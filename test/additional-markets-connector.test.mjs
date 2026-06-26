@@ -153,6 +153,74 @@ describe('BitmexConnector parser', () => {
     assert.strictEqual(emitted[0].side, 'buy');
     assert.strictEqual(emitted[0].tradeId, 'mx1');
   });
+
+  it('emits BitMEX orderBookL2 updates as changed levels only', () => {
+    const conn = createConn(BitmexConnector);
+    const emitted = [];
+    conn.on('depth', (ev) => emitted.push(ev));
+
+    conn._onMessage({
+      table: 'orderBookL2',
+      action: 'partial',
+      data: [
+        { id: 1, side: 'Buy', price: 50000, size: 10 },
+        { id: 5, side: 'Buy', price: 50000, size: 2 },
+        { id: 2, side: 'Buy', price: 49990, size: 20 },
+        { id: 3, side: 'Sell', price: 50010, size: 30 },
+      ],
+    });
+
+    assert.strictEqual(emitted.length, 1);
+    assert.strictEqual(emitted[0].type, 'snapshot');
+    assert.strictEqual(emitted[0].bids.length, 2);
+    assert.strictEqual(emitted[0].asks.length, 1);
+
+    conn._onMessage({
+      table: 'orderBookL2',
+      action: 'update',
+      data: [{ id: 1, size: 15 }],
+    });
+
+    assert.strictEqual(emitted.length, 2);
+    assert.strictEqual(emitted[1].type, 'update');
+    assert.deepStrictEqual(emitted[1].bids, [['50000', '17']]);
+    assert.deepStrictEqual(emitted[1].asks, []);
+
+    conn._onMessage({
+      table: 'orderBookL2',
+      action: 'update',
+      data: [{ id: 5, price: 49980, size: 4 }],
+    });
+
+    assert.strictEqual(emitted.length, 3);
+    assert.strictEqual(emitted[2].type, 'update');
+    assert.deepStrictEqual(emitted[2].bids, [['50000', '15'], ['49980', '4']]);
+    assert.deepStrictEqual(emitted[2].asks, []);
+
+    conn._onMessage({
+      table: 'orderBookL2',
+      action: 'insert',
+      data: [{ id: 4, side: 'Sell', price: 50020, size: 40 }],
+    });
+
+    assert.strictEqual(emitted.length, 4);
+    assert.deepStrictEqual(emitted[3].bids, []);
+    assert.deepStrictEqual(emitted[3].asks, [['50020', '40']]);
+
+    conn._onMessage({
+      table: 'orderBookL2',
+      action: 'delete',
+      data: [{ id: 3 }],
+    });
+
+    assert.strictEqual(emitted.length, 5);
+    assert.deepStrictEqual(emitted[4].bids, []);
+    assert.deepStrictEqual(emitted[4].asks, [['50010', '0']]);
+
+    const snap = conn.book.toSnapshot();
+    assert.deepStrictEqual(snap.bids.slice(0, 3), [['50000', '15'], ['49990', '20'], ['49980', '4']]);
+    assert.deepStrictEqual(snap.asks, [['50020', '40']]);
+  });
 });
 
 describe('CoinbaseInternationalConnector parser', () => {

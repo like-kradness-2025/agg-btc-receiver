@@ -187,12 +187,16 @@ async function main() {
   marketDataCollector.registerPremium();
   marketDataCollector.start();
 
+  // Start collector timer BEFORE connector startup loop.
+  // The tick handler already skips markets whose connector is not running or
+  // whose book is empty, so data flows for fast-connecting markets while
+  // slow-connecting ones are still syncing.
+  collector.start();
+
   for (const [index, market] of STARTUP_MARKETS.entries()) {
     if (index > 0) await sleep(STARTUP_STAGGER_MS);
     await startConnector(market);
   }
-
-  collector.start();
 
   const shutdown = async () => {
     console.log('[fairprice] shutting down...');
