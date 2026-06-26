@@ -853,7 +853,7 @@ describe('HyperliquidConnector parser', () => {
   }
 
   describe('l2Book (depth snapshot)', () => {
-    it('should apply full book from l2Book message', () => {
+    it('should apply full book from l2Book message (via snapshot-diff)', () => {
       const conn = createHyperliquidConn();
       const msg = {
         channel: 'l2Book',
@@ -874,7 +874,8 @@ describe('HyperliquidConnector parser', () => {
       conn._handleDepth(msg);
 
       assert.notStrictEqual(emitted, null);
-      assert.strictEqual(emitted.type, 'snapshot');
+      assert.strictEqual(emitted.type, 'update', 'snapshot-diff emits update type');
+      // Book was empty, so all levels appear as changes
       assert.strictEqual(emitted.bids.length, 2);
       assert.strictEqual(emitted.asks.length, 2);
       assert.strictEqual(conn.book.getBestBid(), '65000');

@@ -50,12 +50,12 @@ describe('CryptoComConnector parser', () => {
     assert.strictEqual(emitted.tradeId, 'c1');
   });
 
-  it('handles book push updates (id=-1) as depth snapshots', () => {
+  it('handles book push updates (id=-1) as depth updates (via snapshot-diff)', () => {
     const conn = createConn(CryptoComConnector);
     const emitted = [];
     conn.on('depth', (ev) => emitted.push(ev));
 
-    // Book push (id=-1, full snapshot)
+    // Book push (id=-1, full snapshot → diff computed)
     conn._onMessage({
       id: -1,
       channel: 'book.BTC_USD.10',
@@ -67,7 +67,8 @@ describe('CryptoComConnector parser', () => {
     });
 
     assert.strictEqual(emitted.length, 1, 'should emit depth for book push');
-    assert.strictEqual(emitted[0].type, 'snapshot');
+    assert.strictEqual(emitted[0].type, 'update', 'snapshot-diff emits update type');
+    // Book was empty before, so all 4 levels are changes
     assert.strictEqual(emitted[0].bids.length, 2);
     assert.strictEqual(emitted[0].asks.length, 2);
 
