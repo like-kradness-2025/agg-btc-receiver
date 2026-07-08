@@ -1,0 +1,81 @@
+# Decision Log
+
+## 2026-07-04
+- Chosen design mode: contract-first, one issue at a time.
+- Scope fixed: all proposed burst feature families remain in scope unless later removed by explicit review.
+- Canonical interpretation: features describe short-horizon same-side aggressive flow bursts inferred from public trade tape, not true parent-order identity.
+- Naming rule: avoid `order_*`; prefer `burst_*` / `cluster_*` / `*_est` semantics.
+- Phase 1 draft fixed in `docs/burst-formation-contract.md`:
+  - burst formation uses trade stream only
+  - burst = same market + same side + short gap + bounded total duration
+  - price continuity is not a split rule
+  - formation runs on full ordered stream first, then 1s summaries are derived
+  - `gap_threshold_ms` scope is per venue in v1
+  - `max_burst_duration_ms` scope is global in v1
+  - cross-second bursts preserve identity and can overlap multiple 1s rows
+- Phase 2 draft fixed in `docs/same-price-burst-contract.md`:
+  - same-price runs are sub-runs inside already-formed Phase 1 bursts
+  - same-price equality uses deterministic canonical numeric price equality, not raw formatting and not loose proximity bands
+  - `same_price_burst_count_1s` counts overlapping same-price sub-runs
+  - `same_price_burst_max_len_1s` is max print-run length among overlapping same-price sub-runs
+  - `same_price_burst_notional_1s` sums notional across all overlapping same-price sub-runs
+  - no cross-burst merging even if the same price repeats later
+- Phase 3 draft fixed in `docs/multilevel-burst-contract.md`:
+  - multilevel is a Phase 1 burst-level classification, not a new formation rule
+  - multilevel count/notional are overlap-based summaries over all qualifying bursts
+  - `span_ticks` is finalized as `(burst_max_price - burst_min_price) / tick_size`
+  - `tick_size` comes from configured market/venue metadata, not inferred from burst tape
+  - same-price sub-runs and multilevel burst classification are complementary, not contradictory
+- Phase 4 draft fixed in `docs/burst-summary-contract.md`:
+  - split summary semantics into burst-overlap features vs intra-second print-structure features
+  - `buy_burst_notional_1s`, `sell_burst_notional_1s`, `burst_delta_notional_1s`, and `largest_burst_share_notional_1s` inherit Phase 1 overlap semantics
+  - `max_same_side_run_prints_1s`, `side_flip_count_1s`, `same_side_gap_ms_min_1s`, and `same_side_gap_ms_p25_1s` are bucket-local only
+  - empty same-side gap sample emits NULL, not 0
+- Phase 5 draft fixed in `docs/burst-book-validation-contract.md`:
+  - book-aware metrics are post-formation validation summaries, not formation inputs
+  - `burst_at_touch_ratio_1s` and `burst_through_ratio_1s` use classified burst-associated notional as denominator
+  - depletion/replenish metrics are co-occurrence counts, not causal claims
+  - book-aware ratios are bucket-local and emit NULL when the classified denominator is empty
+  - book-aware count metrics emit NULL when the relevant book observation is unavailable and 0 when observable but absent
+- Cross-doc spec review gate passed in `docs/burst-spec-review-gate.md` after freezing multilevel span semantics.
+- Implementation bridge frozen in `docs/burst-implementation-bridge-plan.md`: reuse the existing accumulator path, ship slices in order, verify each slice before moving on.
+- Slice 1 implementation landed in `lib/feature-accumulator.mjs`:
+  - added burst state + close-burst primitives inside the existing accumulator path
+  - emitted the 14 overlap-based trade-only burst summary fields into the 1s row
+  - verified with deterministic fixture in `test/feature-accumulator-burst-slice1.test.mjs`
+- Slice 2 implementation landed in `lib/feature-accumulator.mjs`:
+  - added bucket-local print retention in `_tradeAccums`
+  - emitted `max_same_side_run_prints_1s`, `side_flip_count_1s`, `same_side_gap_ms_min_1s`, `same_side_gap_ms_p25_1s`
+  - preserved NULL semantics for empty same-side gap samples
+- Slice 3 implementation landed in `lib/feature-accumulator.mjs`:
+  - emitted `burst_at_touch_ratio_1s`, `burst_through_ratio_1s`, `burst_depletion_count_1s`, `burst_replenish_after_touch_count_1s`
+  - implemented contract-side through semantics (`buy > bestAsk`, `sell < bestBid`) without repurposing legacy global trade fields
+  - kept count metrics as co-occurrence summaries gated by at-touch burst activity
+- Independent review found and fix-verified two slice 3 correctness issues:
+  - side-aware at-touch / classified-denominator logic was tightened so buy uses best ask and sell uses best bid
+  - `levelQty()` now tolerates string-vs-number price-key access so replenish detection matches real exchange-style string fixtures
+- Verification package after slice 3 fixes:
+  - `node --test test/feature-accumulator-burst-slice1.test.mjs` PASS (4/4)
+  - `node --test test/trade-aggregator.test.mjs test/feature-accumulator-burst-slice1.test.mjs` PASS (21/21)
+  - `npm run check` PASS
+- Async delegation batch `deleg_30f0dd8a` returned useful review/test guidance; accepted findings were already reflected in the parent implementation, while stale observations about “slice 3 unimplemented” were rejected because the code had advanced past that state.
+- Slice 4 reconciliation was documented in `docs/burst-slice4-reconciliation-note.md`:
+  - legacy `trade_at_touch_qty` / `trade_through_qty` / `best_deplete_count` / `best_replenish_count` remain global trade/book summaries
+  - new `burst_*` validation fields remain burst-associated ratio/co-occurrence summaries with their own nullability rules
+  - no sink-level nullability adapter fix was required based on current verification
+- Live cutover verification completed:
+  - `orderflow_monitor.mjs` now emits dated `1s_features/...` through `FeatureAccumulator`
+  - live smoke produced real burst-aware 1s rows
+  - `30s_book/...` now emits full-book-derived bucketed macro snapshots
+- Book coverage interpretation was frozen in `docs/book-coverage-tiers.md`:
+  - continuous WS ingestion does not imply identical full-book visibility across markets
+  - markets are classified into Tier A (full-book-like), Tier B (snapshot-limited mid-depth), Tier C (bounded-depth near-book)
+  - downstream `30s_book` analysis must be tier-aware rather than assuming equal far-book coverage
+- Receiver/集計分離の方針を `docs/raw-receiver-separation-plan.md` に固定:
+  - 受信側は生データ保存に寄せる
+  - 集計側が 1秒集計と30秒板まとめを後段生成する
+  - 生データ削除はロック付き・待ち時間付きで、即削除しない
+- `orderflow_monitor.mjs` から receiver 内の旧 feature 計算を外した:
+  - `FeatureComputer` import / 初期化 / tick 内の `compute()` / `features.jsonl` writer を削除
+  - raw trade / aggregated trade / book update / periodic snapshot / liquidation / health / derivatives / market data の出力は維持
+  - `npm run check` と `npm test` を再実行して通過

@@ -806,9 +806,9 @@ describe('Binance spot maxLevels from config.depthLimit', () => {
     assert.strictEqual(conn.book._maxLevels, 5000);
   });
 
-  it('should fallback to default 5000 when depthLimit undefined', () => {
+  it('should fallback to unlimited when depthLimit undefined', () => {
     const conn = new BinanceSpotConnector({});
-    assert.strictEqual(conn.book._maxLevels, 5000);
+    assert.strictEqual(conn.book._maxLevels, 0);
   });
 
   it('should use depthLimit from config for BinancePerpConnector', () => {

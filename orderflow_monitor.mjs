@@ -24,8 +24,8 @@ import { GeminiConnector } from './lib/gemini-connector.mjs';
 import { BitmexConnector } from './lib/bitmex-connector.mjs';
 import { HyperliquidConnector } from './lib/hyperliquid-connector.mjs';
 import { TradeAggregator } from './lib/trade-aggregator.mjs';
-import { FeatureComputer } from './lib/feature-computer.mjs';
 import { BufferedWriter } from './lib/buffered-writer.mjs';
+import { RawRotationWriter } from './lib/raw-rotation-writer.mjs';
 import { HealthMonitor } from './lib/health-monitor.mjs';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
 import { MarketDataCollector } from './lib/market-data-collector.mjs';
@@ -121,15 +121,13 @@ if (enabledMarkets.includes('binance_perp')) STARTUP_MARKETS.push('binance_perp'
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Writers: trades/{market}.jsonl, trades/{market}_raw.jsonl, book/{market}.jsonl, book/{market}_update.jsonl, liquidations/{market}.jsonl, features.jsonl, health.jsonl
-const tradeWriters = new Map();
-const rawTradeWriters = new Map();
-const bookWriters = new Map();
-const bookUpdateWriters = new Map();
-const liquidationWriters = new Map();
-const featuresWriter = new BufferedWriter(path.join(outputBase, 'features.jsonl'), {
-  flushIntervalMs: config.output.flush_features_ms ?? 200,
-});
+// Writers: rotation writers for raw data, fixed-path for aggregated data
+const rawTradeRotationWriters = new Map();   // market → RawRotationWriter (trades)
+const bookUpdateRotationWriters = new Map();  // market → RawRotationWriter (book_updates)
+const liquidationRotationWriters = new Map(); // market → RawRotationWriter (liquidations)
+const snapshotRotationWriters = new Map();    // market → RawRotationWriter (snapshots)
+const tradeWriters = new Map();               // aggregated trades (fixed path)
+const bookWriters = new Map();                // book snapshots (fixed path)
 const healthMonitor = new HealthMonitor(path.join(outputBase, 'health.jsonl'), {
   intervalMs: 1000,
 });
@@ -141,8 +139,6 @@ const derivativesHelper = new DerivativesHelper(outputBase, {
 const marketDataCollector = new MarketDataCollector(outputBase, {
   intervalMs: config.tick?.market_data_ms ?? 60000,
 });
-
-const featureComputer = new FeatureComputer();
 
 // ====== Start connectors ======
 async function startConnector(market) {
@@ -159,36 +155,39 @@ async function startConnector(market) {
   aggregators.set(market, aggregator);
   books.set(market, connector.book);
 
-  // Create writers
+  // Create writers — raw data uses rotation writers, aggregated data uses fixed-path
   const basePath = outputBase;
+  rawTradeRotationWriters.set(market, new RawRotationWriter(basePath, market, 'trades', {
+    flushIntervalMs: config.output.flush_trades_ms ?? 200,
+  }));
+  bookUpdateRotationWriters.set(market, new RawRotationWriter(basePath, market, 'book_updates', {
+    flushIntervalMs: config.output.flush_book_ms ?? 1000,
+  }));
+  liquidationRotationWriters.set(market, new RawRotationWriter(basePath, market, 'liquidations', {
+    flushIntervalMs: config.output.flush_liquidations_ms ?? 200,
+  }));
+  snapshotRotationWriters.set(market, new RawRotationWriter(basePath, market, 'snapshots', {
+    flushIntervalMs: config.output.flush_book_ms ?? 1000,
+  }));
   tradeWriters.set(market, new BufferedWriter(path.join(basePath, 'trades', `${market}.jsonl`), {
     flushIntervalMs: config.output.flush_trades_ms ?? 200,
   }));
   bookWriters.set(market, new BufferedWriter(path.join(basePath, 'book', `${market}.jsonl`), {
     flushIntervalMs: config.output.flush_book_ms ?? 1000,
   }));
-  rawTradeWriters.set(market, new BufferedWriter(path.join(basePath, 'trades', `${market}_raw.jsonl`), {
-    flushIntervalMs: config.output.flush_trades_ms ?? 200,
-  }));
-  bookUpdateWriters.set(market, new BufferedWriter(path.join(basePath, 'book', `${market}_update.jsonl`), {
-    flushIntervalMs: config.output.flush_book_ms ?? 1000,
-  }));
-  liquidationWriters.set(market, new BufferedWriter(path.join(basePath, 'liquidations', `${market}.jsonl`), {
-    flushIntervalMs: config.output.flush_liquidations_ms ?? 200,
-  }));
 
-  // Wire events
+  // Wire events — raw data goes to rotation writers
   connector.on('trade', async (tradeEvent) => {
     aggregator.addTrade(tradeEvent);
-    rawTradeWriters.get(market)?.write(tradeEvent);
+    rawTradeRotationWriters.get(market)?.write(tradeEvent, tradeEvent.ts);
   });
 
   connector.on('depth', async (depthEvent) => {
-    bookUpdateWriters.get(market)?.write(depthEvent);
+    bookUpdateRotationWriters.get(market)?.write(depthEvent, depthEvent.ts);
   });
 
   connector.on('liquidation', async (row) => {
-    liquidationWriters.get(market)?.write(row);
+    liquidationRotationWriters.get(market)?.write(row, row.ts);
   });
 
   connector.on('error', ({ message }) => {
@@ -221,6 +220,21 @@ async function main() {
   for (const [index, market] of STARTUP_MARKETS.entries()) {
     if (index > 0) await sleep(STARTUP_STAGGER_MS);
     await startConnector(market);
+  }
+
+  // Startup recovery: scan existing files and restore state for all rotation writers
+  const startupNowMs = Date.now();
+  for (const [market, writer] of rawTradeRotationWriters) {
+    await writer.startupRecovery(startupNowMs);
+  }
+  for (const [market, writer] of bookUpdateRotationWriters) {
+    await writer.startupRecovery(startupNowMs);
+  }
+  for (const [market, writer] of liquidationRotationWriters) {
+    await writer.startupRecovery(startupNowMs);
+  }
+  for (const [market, writer] of snapshotRotationWriters) {
+    await writer.startupRecovery(startupNowMs);
   }
 
   // Register perp markets for auxiliary data collection
@@ -284,15 +298,6 @@ async function main() {
         // Write aggregated trade row
         tradeWriters.get(market)?.write(aggTrade);
       }
-
-      // Compute feature — skip if connector is not running or book is empty
-      // Prevents silent bad-data rows during reconnect (empty book after _resetBook)
-      const connector = connectors.get(market);
-      const book = books.get(market);
-      if (isMarketWritable(connector, book)) {
-        const feature = featureComputer.compute(market, book, aggTrade, now);
-        featuresWriter.write(feature);
-      }
     }
 
     // Book snapshot — skip for non-running connectors or empty books
@@ -303,6 +308,8 @@ async function main() {
         if (isMarketWritable(connector, book)) {
           const snap = book.toSnapshot(now);
           bookWriters.get(market)?.write(snap);
+          // Also write snapshot to rotation writer (wall-clock bucketing)
+          snapshotRotationWriters.get(market)?.write(snap, now);
         }
       }
     }
@@ -316,10 +323,22 @@ async function main() {
   // Run tick every tickMs
   const tickTimer = setInterval(tick, tickMs);
 
+  // Periodic stale check for rotation writers (every 15s)
+  const staleCheckMs = 15000;
+  const staleCheckTimer = setInterval(async () => {
+    const now = Date.now();
+    for (const [, writer] of rawTradeRotationWriters) await writer.checkStale(now);
+    for (const [, writer] of bookUpdateRotationWriters) await writer.checkStale(now);
+    for (const [, writer] of liquidationRotationWriters) await writer.checkStale(now);
+    for (const [, writer] of snapshotRotationWriters) await writer.checkStale(now);
+  }, staleCheckMs);
+  if (staleCheckTimer.unref) staleCheckTimer.unref();
+
   // Graceful shutdown
   const shutdown = async () => {
     console.log('[main] shutting down...');
     clearInterval(tickTimer);
+    clearInterval(staleCheckTimer);
 
     for (const [, conn] of connectors) {
       conn.disconnect();
@@ -336,11 +355,11 @@ async function main() {
     // Flush all writers
     const writerFlushPromises = [];
     for (const w of tradeWriters.values()) writerFlushPromises.push(w.close());
-    for (const w of rawTradeWriters.values()) writerFlushPromises.push(w.close());
     for (const w of bookWriters.values()) writerFlushPromises.push(w.close());
-    for (const w of bookUpdateWriters.values()) writerFlushPromises.push(w.close());
-    for (const w of liquidationWriters.values()) writerFlushPromises.push(w.close());
-    writerFlushPromises.push(featuresWriter.close());
+    for (const w of rawTradeRotationWriters.values()) writerFlushPromises.push(w.finalize());
+    for (const w of bookUpdateRotationWriters.values()) writerFlushPromises.push(w.finalize());
+    for (const w of liquidationRotationWriters.values()) writerFlushPromises.push(w.finalize());
+    for (const w of snapshotRotationWriters.values()) writerFlushPromises.push(w.finalize());
     writerFlushPromises.push(healthMonitor.close());
     writerFlushPromises.push(derivativesHelper.close());
     writerFlushPromises.push(marketDataCollector.close());

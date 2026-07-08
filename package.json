@@ -1,5 +1,5 @@
 {
-  "name": "btc-receiver",
+  "name": "agg-btc-receiver",
   "version": "3.0.0",
   "private": true,
   "type": "module",

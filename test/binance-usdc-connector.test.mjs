@@ -31,9 +31,9 @@ describe('BinanceSpotUsdcConnector', () => {
       assert.strictEqual(conn.book._maxLevels, 100);
     });
 
-    it('should default depthLimit to 5000', () => {
+    it('should default depthLimit to unlimited', () => {
       const conn = new BinanceSpotUsdcConnector({});
-      assert.strictEqual(conn.book._maxLevels, 5000);
+      assert.strictEqual(conn.book._maxLevels, 0);
     });
 
     it('should pass wsUrl and restUrl from config to base', () => {

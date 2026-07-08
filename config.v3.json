@@ -71,7 +71,7 @@
       }
     },
     "binance_coinm_perp": {
-      "enabled": true,
+      "enabled": false,
       "symbol": "BTCUSD_PERP",
       "wsUrl": "wss://dstream.binance.com/stream?streams=btcusd_perp@trade/btcusd_perp@depth@100ms/btcusd_perp@forceOrder",
       "restUrl": "https://dapi.binance.com/dapi/v1/depth?symbol=BTCUSD_PERP&limit=1000",
@@ -123,7 +123,7 @@
       "depthLimit": 0
     },
     "gemini_spot": {
-      "enabled": true,
+      "enabled": false,
       "symbol": "BTC/USD",
       "wsUrl": "wss://api.gemini.com/v2/marketdata/",
       "restUrl": "",

@@ -53,6 +53,7 @@ describe('BybitConnector parser', () => {
     it('should apply delta updates and update seq', () => {
       const conn = createBybitConn();
       conn.book.applySnapshot([['65000', '1']], [['65001', '1']], 100);
+      conn._notifyWsSnapshotReceived(100);
 
       let depthEmitted = null;
       conn.on('depth', (ev) => { depthEmitted = ev; });
@@ -476,6 +477,7 @@ describe('OkxConnector parser', () => {
     it('should apply level update and handle qty=0 as delete', () => {
       const conn = createOkxConn();
       conn.book.applySnapshot([['65000', '1']], [['65001', '1']], 100);
+      conn._notifyWsSnapshotReceived(100);
 
       conn._handleDepth({
         arg: { channel: 'books', instId: 'BTC-USDT-SWAP' },
@@ -734,6 +736,7 @@ describe('CoinbaseConnector parser', () => {
     it('should apply updates to book using price_level / new_quantity', () => {
       const conn = createCoinbaseConn();
       conn.book.applySnapshot([['65000', '1']], [['65001', '1']], 100);
+      conn._notifyWsSnapshotReceived(100);
 
       conn._handleDepth({
         channel: 'l2_data',
@@ -756,10 +759,11 @@ describe('CoinbaseConnector parser', () => {
     it('should treat side=offer as ask in update', () => {
       const conn = createCoinbaseConn();
       conn.book.applySnapshot([['65000', '1']], [['65001', '1']], 100);
+      conn._notifyWsSnapshotReceived(100);
 
       conn._handleDepth({
         channel: 'l2_data',
-        sequence_num: 102,
+        sequence_num: 101,
         events: [{
           type: 'update',
           product_id: 'BTC-USD',
@@ -770,7 +774,7 @@ describe('CoinbaseConnector parser', () => {
       });
 
       assert.strictEqual(conn.book.asks.get('65001.00'), '5.0');
-      assert.strictEqual(conn.book._lastSeq, 102);
+      assert.strictEqual(conn.book._lastSeq, 101);
     });
   });
 
@@ -1095,5 +1099,55 @@ describe('Market alias connectors', () => {
     const coinm = new BinanceCoinmPerpConnector({});
     coinm._ringBuf = [];
     assert.ok(coinm._validateSync({ lastUpdateId: 100 }));
+  });
+
+  it('should let COIN-M snapshot-only sync enter running and bridge first live diff', async () => {
+    const coinm = new BinanceCoinmPerpConnector({});
+    coinm._ws = null;
+    coinm._fetchSnapshot = async () => ({
+      lastUpdateId: 100,
+      bids: [['65000', '1']],
+      asks: [['65001', '1']],
+    });
+    coinm._scheduleReconnect = () => { coinm._setState('reconnecting'); };
+
+    await coinm._syncBook();
+    assert.strictEqual(coinm.getState(), 'running');
+    assert.strictEqual(coinm._firstRunningDiff, true);
+
+    coinm._handleDepth({ U: 95, u: 105, pu: -1, b: [], a: [], E: 1700000000000 });
+    assert.strictEqual(coinm.book._lastSeq, 105);
+    assert.strictEqual(coinm._firstRunningDiff, false);
+
+    let err = null;
+    coinm.on('error', (ev) => { err = ev; });
+    coinm._handleDepth({ U: 106, u: 106, pu: 999, b: [], a: [], E: 1700000000001 });
+    assert.match(err.message, /Perp depth pu mismatch/);
+    assert.strictEqual(coinm.getState(), 'reconnecting');
+  });
+
+  it('should let BTCUSDC perp snapshot-only sync enter running and bridge first live diff', async () => {
+    const btcusdc = new BinancePerpBtcusdcConnector({});
+    btcusdc._ws = null;
+    btcusdc._fetchSnapshot = async () => ({
+      lastUpdateId: 200,
+      bids: [['65000', '1']],
+      asks: [['65001', '1']],
+    });
+    btcusdc._scheduleReconnect = () => { btcusdc._setState('reconnecting'); };
+
+    await btcusdc._syncBook();
+    assert.strictEqual(btcusdc.getState(), 'running');
+    assert.strictEqual(btcusdc._firstRunningDiff, true);
+
+    btcusdc._handleDepth({ U: 190, u: 205, pu: -1, b: [], a: [], E: 1700000000000 });
+    assert.strictEqual(btcusdc.book._lastSeq, 205);
+    assert.strictEqual(btcusdc._firstRunningDiff, false);
+
+    let err = null;
+    btcusdc.on('error', (ev) => { err = ev; });
+    btcusdc._handleDepth({ U: 206, u: 206, pu: 999, b: [], a: [], E: 1700000000001 });
+    assert.match(err.message, /Perp depth pu mismatch/);
+    assert.strictEqual(btcusdc.getState(), 'reconnecting');
   });
 });

@@ -76,66 +76,64 @@ function outputStream(stream) {
 
 // ── Per-file conversion ────────────────────────────────────────────────
 
-async function convertFile(srcBuf, stream, market, outDir, dateStr) {
+async function convertFile(srcPath, stream, market, outDir, dateStr) {
   const db = new duckdb.Database(':memory:');
 
-  const srcSize = srcBuf.length;
-  const lines = srcBuf.toString().split('\n').filter(Boolean);
-  if (lines.length === 0) { db.close(); return { rows: 0, srcSize, rowCount: 0, parSize: 0 }; }
-
-  // Write temp CSV with line numbers using TAB separator so DuckDB
-  // deterministically reads row_id and raw_line.
-  const SEP = '\t';
-  const tmpFile = path.join('/tmp', `convert_${dateStr}_${stream}_${market}.csv`);
-  const tmpLines = lines.map((line, i) => `${i}${SEP}${line}`);
-  fs.writeFileSync(tmpFile, tmpLines.join('\n'));
+  const srcStat = fs.statSync(srcPath);
+  const srcSize = srcStat.size;
+  if (srcSize === 0) { db.close(); return { rows: 0, srcSize, rowCount: 0, parSize: 0 }; }
 
   const outFile = path.join(outDir, `${market}.parquet`);
   fs.mkdirSync(outDir, { recursive: true });
 
-  const csvOpts = `header=false, columns={'row_id': 'BIGINT', 'line': 'VARCHAR'}, sep='${SEP}', quote='', auto_detect=false`;
-
-  // Build column list for DuckDB SQL — common fields first, then stream-specific
-  let cols = `line::VARCHAR AS raw_line,
-    row_id,
-    json_extract_string(line, '$.ts')::BIGINT AS ts,
-    json_extract_string(line, '$.market') AS market`;
+  // Build column list — use DuckDB read_csv with null-byte-like delimiter
+  // so each JSONL line is read as a single VARCHAR row (preserving order)
+  let cols = `raw_line::VARCHAR AS raw_line,
+    (row_number() OVER ()) - 1 AS row_id,
+    json_extract_string(raw_line, '$.ts')::BIGINT AS ts,
+    json_extract_string(raw_line, '$.market') AS market`;
 
   if (stream === 'trade') {
     cols += `,
-    json_extract_string(line, '$.price')::DOUBLE AS price,
-    json_extract_string(line, '$.qty')::DOUBLE AS qty,
-    json_extract_string(line, '$.side') AS side,
-    coalesce(json_extract_string(line, '$.tradeId'), json_extract_string(line, '$.trade_id')) AS trade_id`;
+    json_extract_string(raw_line, '$.price')::DOUBLE AS price,
+    json_extract_string(raw_line, '$.qty')::DOUBLE AS qty,
+    json_extract_string(raw_line, '$.side') AS side,
+    coalesce(json_extract_string(raw_line, '$.tradeId'), json_extract_string(raw_line, '$.trade_id')) AS trade_id`;
   } else if (stream === 'depth' || stream === 'snapshot') {
     cols += `,
-    json_extract_string(line, '$.schemaVersion') AS schema_version,
-    json_extract_string(line, '$.stream') AS stream_name,
-    json_extract_string(line, '$.type') AS type,
-    json_extract_string(line, '$.recvTs')::BIGINT AS recv_ts,
-    json_extract_string(line, '$.exchange') AS exchange,
-    json_extract_string(line, '$.seq')::BIGINT AS seq,
-    json_extract_string(line, '$.prevSeq')::BIGINT AS prev_seq,
-    json_extract_string(line, '$.reason') AS reason,
-    json_extract_string(line, '$.bidLevelCount')::BIGINT AS bid_level_count,
-    json_extract_string(line, '$.askLevelCount')::BIGINT AS ask_level_count,
-    json_extract_string(line, '$.bids') AS bids,
-    json_extract_string(line, '$.asks') AS asks`;
+    json_extract_string(raw_line, '$.schemaVersion') AS schema_version,
+    json_extract_string(raw_line, '$.stream') AS stream_name,
+    json_extract_string(raw_line, '$.type') AS type,
+    json_extract_string(raw_line, '$.recvTs')::BIGINT AS recv_ts,
+    json_extract_string(raw_line, '$.exchange') AS exchange,
+    json_extract_string(raw_line, '$.seq')::BIGINT AS seq,
+    json_extract_string(raw_line, '$.prevSeq')::BIGINT AS prev_seq,
+    json_extract_string(raw_line, '$.reason') AS reason,
+    json_extract_string(raw_line, '$.bidLevelCount')::BIGINT AS bid_level_count,
+    json_extract_string(raw_line, '$.askLevelCount')::BIGINT AS ask_level_count,
+    json_extract_string(raw_line, '$.bids') AS bids,
+    json_extract_string(raw_line, '$.asks') AS asks`;
   } else if (stream === 'fairprice') {
     cols += `,
-    json_extract_string(line, '$.fair_price')::DOUBLE AS fair_price,
-    json_extract_string(line, '$.fair_price_source') AS fair_price_source,
-    json_extract_string(line, '$.mark_price')::DOUBLE AS mark_price,
-    json_extract_string(line, '$.book_mid')::DOUBLE AS book_mid,
-    json_extract_string(line, '$.last_price')::DOUBLE AS last_price,
-    json_extract_string(line, '$.type') AS type`;
+    json_extract_string(raw_line, '$.fair_price')::DOUBLE AS fair_price,
+    json_extract_string(raw_line, '$.fair_price_source') AS fair_price_source,
+    json_extract_string(raw_line, '$.mark_price')::DOUBLE AS mark_price,
+    json_extract_string(raw_line, '$.book_mid')::DOUBLE AS book_mid,
+    json_extract_string(raw_line, '$.last_price')::DOUBLE AS last_price,
+    json_extract_string(raw_line, '$.type') AS type`;
   }
 
   try {
     await e(db, `
       COPY (
         SELECT ${cols}
-        FROM read_csv_auto('${tmpFile}', ${csvOpts})
+        FROM read_csv('${srcPath}',
+          columns={'raw_line': 'VARCHAR'},
+          delim='\x01',
+          quote='\x02',
+          header=false,
+          auto_detect=false)
+        WHERE raw_line != ''
       ) TO '${outFile}' (FORMAT PARQUET, COMPRESSION ZSTD)
     `);
   } catch (err) {
@@ -144,9 +142,10 @@ async function convertFile(srcBuf, stream, market, outDir, dateStr) {
   }
 
   const parSize = fs.statSync(outFile).size;
-  fs.rmSync(tmpFile);
+  const result = await q(db, `SELECT count(*) AS cnt FROM read_parquet('${outFile}')`);
   db.close();
-  return { rows: lines.length, srcSize, rowCount: lines.length, parSize };
+  const rowCnt = Number(result[0].cnt);
+  return { rows: rowCnt, srcSize, rowCount: rowCnt, parSize };
 }
 
 // ── Main ───────────────────────────────────────────────────────────────
@@ -199,10 +198,14 @@ async function main() {
         console.log(`  ${stream}/${market}: empty, SKIP`);
         continue;
       }
+      if (srcStat.size > 2147483648) {
+        console.log(`  ${stream}/${market}: ${(srcStat.size/1024/1024/1024).toFixed(2)}GB exceeds DuckDB 2GB read_csv limit, SKIP`);
+        continue;
+      }
       // Atomic read: compute SHA from the exact same buffer used for conversion
       const srcBuf = fs.readFileSync(srcPath);
       const srcSha256 = crypto.createHash('sha256').update(srcBuf).digest('hex');
-      const result = await convertFile(srcBuf, stream, market, outDir, dateStr);
+      const result = await convertFile(srcPath, stream, market, outDir, dateStr);
 
       if (result.rows === 0) {
         console.log(`  ${stream}/${market}: 0 rows, SKIP`);
@@ -242,7 +245,7 @@ async function main() {
       const parFile = path.join(outBase, entry.parquet_file);
       const vDb = new duckdb.Database(':memory:');
       const rawLines = await q(vDb, `
-        SELECT raw_line::VARCHAR AS raw_str
+        SELECT CAST(raw_line AS VARCHAR) AS raw_str
         FROM read_parquet('${parFile}')
         ORDER BY row_id
       `);
@@ -261,9 +264,11 @@ async function main() {
 
   manifest.verified = allVerified;
 
-  // Write manifest
+  // Write manifest atomically (temp file + rename to avoid corruption on crash)
   const manifestPath = path.join(outBase, MANIFEST_NAME);
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  const tmpManifest = manifestPath + '.tmp';
+  fs.writeFileSync(tmpManifest, JSON.stringify(manifest, null, 2));
+  fs.renameSync(tmpManifest, manifestPath);
   console.log(`\n[convert] Manifest: ${manifestPath}`);
   console.log(`[convert] Total: ${manifest.total_source_rows} rows, ${(manifest.total_source_bytes/1024/1024).toFixed(0)}MB → ${(manifest.total_parquet_bytes/1024/1024).toFixed(0)}MB`);
   console.log(`[convert] Verified: ${allVerified ? '✅ ALL PASS' : '❌ FAIL'}`);
