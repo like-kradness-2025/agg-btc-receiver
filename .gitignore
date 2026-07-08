@@ -5,3 +5,15 @@ docs/WIRING_DIAGRAM.md
 __pycache__/
 *.pyc
 charts/
+
+# CVD analysis (moved to burst-cvd-analysis/)
+plot_cvd.py
+scripts/*cvd*
+scripts/large_cvd_*
+scripts/plot-size-bucketed-*
+scripts/analyze-burst-cvd-*
+scripts/compare-burst-cvd-*
+docs/*cvd*
+docs/burst_cvd_*
+docs/size-dominance-*
+docs/size_distribution_*
