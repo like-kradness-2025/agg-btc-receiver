@@ -3,7 +3,8 @@
 // Follows plan Task 9 + P0-4 finalized input horizon + P0-1 kind/horizon-proof
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runPipeline } from '../lib/burst-reducer/pipeline.mjs';
 import { INPUT_KIND, VALID_INPUT_KINDS, BLOCK_DURATION_MS } from '../lib/burst-reducer/schema.mjs';
 
@@ -332,7 +333,14 @@ async function main() {
   process.exit(0);
 }
 
-main().catch(e => {
-  process.stderr.write(JSON.stringify({ level: 'FATAL', error: e.message }) + '\n');
-  process.exit(1);
-});
+// Only run main when executed directly (not when imported as module)
+const __filename = fileURLToPath(import.meta.url);
+const isDirectRun = process.argv[1] && resolve(process.argv[1]) === __filename;
+if (isDirectRun) {
+  main().catch(e => {
+    process.stderr.write(JSON.stringify({ level: 'FATAL', error: e.message }) + '\n');
+    process.exit(1);
+  });
+}
+
+export { validateInventoryEntry, validateInventoryCrossReferences, loadAndValidateFrozenInventory };

@@ -239,11 +239,12 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
     cleanDerived();
   });
 
-  // ── HORIZON-005: book_updates block within finalizedThrough but absent → verified-missing ──
+  // ── HORIZON-005: book_updates missing next block within finalizedThrough → verified-missing ──
   it('HORIZON-005: book_updates missing next block within finalizedThrough => verified-missing', async () => {
     cleanP0_1Derived();
     // Only block 0 exists in book_updates. finalizedThrough=90000 → next boundary 30000
     // is within horizon but file absent. For book_updates → verified-missing.
+    // Block at 60000 also exists from setup, creating a gap at 30000.
     const result = await runPipeline({
       dataDir: P0_1_DIR,
       market: P0_1_MARKET,
@@ -258,14 +259,16 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
     assert.equal(result.blockedReason, 'verified-missing');
     assert.equal(result.blockedState, 'verified-missing');
 
-    // Quarantine report should be written for pending block
-    const qPath = join('data/derived/burst_features_v1', 'quarantine', P0_1_MARKET, '0.json');
-    assert.ok(existsSync(qPath), 'quarantine report should exist for block 0');
+    // Quarantine report should exist for the missing gap block at 30000
+    const qPath = join('data/derived/burst_features_v1', 'quarantine', P0_1_MARKET, '30000.json');
+    assert.ok(existsSync(qPath), 'quarantine report should exist for gap block at 30000');
     const qReport = JSON.parse(readFileSync(qPath, 'utf8'));
     assert.equal(qReport.market, P0_1_MARKET);
-    assert.equal(qReport.block_start_ms, 0);
+    assert.equal(qReport.block_start_ms, 30000);
     assert.equal(qReport.kind, 'book_updates');
     assert.match(qReport.reason, /MISSING_FINALIZED_INPUT/i);
+    assert.equal(qReport.details.gap_from, 30000);
+    assert.equal(qReport.details.gap_to_exclusive, 60000);
   });
 
   // ── HORIZON-006: frozen inventory hash mismatch ──
@@ -411,75 +414,39 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
     );
   });
 
-  // ── HORIZON-013: frozen inventory block_start_ms not 30s-aligned → FATAL ──
-  it('HORIZON-013: frozen inventory block_start_ms not 30s-aligned => error', async () => {
-    cleanP0_1Derived();
-    // Construct a frozen inventory with misaligned block_start_ms
-    // The pipeline will reject this when checkFinalizedHorizon tries to look up
-    // Actually, the pipeline doesn't validate alignment internally; it trusts the inventory.
-    // But we should verify that the inventory entry is checked when used.
-    // This test verifies that an inventory entry with misaligned block_start_ms
-    // does not cause unexpected behavior.
-    const misalignedInventory = {
-      byKindAndMarket: new Map([
-        ['trades', new Map([
-          [P0_1_MARKET, new Map([
-            [0, { market: P0_1_MARKET, kind: 'trades', block_start_ms: 0, sha256: '' }],
-          ])]
-        ])]
-      ]),
-      entries: [{ market: P0_1_MARKET, kind: 'trades', block_start_ms: 0, sha256: '' }],
-      errors: [],
-    };
+  // ── HORIZON-013: frozen inventory block_start_ms not 30s-aligned → validation error ──
+  it('HORIZON-013: frozen inventory block_start_ms not 30s-aligned => validation error', async () => {
+    const { validateInventoryEntry } = await import('../../scripts/tfp.mjs');
 
-    // Should not throw - misaligned entry is in inventory but we don't validate it
-    // (validation happens in tfp.mjs's loadAndValidateFrozenInventory)
-    const result = await runPipeline({
-      dataDir: P0_1_DIR,
-      market: P0_1_MARKET,
-      fromMs: 0,
-      toMs: 120000,
-      runId: RUN_ID + '-h013',
-      frozenInventory: misalignedInventory,
-      kind: 'trades',
-    });
-    assert.ok(result !== undefined);
+    // Validate an entry with non-30s-aligned block_start_ms
+    const errors = validateInventoryEntry({
+      market: 'test',
+      kind: 'book_updates',
+      block_start_ms: 1000,  // Not 30s-aligned (1000 % 30000 = 1000)
+      path: 'book_updates/test/1970-01-01/00-00-01.jsonl',
+      sha256: '',
+    }, 0);
+
+    assert.ok(errors.length > 0, 'should return validation error for misaligned block_start_ms');
+    assert.match(errors[0], /aligned/i, 'error message should mention alignment');
+    assert.match(errors[0], /1000/, 'error should reference the misaligned value');
   });
 
   // ── HORIZON-014: duplicate (market, kind, block_start_ms) detection ──
-  it('HORIZON-014: duplicate (market, kind, block_start_ms) in frozen inventory => error in validation', async () => {
-    cleanP0_1Derived();
-    // Test that the validation logic (used by tfp.mjs) detects duplicates
-    // We test by passing an inventory with duplicate entries and checking
-    // that the pipeline deduplicates correctly (first entry wins in Map).
+  it('HORIZON-014: duplicate (market, kind, block_start_ms) in frozen inventory => detected', async () => {
+    const { validateInventoryCrossReferences } = await import('../../scripts/tfp.mjs');
 
-    const duplicateInventory = {
-      byKindAndMarket: new Map([
-        ['trades', new Map([
-          [P0_1_MARKET, new Map([
-            [0, { market: P0_1_MARKET, kind: 'trades', block_start_ms: 0, sha256: 'first' }],
-          ])]
-        ])]
-      ]),
-      entries: [
-        { market: P0_1_MARKET, kind: 'trades', block_start_ms: 0, sha256: 'first' },
-        { market: P0_1_MARKET, kind: 'trades', block_start_ms: 0, sha256: 'second' },
-      ],
-      errors: [],
-    };
+    // Two entries with identical (market, kind, block_start_ms) but different sha256
+    const entries = [
+      { market: 'test', kind: 'trades', block_start_ms: 0, sha256: 'a'.repeat(64), path: 'trades/test/1970-01-01/00-00-00.jsonl' },
+      { market: 'test', kind: 'trades', block_start_ms: 0, sha256: 'b'.repeat(64), path: 'trades/test/1970-01-01/00-00-00.jsonl' },
+    ];
 
-    // Should not throw — Map deduplication handles this at runtime
-    // The actual duplicate detection happens in loadAndValidateFrozenInventory (tfp.mjs)
-    const result = await runPipeline({
-      dataDir: P0_1_DIR,
-      market: P0_1_MARKET,
-      fromMs: 0,
-      toMs: 120000,
-      runId: RUN_ID + '-h014',
-      frozenInventory: duplicateInventory,
-      kind: 'trades',
-    });
-    assert.ok(result !== undefined);
+    const errors = validateInventoryCrossReferences(entries);
+    assert.equal(errors.length, 1, 'should detect exactly 1 duplicate pair');
+    assert.match(errors[0], /duplicate/i, 'error should mention duplicate');
+    assert.match(errors[0], /market=test/, 'error should identify the market');
+    assert.match(errors[0], /block_start_ms=0/, 'error should identify the block');
   });
 
   // ── schema.mjs validity checks ──
@@ -553,6 +520,7 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
       toMs: 120000,
       runId: RUN_ID + '-default-kind',
     });
+    cleanP0_1Derived();
     const resultExplicit = await runPipeline({
       dataDir: P0_1_DIR,
       market: P0_1_MARKET,
@@ -564,5 +532,51 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
     assert.equal(resultDefault.processed, resultExplicit.processed);
     assert.equal(resultDefault.blocked, resultExplicit.blocked);
     assert.equal(resultDefault.blockedReason, resultExplicit.blockedReason);
+  });
+
+  // ── HORIZON-E2E: frozen inventory via tfp.mjs CLI with book_updates ──
+  it('HORIZON-E2E: frozen inventory via tfp.mjs CLI with book_updates', async () => {
+    cleanP0_1Derived();
+    const fixturePath = join(P0_1_DIR, 'frozen-inventory-e2e.json');
+
+    // Create frozen inventory fixture covering the two book_updates blocks
+    const fixture = [
+      {
+        market: P0_1_MARKET,
+        kind: 'book_updates',
+        block_start_ms: 0,
+        path: `book_updates/${P0_1_MARKET}/1970-01-01/00-00-00.jsonl`,
+        sha256: '',
+      },
+      {
+        market: P0_1_MARKET,
+        kind: 'book_updates',
+        block_start_ms: 60000,
+        path: `book_updates/${P0_1_MARKET}/1970-01-01/00-01-00.jsonl`,
+        sha256: '',
+      },
+    ];
+    writeFileSync(fixturePath, JSON.stringify(fixture, null, 2));
+
+    try {
+      const { spawnSync } = await import('node:child_process');
+      const result = spawnSync('node', [
+        'scripts/tfp.mjs',
+        '--data', P0_1_DIR,
+        '--from', '1970-01-01T00:00:00.000Z',
+        '--to', '1970-01-01T00:02:00.000Z',
+        '--kind', 'book_updates',
+        '--frozen-inventory', fixturePath,
+      ], { encoding: 'utf8', timeout: 15000 });
+
+      // Exit code 0 — blocked exit is not an error per tfp.mjs
+      assert.equal(result.status, 0, `tfp.mjs exit code should be 0 (got ${result.status}, stderr: ${result.stderr})`);
+
+      // Verify stderr contains blocked_state from pipeline
+      assert.ok(result.stderr.includes('blocked_state'), 'stderr should contain blocked_state output');
+      assert.ok(result.stderr.includes('verified-missing'), 'stderr should indicate verified-missing (gap in book_updates)');
+    } finally {
+      try { rmSync(fixturePath, { force: true }); } catch (_) {}
+    }
   });
 });
