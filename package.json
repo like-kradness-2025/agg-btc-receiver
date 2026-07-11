@@ -5,7 +5,7 @@
   "type": "module",
   "description": "BTC orderbook & trade receiver v3.00",
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test 'test/**/*.test.mjs'",
     "check": "node --check lib/*.mjs orderflow_monitor.mjs aux_data_collector.mjs fairprice_monitor.mjs scripts/cleanup-raw.mjs",
     "smoke": "node orderflow_monitor.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_v3_smoke",
     "fairprice": "node fairprice_monitor.mjs --config config.v3.json",

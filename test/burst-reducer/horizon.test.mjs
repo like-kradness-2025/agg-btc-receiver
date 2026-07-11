@@ -275,20 +275,20 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
   it('HORIZON-006: frozen inventory hash mismatch => hash-mismatch state', async () => {
     cleanP0_1Derived();
 
-    // First, run trades pipeline to create a checkpoint with pending block
+    // First, run trades pipeline without finalizedThrough to create checkpoint with pending block
     const result1 = await runPipeline({
       dataDir: P0_1_DIR,
       market: P0_1_MARKET,
       fromMs: 0,
       toMs: 120000,
       runId: RUN_ID + '-h006-a',
-      finalizedThroughMs: 90000,
+      // No finalizedThroughMs — leaves block 60000 pending with no-horizon-proof
       kind: 'trades',
     });
-    // Block 0 committed, block 60000 pending
+    // Block 0 committed, block 60000 pending (no-horizon-proof)
     assert.equal(result1.processed, 1);
 
-    // Now run again with frozen inventory that declares block 0 with a wrong sha256
+    // Now run again with frozen inventory
     // The pending block from checkpoint should trigger hash mismatch
     const fakeInventory = {
       byKindAndMarket: new Map([
