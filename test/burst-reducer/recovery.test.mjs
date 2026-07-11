@@ -640,4 +640,203 @@ describe('MarketStateRecovery', () => {
     // Staged file should be removed
     assert.ok(!existsSync(stagedPath), 'staged file should be removed on cursor mismatch');
   });
+
+  // ═══ P0-3: Crash recovery / committed-state integrity ═══
+
+  it('Fixture 16: Duplicate composite key — intent overwrites committed, hash mismatch => quarantine', async () => {
+    cleanup();
+    const { reconcileMarketState } = await import('../../lib/burst-reducer/recovery.mjs');
+    const { loadManifest } = await import('../../lib/burst-reducer/manifest-manager.mjs');
+
+    const blockMs = 390000;
+    const inputSha = sha256('input16');
+    const originalContent = makeShardContent(blockMs, MARKET);
+    const originalHash = sha256(originalContent);
+    const key = compositeKey(MARKET, blockMs, inputSha);
+
+    // Create final shard from a prior successful commit (hash = originalHash)
+    const date = '1970-01-01';
+    const finalPath = join(FEATURES_DIR, date, '00-06-30.jsonl');
+    mkdirSync(dirname(finalPath), { recursive: true });
+    writeFileSync(finalPath, originalContent);
+
+    // Write committed record (simulating first worker's completed commit)
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: blockMs,
+      processed_blocks: {
+        [key]: makeCommittedRecord(key, blockMs, inputSha, originalHash, 1),
+      },
+    });
+
+    // Now simulate a write race: second worker overwrites manifest with an intent
+    // for the same composite key but with a DIFFERENT staged_row_hash
+    const wrongHash = sha256('corrupted-content');
+    const intentRec = makeIntentRecord(key, blockMs, inputSha, wrongHash);
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: null,
+      processed_blocks: { [key]: intentRec },
+    });
+
+    const result = reconcileMarketState(MARKET, TEST_ROOT);
+    // Final exists but its hash (originalHash) differs from staged_row_hash (wrongHash) → quarantine
+    assert.ok(result.quarantinedKeys.length >= 1,
+      'duplicate key with hash mismatch should be quarantined');
+
+    const manifest = loadManifest(MARKET, TEST_ROOT);
+    assert.equal(manifest.processed_blocks[key].status, 'quarantined',
+      'duplicate key hash mismatch should result in quarantined');
+  });
+
+  it('Fixture 17: Intent-only — manifest has intent, no staged file, no final file => quarantine', async () => {
+    cleanup();
+    const { reconcileMarketState } = await import('../../lib/burst-reducer/recovery.mjs');
+    const { loadManifest } = await import('../../lib/burst-reducer/manifest-manager.mjs');
+
+    const blockMs = 420000;
+    const inputSha = sha256('input17');
+    const key = compositeKey(MARKET, blockMs, inputSha);
+
+    // Intent record — DO NOT create any staged or final files on disk
+    const intentRec = makeIntentRecord(key, blockMs, inputSha, sha256('nonexistent-content'));
+    intentRec.staged_path = join(FEATURES_DIR, '.staging', 'run1', '00-07-00.jsonl');
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: null,
+      processed_blocks: { [key]: intentRec },
+    });
+
+    const result = reconcileMarketState(MARKET, TEST_ROOT);
+    assert.ok(result.quarantinedKeys.length >= 1,
+      'intent-only (no staged, no final) should be quarantined');
+
+    const manifest = loadManifest(MARKET, TEST_ROOT);
+    assert.equal(manifest.processed_blocks[key].status, 'quarantined',
+      'intent-only should result in quarantined');
+  });
+
+  it('Fixture 18: Staged-only — orphan staged file with no manifest entry => reconciler ignores (no crash)', async () => {
+    cleanup();
+    const { reconcileMarketState } = await import('../../lib/burst-reducer/recovery.mjs');
+
+    const orphanBlockMs = 450000;
+    const orphanContent = makeShardContent(orphanBlockMs, MARKET);
+
+    // Create orphan staged file (no manifest entry references it)
+    const orphanStagedPath = join(FEATURES_DIR, '.staging', 'run1', '00-07-30.jsonl');
+    mkdirSync(dirname(orphanStagedPath), { recursive: true });
+    writeFileSync(orphanStagedPath, orphanContent);
+
+    // Manifest has an unrelated record so reconciler has something to process
+    const otherBlockMs = 480000;
+    const otherSha = sha256('input18');
+    const otherKey = compositeKey(MARKET, otherBlockMs, otherSha);
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: null,
+      processed_blocks: {
+        [otherKey]: makeIntentRecord(otherKey, otherBlockMs, otherSha, sha256('none')),
+      },
+    });
+
+    // Reconciliation must not crash due to orphan staged file
+    const result = reconcileMarketState(MARKET, TEST_ROOT);
+    assert.ok(Array.isArray(result.quarantinedKeys),
+      'reconciler should not crash with orphan staged file');
+
+    // Orphan staged persists — reconciler only cleans up files referenced in manifest
+    assert.ok(existsSync(orphanStagedPath),
+      'orphan staged file persists (out of manifest scope)');
+  });
+
+  it('Fixture 19: Final-only — final shard exists, no manifest entry => no quarantine (already committed)', async () => {
+    cleanup();
+    const { reconcileMarketState } = await import('../../lib/burst-reducer/recovery.mjs');
+
+    const orphanBlockMs = 510000;
+    const orphanContent = makeShardContent(orphanBlockMs, MARKET);
+
+    // Create final shard with no corresponding manifest entry
+    const date = '1970-01-01';
+    const orphanFinalPath = join(FEATURES_DIR, date, '00-08-30.jsonl');
+    mkdirSync(dirname(orphanFinalPath), { recursive: true });
+    writeFileSync(orphanFinalPath, orphanContent);
+
+    // Manifest has an unrelated record
+    const otherBlockMs = 540000;
+    const otherSha = sha256('input19');
+    const otherKey = compositeKey(MARKET, otherBlockMs, otherSha);
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: null,
+      processed_blocks: {
+        [otherKey]: makeIntentRecord(otherKey, otherBlockMs, otherSha, sha256('none')),
+      },
+    });
+
+    const result = reconcileMarketState(MARKET, TEST_ROOT);
+    // Final-only (no manifest record) should NOT be quarantined
+    // The orphan key isn't in the manifest, so it's never visited
+    assert.ok(Array.isArray(result.quarantinedKeys),
+      'reconciler should not crash with orphan final file');
+    // Verify the unrelated record was quarantined (no files), not the orphan
+    assert.ok(!result.quarantinedKeys.some(k => k.includes('510000')),
+      'final-only orphan should not appear in quarantinedKeys');
+
+    // Final file still exists (it was already committed)
+    assert.ok(existsSync(orphanFinalPath),
+      'final-only shard persists (already committed)');
+  });
+
+  it('Fixture 20: Generation must be monotonic — cp gen=3, committed record gen=3 => quarantine', async () => {
+    cleanup();
+    const { reconcileMarketState } = await import('../../lib/burst-reducer/recovery.mjs');
+    const { loadManifest } = await import('../../lib/burst-reducer/manifest-manager.mjs');
+
+    const blockMs = 570000;
+    const inputSha = sha256('input20');
+    const content = makeShardContent(blockMs, MARKET);
+    const contentHash = sha256(content);
+    const key = compositeKey(MARKET, blockMs, inputSha);
+
+    // Create committed final shard with valid hash
+    const date = '1970-01-01';
+    const finalPath = join(FEATURES_DIR, date, '00-09-30.jsonl');
+    mkdirSync(dirname(finalPath), { recursive: true });
+    writeFileSync(finalPath, content);
+
+    // Committed record with checkpoint_generation=3
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: blockMs,
+      processed_blocks: {
+        [key]: makeCommittedRecord(key, blockMs, inputSha, contentHash, 3),
+      },
+    });
+
+    // Checkpoint with generation=3 (record gen >= cp gen → monotonicity violation)
+    writeCheckpointFile({
+      schema_version: 'burst_features_v1',
+      last_committed_block_start: blockMs - 30000,
+      pending_block: null,
+      open_burst: null,
+      generation: 3,
+      updated_at: new Date().toISOString(),
+    });
+
+    const result = reconcileMarketState(MARKET, TEST_ROOT);
+    assert.ok(result.quarantinedKeys.length >= 1,
+      'committed record gen == cp gen should be quarantined (generation not strictly less)');
+
+    const manifest = loadManifest(MARKET, TEST_ROOT);
+    assert.equal(manifest.processed_blocks[key].status, 'quarantined',
+      'gen==gen monotonic violation should result in quarantined');
+  });
 });
