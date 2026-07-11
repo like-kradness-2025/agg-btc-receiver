@@ -839,4 +839,51 @@ describe('MarketStateRecovery', () => {
     assert.equal(manifest.processed_blocks[key].status, 'quarantined',
       'gen==gen monotonic violation should result in quarantined');
   });
+
+  it('Fixture 21: intent + finalExists + gen == cp gen + hash matches => committed (intent gen >= fix)', async () => {
+    cleanup();
+    const { reconcileMarketState } = await import('../../lib/burst-reducer/recovery.mjs');
+    const { loadManifest } = await import('../../lib/burst-reducer/manifest-manager.mjs');
+
+    const blockMs = 510000;
+    const inputSha = sha256('input21');
+    const content = makeShardContent(blockMs, MARKET);
+    const contentHash = sha256(content);
+    const key = compositeKey(MARKET, blockMs, inputSha);
+
+    // Create final shard (rename already happened)
+    const date = '1970-01-01';
+    const finalPath = join(FEATURES_DIR, date, '00-08-30.jsonl');
+    mkdirSync(dirname(finalPath), { recursive: true });
+    writeFileSync(finalPath, content);
+
+    // Intent record with gen=2 (same as checkpoint gen)
+    const intentRec = makeIntentRecord(key, blockMs, inputSha, contentHash);
+    intentRec.checkpoint_generation = 2;
+    writeManifestFile({
+      schema_version: 'burst_features_v1',
+      market: MARKET,
+      last_checkpoint_block_start: null,
+      processed_blocks: { [key]: intentRec },
+    });
+
+    // Checkpoint with gen=2 (intent gen === cp gen — normal after rename-before-checkpoint crash)
+    writeCheckpointFile({
+      schema_version: 'burst_features_v1',
+      last_committed_block_start: blockMs,
+      pending_block: null,
+      open_burst: null,
+      generation: 2,
+      updated_at: new Date().toISOString(),
+    });
+
+    const result = reconcileMarketState(MARKET, TEST_ROOT);
+    // intent gen === cp gen is OK for intent records (checkpoint not yet updated)
+    assert.deepEqual(result.quarantinedKeys, [],
+      'intent with gen == cp gen should not quarantine (checkpoint write deferred)');
+
+    const manifest = loadManifest(MARKET, TEST_ROOT);
+    assert.equal(manifest.processed_blocks[key].status, 'committed',
+      'intent with gen == cp gen and matching hash should result in committed');
+  });
 });
