@@ -153,8 +153,8 @@ async function main() {
   console.log(`[agg-btc] output base: ${outputBase}`);
 
   const collector = new FairPriceCollector(outputBase, {
-    snapshotIntervalMs: config.tick?.feature_ms ?? 1000,
-    bookSnapshotMs: config.tick?.book_snapshot_ms ?? 30000,
+    snapshotIntervalMs: config.fairprice?.snapshot_interval_ms ?? 1000,
+    bookSnapshotMs: config.fairprice?.book_snapshot_ms ?? 30000,
   });
   collectors.set('main', collector);
 

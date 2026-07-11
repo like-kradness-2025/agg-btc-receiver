@@ -792,7 +792,7 @@ async function smokeTest() {
 
 function deleteProcessedRawFiles(dataDir, markets, fromMs, toMs, runReport) {
   let deleted = 0;
-  const subdirs = ['trades', 'book_updates', 'snapshots'];
+  const subdirs = ['trades', 'book_updates'];
   for (const market of markets) {
     const mktReport = runReport.markets[market];
     if (!mktReport || mktReport.trades_read === 0) continue;

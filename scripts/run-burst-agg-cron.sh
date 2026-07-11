@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Deterministic burst aggregation cron runner.
-# Processes the oldest remaining finalized raw window up to a safe cutoff.
-# Avoids LLM-derived from/to gaps.
+# Legacy burst-agg cron runner.
+# Kept only for historical backfill / comparison work against data/burst_agg.
+# Live authoritative outputs now come from FeatureAccumulator in orderflow_monitor.mjs.
+
+echo "run-burst-agg-cron.sh is legacy. Use scripts/run-cleanup-raw.sh for live maintenance." >&2
+echo "Set BURST_AGG_LEGACY_OK=1 if you intentionally want the old burst_agg path." >&2
+if [[ "${BURST_AGG_LEGACY_OK:-0}" != "1" ]]; then
+  exit 1
+fi
 
 set -euo pipefail
 

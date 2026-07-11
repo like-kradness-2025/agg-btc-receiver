@@ -1,0 +1,700 @@
+{
+  "vector_version": "tfp-book-contract-vector-v1",
+  "contract": {
+    "block_start_ms": 0,
+    "block_end_ms": 30000,
+    "market": "test",
+    "schema_version": "book_updates_v1",
+    "anchor_rule": "event_ts_ms < anchor_ts_ms",
+    "raw_bytes_include_trailing_newline": true,
+    "event_ordering": [
+      "event_ts_ms ASC",
+      "type_priority(snapshot=0, update=1) ASC",
+      "sequence_or_range_start ASC",
+      "file_path ASC",
+      "line_no ASC"
+    ],
+    "event_time_regression": "retain raw order metadata; stable-sort by the complete key; mark reordered_input and timestamp_inversion_count; never use wall-clock order",
+    "anchor_semantics": "feature-computer-1s row uses second_ts bucket and BurstBuilder overlap; board_* candidates are separate names, not #1-#12"
+  },
+  "adapter_contract": {
+    "canonical_fields": [
+      "seq",
+      "prev_seq",
+      "seq_start",
+      "seq_end",
+      "bridge_kind"
+    ],
+    "mapping": "single sequence => seq=S, prev_seq=P; range => seq_start=A, seq_end=B, seq=B, prev_seq=P; snapshot seed => bridge_kind=seed; snapshot-after-gap recovery is recorded but does not erase prior quarantine",
+    "bridge_conditions": [
+      "single update requires prev_seq==last_seq or seq==last_seq+1 when prev_seq is null",
+      "range requires prev_seq==last_seq and seq_start==last_seq+1",
+      "snapshot-after-snapshot seeds; first post-snapshot update must satisfy the same bridge rule"
+    ],
+    "unknown_source": "canonicalize only when source supplies unambiguous values; otherwise seq/prev_seq/range are null, provenance records source mapping, status=unsequenced; inference is forbidden"
+  },
+  "raw_block": {
+    "trades": {
+      "path": "trades/test/1970-01-01/00-00-00.jsonl",
+      "line_no_range": [1, 2],
+      "sha256": "10e8b4dac451511ba57bb9542b11485c1dac78c697c92ec2fbe06666653cfe95",
+      "content": "{\"ts\":1000,\"price\":10,\"qty\":1,\"side\":\"buy\",\"tradeId\":\"t1\",\"market\":\"test\"}\n{\"ts\":1500,\"price\":10,\"qty\":1,\"side\":\"sell\",\"tradeId\":\"t2\",\"market\":\"test\"}\n"
+    },
+    "book_updates": {
+      "path": "book_updates/test/1970-01-01/00-00-00.jsonl",
+      "line_no_range": [1, 2],
+      "sha256": "2a899c5e551c7b2a4034b5077d09f400c0b0d74b2bb80329c8966aba4674cb45",
+      "content": "{\"schema_version\":\"book_updates_v1\",\"market\":\"test\",\"type\":\"snapshot\",\"event_ts_ms\":500,\"seq\":100,\"prev_seq\":null,\"bids\":[[\"100\",\"2\"]],\"asks\":[[\"101\",\"3\"]],\"source\":{\"exchange\":\"test\",\"channel\":\"book\",\"adapter\":\"test-book-adapter\",\"adapter_version\":\"1.0.0\"}}\n{\"schema_version\":\"book_updates_v1\",\"market\":\"test\",\"type\":\"update\",\"event_ts_ms\":1500,\"seq\":101,\"prev_seq\":100,\"bids\":[[\"100\",\"0\"],[\"101\",\"2\"]],\"asks\":[[\"101\",\"0\"],[\"102\",\"3\"]],\"source\":{\"exchange\":\"test\",\"channel\":\"book\",\"adapter\":\"test-book-adapter\",\"adapter_version\":\"1.0.0\"}}\n"
+    }
+  },
+  "main_case": {
+    "description": "snapshot then update; update deletes old best levels and installs new levels",
+    "events": [
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "snapshot", "event_ts_ms": 500, "seq": 100, "prev_seq": null,
+        "bids": [["100","2"]], "asks": [["101","3"]],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+      },
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "update", "event_ts_ms": 1500, "seq": 101, "prev_seq": 100,
+        "bids": [["100","0"],["101","2"]], "asks": [["101","0"],["102","3"]],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+      }
+    ],
+    "expected": {
+      "state_at_1000": {
+        "seeded": true, "best_bid": 100, "best_bid_qty": 2, "best_ask": 101, "best_ask_qty": 3,
+        "mid": 100.5, "last_seq": 100
+      },
+      "state_at_1500": {
+        "seeded": true, "best_bid": 100, "best_bid_qty": 2, "best_ask": 101, "best_ask_qty": 3,
+        "mid": 100.5, "last_seq": 100
+      },
+      "state_at_1501": {
+        "seeded": true, "best_bid": 101, "best_bid_qty": 2, "best_ask": 102, "best_ask_qty": 3,
+        "mid": 101.5, "last_seq": 101
+      },
+      "feature_computer_1s_row_at_1000": {
+        "burst_count_1s": 2,
+        "total_burst_notional_1s": 20,
+        "traded_notional_30s": 30,
+        "burst_notional_vs_30s_traded_notional": 0.6666666666666666
+      },
+      "feature_computer_1s_row_at_2000": {
+        "burst_count_1s": 0,
+        "total_burst_notional_1s": 0,
+        "traded_notional_30s": 30,
+        "burst_notional_vs_30s_traded_notional": 0
+      },
+      "board_candidates_at_1000": {
+        "book_state_anchor": "state_at_1000",
+        "top_depth_notional": 503,
+        "board_top_depth_ratio": 0.039761431411530816,
+        "board_vs_depth": 0.039761431411530816,
+        "prior_mid": null,
+        "board_mid_move_bps": null
+      },
+      "board_candidates_at_2000": {
+        "book_state_anchor": "state_at_2000",
+        "top_depth_notional": 508,
+        "board_top_depth_ratio": 0,
+        "board_vs_depth": 0,
+        "prior_mid": 100.5,
+        "board_mid_move_bps": 99.50248756218905
+      },
+      "quality": {
+        "contract": "tfp_book_contract_v1",
+        "book_status": "seeded",
+        "sequence_status": "ok",
+        "trade_count_this_second": 0,
+        "input_block_ids": ["book_updates/test/1970-01-01/00-00-00.jsonl"],
+        "raw_sha256": {
+          "book_updates/test/1970-01-01/00-00-00.jsonl": "2a899c5e551c7b2a4034b5077d09f400c0b0d74b2bb80329c8966aba4674cb45"
+        },
+        "raw_sha256_present": true,
+        "reason_code": null,
+        "line_no": [1, 2],
+        "event_payload_sha256": [
+          "9e96c4ec430c5c3b016db5d5aed621af49d7527c8c3dd2e977f149aa2081607b",
+          "8158da20ae2ae590de677a7d1d345cfa8f43a584a8767f3203f1b1f04a2bfcbe"
+        ],
+        "book_event_count_applied": 2,
+        "book_event_count_ignored": 0,
+        "anchor_rule": "event_ts_ms < anchor_ts_ms",
+        "provenance": {
+          "book_source": "raw_book_updates",
+          "adapter": "test-book-adapter@1.0.0"
+        }
+      }
+    }
+  },
+  "ordering_case": {
+    "description": "mix of snapshot/update with range events, same timestamp, event-time inversion, and range seq_start/seq_end",
+    "events": [
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "update", "event_ts_ms": 1000, "seq": 12, "prev_seq": 11,
+        "seq_start": 12, "seq_end": 12,
+        "bids": [["100","2"]], "asks": [],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/z.jsonl", "line_no": 2
+      },
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "snapshot", "event_ts_ms": 1000, "seq": 11, "prev_seq": null,
+        "bids": [["100","1"]], "asks": [["101","1"]],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/a.jsonl", "line_no": 1
+      },
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "update", "event_ts_ms": 1000, "seq": 11, "prev_seq": 10,
+        "bids": [["100","3"]], "asks": [],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/a.jsonl", "line_no": 3
+      },
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "update", "event_ts_ms": 999, "seq": 10, "prev_seq": 9,
+        "bids": [["100","1"]], "asks": [],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/a.jsonl", "line_no": 4
+      },
+      {
+        "schema_version": "book_updates_v1", "market": "test",
+        "type": "update", "event_ts_ms": 1001, "seq": 20, "prev_seq": 19,
+        "seq_start": 16, "seq_end": 20,
+        "bids": [["102","5"]], "asks": [],
+        "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+        "path": "book_updates/b.jsonl", "line_no": 1
+      }
+    ],
+    "expected_order": [
+      "999:update:a:4",
+      "1000:snapshot:a:1",
+      "1000:update:a:3",
+      "1000:update:z:2[12-12]",
+      "1001:update:b:1[16-20]"
+    ],
+    "priority": "snapshot before update at equal event_ts_ms; sequence_or_range_start (seq_start) then path then line are final tie-breaks",
+    "event_time_regression": {
+      "reordered_input": true,
+      "timestamp_inversion_count": 1
+    }
+  },
+  "sequence_mapping_cases": [
+    {
+      "id": "single-seq",
+      "source": {"raw_seq": 42},
+      "canonical": {"seq": 42, "prev_seq": null, "seq_start": null, "seq_end": null},
+      "expected": "adapter_must_not_invent_prev_seq; continuity_uses_last_seq_plus_one"
+    },
+    {
+      "id": "range",
+      "source": {"first_update_id": 101, "final_update_id": 105, "pu": 100},
+      "canonical": {"seq": 105, "prev_seq": 100, "seq_start": 101, "seq_end": 105},
+      "expected": "bridge_if_prev_seq_equals_last_seq_and_start_is_last_plus_one"
+    },
+    {
+      "id": "snapshot-first-update",
+      "source": {"snapshot_seq": 100, "update_seq": 101, "update_prev": 100},
+      "canonical": {"seq": 101, "prev_seq": 100},
+      "expected": "ok"
+    },
+    {
+      "id": "unrepresentable",
+      "source": {"exchange_seq": "opaque"},
+      "canonical": {"seq": null, "prev_seq": null, "seq_start": null, "seq_end": null},
+      "expected": "unsequenced_with_provenance_no_guess"
+    }
+  ],
+  "state_cases": [
+    {
+      "id": "valid-empty",
+      "input": {"exists": true, "bytes": "\\n", "parse": "valid-empty"},
+      "expected": {"state": "valid-empty", "commit": true, "cursor": "advance"}
+    },
+    {
+      "id": "verified-missing",
+      "input": {"exists": false, "inside_authoritative_horizon": true},
+      "expected": {"state": "verified-missing", "commit": false, "cursor": "retain", "quarantine": true}
+    },
+    {
+      "id": "not-yet-arrived",
+      "input": {"exists": false, "inside_authoritative_horizon": false},
+      "expected": {"state": "not-yet-arrived", "commit": false, "cursor": "retain", "quarantine": false, "blocked_reason": "no-horizon-proof"}
+    },
+    {
+      "id": "malformed",
+      "input": {"exists": true, "parse": "error"},
+      "expected": {"state": "malformed", "commit": false, "cursor": "retain", "quarantine": true}
+    },
+    {
+      "id": "hash-mismatch",
+      "input": {"exists": true, "hash": "wrong"},
+      "expected": {"state": "hash_mismatch", "commit": false, "cursor": "retain", "quarantine": true}
+    },
+    {
+      "id": "unsequenced",
+      "input": {"exists": true, "sequence": "null"},
+      "expected": {"state": "unsequenced", "commit": true, "cursor": "advance", "book_value": "unavailable"}
+    },
+    {
+      "id": "sequence-gap",
+      "input": {"exists": true, "sequence": "gap"},
+      "expected": {"state": "sequence-gap", "commit": false, "cursor": "retain", "quarantine": true}
+    }
+  ],
+  "cases": [
+    {
+      "id": "sequence-gap",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 12, "prev_seq": 10,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "state_at_300": null,
+        "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "gap"},
+        "error": {"code": "SEQUENCE_GAP", "reason": "prev_seq 10 does not bridge to seq 12"}
+      }
+    },
+    {
+      "id": "unsequenced",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": null, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": null, "prev_seq": null,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "quality": {"book_status": "unsequenced", "sequence_status": "unsequenced"},
+        "commit": true, "cursor": "advance", "book_value": "unavailable"
+      }
+    },
+    {
+      "id": "valid-empty",
+      "events": [],
+      "expected": {"state": "valid-empty", "commit": true, "cursor": "advance"}
+    },
+    {
+      "id": "malformed-envelope",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 2, "prev_seq": 1,
+          "bids": [["100","-1"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "malformed"},
+        "error": {"code": "MALFORMED_LEVEL", "reason": "qty must be >= 0"}
+      }
+    },
+    {
+      "id": "verified-missing",
+      "events": null,
+      "expected": {"state": "verified-missing", "commit": false, "cursor": "retain", "quarantine": true}
+    },
+    {
+      "id": "not-yet-arrived",
+      "events": null,
+      "expected": {"state": "not-yet-arrived", "commit": false, "cursor": "retain", "blocked_reason": "no-horizon-proof"}
+    },
+    {
+      "id": "hash-mismatch",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 500, "seq": 100, "prev_seq": null,
+          "bids": [["100","2"]], "asks": [["101","3"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 1500, "seq": 101, "prev_seq": 100,
+          "bids": [["100","0"],["101","2"]], "asks": [["101","0"],["102","3"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "state": "hash_mismatch", "commit": false, "cursor": "retain", "quarantine": true,
+        "expected_sha256": "2a899c5e551c7b2a4034b5077d09f400c0b0d74b2bb80329c8966aba4674cb45",
+        "actual_sha256": "123676981186fa72a54acb5d9cff5925f5c1e919cbace2e61adbf0c72baa08f6"
+      },
+      "input": {
+        "path": "book_updates/test/1970-01-01/00-00-00.jsonl",
+        "expected_sha256": "2a899c5e551c7b2a4034b5077d09f400c0b0d74b2bb80329c8966aba4674cb45",
+        "actual_sha256": "123676981186fa72a54acb5d9cff5925f5c1e919cbace2e61adbf0c72baa08f6",
+        "raw_content": "{\"schema_version\":\"book_updates_v1\",\"market\":\"test\",\"type\":\"snapshot\",\"event_ts_ms\":500,\"seq\":100,\"prev_seq\":null,\"bids\":[[\"99\",\"2\"]],\"asks\":[[\"101\",\"3\"]],\"source\":{\"exchange\":\"test\",\"channel\":\"book\",\"adapter\":\"test-book-adapter\",\"adapter_version\":\"1.0.0\"}}\n{\"schema_version\":\"book_updates_v1\",\"market\":\"test\",\"type\":\"update\",\"event_ts_ms\":1500,\"seq\":101,\"prev_seq\":100,\"bids\":[[\"100\",\"0\"],[\"101\",\"2\"]],\"asks\":[[\"101\",\"0\"],[\"102\",\"3\"]],\"source\":{\"exchange\":\"test\",\"channel\":\"book\",\"adapter\":\"test-book-adapter\",\"adapter_version\":\"1.0.0\"}}\n"
+      }
+    },
+    {
+      "id": "frozen-inventory",
+      "inventory": {
+        "mode": "backfill",
+        "frozen": true,
+        "blocks": [
+          {
+            "market": "test",
+            "kind": "book_updates",
+            "block_start_ms": 0,
+            "path": "book_updates/test/1970-01-01/00-00-00.jsonl",
+            "sha256": "2a899c5e551c7b2a4034b5077d09f400c0b0d74b2bb80329c8966aba4674cb45"
+          },
+          {
+            "market": "test",
+            "kind": "book_updates",
+            "block_start_ms": 30000,
+            "path": "book_updates/test/1970-01-01/00-00-30.jsonl",
+            "sha256": "7d01ead03dd21aaa27faadd6f05915c398076d21335aded20a2ba4ad242276e6"
+          },
+          {
+            "market": "test",
+            "kind": "book_updates",
+            "block_start_ms": 60000,
+            "path": "book_updates/test/1970-01-01/00-01-00.jsonl",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "raw_input_map": {
+        "book_updates/test/1970-01-01/00-00-00.jsonl": {
+          "sha256": "2a899c5e551c7b2a4034b5077d09f400c0b0d74b2bb80329c8966aba4674cb45",
+          "kind": "book_updates"
+        },
+        "book_updates/test/1970-01-01/00-00-30.jsonl": {
+          "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "kind": "book_updates"
+        },
+        "book_updates/test/1970-01-01/00-01-30.jsonl": {
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "kind": "book_updates"
+        }
+      },
+      "expected": {
+        "inventory_authoritative": true,
+        "declared_existing_paths": ["book_updates/test/1970-01-01/00-00-00.jsonl"],
+        "declared_missing_paths": ["book_updates/test/1970-01-01/00-01-00.jsonl"],
+        "hash_mismatch_paths": ["book_updates/test/1970-01-01/00-00-30.jsonl"],
+        "kind_mismatch_paths": [],
+        "undeclared_present_paths": ["book_updates/test/1970-01-01/00-01-30.jsonl"],
+        "commit": false,
+        "cursor": "retain",
+        "quarantine": true
+      }
+    },
+    {
+      "id": "quarantine-no-commit",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 12, "prev_seq": 10,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "commit": false,
+        "cursor": "retain",
+        "quarantine_record": "SEQUENCE_GAP"
+      }
+    },
+    {
+      "id": "crossed-book",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["102","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "ok"},
+        "error": {"code": "CROSSED_BOOK", "reason": "best_bid 102 >= best_ask 101"}
+      }
+    },
+    {
+      "id": "stale-duplicate",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 11, "prev_seq": 10,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 300, "seq": 10, "prev_seq": null,
+          "bids": [["100","3"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 3
+        }
+      ],
+      "expected": {
+        "quality": {"book_status": "seeded", "sequence_status": "stale_duplicate"},
+        "commit": true,
+        "cursor": "advance"
+      }
+    },
+    {
+      "id": "gap-after-snapshot",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 12, "prev_seq": 10,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 300, "seq": 20, "prev_seq": null,
+          "bids": [["200","5"]], "asks": [["201","5"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 3
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "gap"},
+        "commit": false,
+        "cursor": "retain",
+        "error": {"code": "SEQUENCE_GAP", "reason": "gap detected; later snapshot does not erase quarantine"}
+      }
+    },
+    {
+      "id": "range-bridge-ok",
+      "description": "range event with correct bridge: prev_seq matches last_seq, seq_start is last_seq+1, seq_end >= seq_start",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 15, "prev_seq": 10,
+          "seq_start": 11, "seq_end": 15,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "quality": {"book_status": "seeded", "sequence_status": "ok"},
+        "commit": true, "cursor": "advance",
+        "state": {"seeded": true, "best_bid": 100, "best_bid_qty": 2, "best_ask": 101, "best_ask_qty": 1, "mid": 100.5, "last_seq": 15}
+      }
+    },
+    {
+      "id": "range-bridge-fail",
+      "description": "range event with fails bridge: seq_start is not last_seq+1",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 15, "prev_seq": 10,
+          "seq_start": 12, "seq_end": 15,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "gap"},
+        "commit": false, "cursor": "retain",
+        "error": {"code": "SEQUENCE_GAP", "reason": "bridge fail: seq_start 12 !== last_seq+1 11"}
+      }
+    },
+    {
+      "id": "single-seq-prev-mismatch",
+      "description": "single seq update with prev_seq that doesn't match last_seq",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 11, "prev_seq": 9,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "gap"},
+        "commit": false, "cursor": "retain",
+        "error": {"code": "SEQUENCE_GAP", "reason": "prev_seq 9 !== last_seq 10"}
+      }
+    },
+    {
+      "id": "prev-null-seq-jump",
+      "description": "prev_seq null but seq jumps past last_seq+1",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 12, "prev_seq": null,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "gap"},
+        "commit": false, "cursor": "retain",
+        "error": {"code": "SEQUENCE_GAP", "reason": "seq 12 !== last_seq+1 11 (prev_seq null)"}
+      }
+    },
+    {
+      "id": "range-seq-end-lt-start",
+      "description": "range with seq_end < seq_start is invalid",
+      "events": [
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "snapshot", "event_ts_ms": 100, "seq": 10, "prev_seq": null,
+          "bids": [["100","1"]], "asks": [["101","1"]],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 1
+        },
+        {
+          "schema_version": "book_updates_v1", "market": "test",
+          "type": "update", "event_ts_ms": 200, "seq": 20, "prev_seq": 10,
+          "seq_start": 15, "seq_end": 10,
+          "bids": [["100","2"]], "asks": [],
+          "source": {"exchange":"test","channel":"book","adapter":"test-book-adapter","adapter_version":"1.0.0"},
+          "path": "book_updates/test/1970-01-01/00-00-00.jsonl", "line_no": 2
+        }
+      ],
+      "expected": {
+        "state": null, "feature": null,
+        "quality": {"book_status": "quarantine", "sequence_status": "gap"},
+        "commit": false, "cursor": "retain",
+        "error": {"code": "SEQUENCE_GAP", "reason": "seq_end 10 < seq_start 15"}
+      }
+    },
+    {
+      "id": "assumed-empty-gap-trade-only",
+      "description": "ASSUMED_EMPTY_GAP applies to trade-only lookback (e.g., #12 denominator gap). Book must NOT extend this to synthetic empty blocks or sequence-gap recovery.",
+      "input": {
+        "has_gap": true,
+        "trade_scenario": {
+          "description": "trade-only proven absent lookback contributes zero notional, commit allowed",
+          "kind": "trade",
+          "exists": false,
+          "inside_authoritative_horizon": true,
+          "expected_zero_contribution": true,
+          "expected_commit": true
+        },
+        "book_scenario": {
+          "description": "same missing condition for book -> not-yet-arrived / verified-missing, NOT synthetic empty",
+          "kind": "book_updates",
+          "exists": false,
+          "inside_authoritative_horizon": false,
+          "expected_commit": false,
+          "expected_cursor": "retain",
+          "expected_synthetic_empty": false
+        }
+      },
+      "expected": {
+        "assumed_empty_gap_applicable": false,
+        "reason": "ASSUMED_EMPTY_GAP is trade-only lookback; book sequence gap must quarantine, not assume empty",
+        "trade_commit": true,
+        "book_commit": false
+      }
+    }
+  ],
+  "commit_cursor_contract": {
+    "assumed_empty_gap": "Existing TFP may commit a trade block across a proven absent lookback as ASSUMED_EMPTY_GAP; this does not authorize synthetic book empty blocks or sequence-gap recovery.",
+    "no_horizon_proof": "Range exhaustion without finalized-through/frozen-inventory proof retains pending cursor and returns blocked_reason=no-horizon-proof (not-yet-arrived).",
+    "quarantine": "No feature shard, manifest commit, or checkpoint cursor advancement. Quarantine record is no-clobber.",
+    "book_adapter_note": "The book contract adapter handles book_updates kind separately from trades. Existing TFP trade-only inventory and ASSUMED_EMPTY_GAP apply to trades kind only. Book_updates does not participate in trade-only ASSUMED_EMPTY_GAP; book sequence gaps are always quarantine."
+  },
+  "frozen_inventory_expectation": {
+    "mode": "backfill",
+    "inventory_is_authority": true,
+    "missing_declared_block": "verified-missing",
+    "undeclared_block": "not-yet-arrived",
+    "hash_mismatch": "quarantine_no_commit",
+    "book_adapter_kind_note": "book contract adapter handles 'book_updates' kind in isolation from existing TFP trade-only pipeline. Trade-only pipeline handles 'trades' kind. These are separate inventory namespaces. P0-0 does not make book_updates production-ready; the adapter is a separate component that the existing trade-only pipeline does not call."
+  }
+}

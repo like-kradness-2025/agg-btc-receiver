@@ -182,14 +182,15 @@
   "output": {
     "base_path": "data/live_v3",
     "flush_trades_ms": 200,
-    "flush_features_ms": 200,
     "flush_book_ms": 1000,
     "flush_health_ms": 1000,
     "flush_liquidations_ms": 200
   },
   "tick": {
-    "feature_ms": 1000,
-    "book_snapshot_ms": 600000,
     "market_data_ms": 60000
+  },
+  "fairprice": {
+    "snapshot_interval_ms": 30000,
+    "book_snapshot_ms": 600000
   }
 }

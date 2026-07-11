@@ -6,10 +6,15 @@
   "description": "BTC orderbook & trade receiver v3.00",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check lib/*.mjs orderflow_monitor.mjs fairprice_monitor.mjs",
+    "check": "node --check lib/*.mjs orderflow_monitor.mjs aux_data_collector.mjs fairprice_monitor.mjs scripts/cleanup-raw.mjs",
     "smoke": "node orderflow_monitor.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_v3_smoke",
     "fairprice": "node fairprice_monitor.mjs --config config.v3.json",
-    "smoke:fairprice": "node fairprice_monitor.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_fairprice_smoke"
+    "smoke:fairprice": "node fairprice_monitor.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_fairprice_smoke",
+    "aux": "node aux_data_collector.mjs --config config.v3.json",
+    "smoke:aux": "node aux_data_collector.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_v3_aux_smoke",
+    "cleanup:raw:dry-run": "node scripts/cleanup-raw.mjs --dry-run",
+    "cleanup:raw": "node scripts/cleanup-raw.mjs",
+    "tfp": "node scripts/tfp.mjs"
   },
   "dependencies": {
     "duckdb": "^1.4.4",

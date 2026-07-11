@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 /**
- * orderflow_monitor.mjs — btc-receiver v3.00 main entry point
+ * orderflow_monitor.mjs — btc-receiver v3.11 multi-worker orchestrator
+ *
+ * Main thread keeps: HealthMonitor
+ * Spawns 4 worker threads with market groups, routes IPC events.
+ * Pure receive + save — no feature computation, no REST auxiliary collection.
  *
  * Usage:
  *   node orderflow_monitor.mjs --help
@@ -10,31 +14,23 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { BinanceSpotConnector, BinancePerpConnector } from './lib/binance-connector.mjs';
-import { BinanceSpotUsdcConnector } from './lib/binance-usdc-connector.mjs';
-import { BybitConnector } from './lib/bybit-connector.mjs';
-import { OkxConnector } from './lib/okx-connector.mjs';
-import { BinanceCoinmPerpConnector, BinancePerpBtcusdcConnector, BybitSpotConnector, OkxSpotConnector, KrakenSpotConnectorAlias } from './lib/market-connectors.mjs';
-import { CoinbaseConnector } from './lib/coinbase-connector.mjs';
-import { CoinbaseInternationalConnector } from './lib/coinbase-international-connector.mjs';
-import { BitstampConnector } from './lib/bitstamp-connector.mjs';
-import { CryptoComConnector } from './lib/crypto-com-connector.mjs';
-import { BitfinexConnector } from './lib/bitfinex-connector.mjs';
-import { GeminiConnector } from './lib/gemini-connector.mjs';
-import { BitmexConnector } from './lib/bitmex-connector.mjs';
-import { HyperliquidConnector } from './lib/hyperliquid-connector.mjs';
-import { TradeAggregator } from './lib/trade-aggregator.mjs';
-import { BufferedWriter } from './lib/buffered-writer.mjs';
-import { RawRotationWriter } from './lib/raw-rotation-writer.mjs';
+import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
-import { DerivativesHelper } from './lib/derivatives-helper.mjs';
-import { MarketDataCollector } from './lib/market-data-collector.mjs';
+
+// ====== Market grouping (4 workers) ======
+
+const WORKER_MARKET_GROUPS = {
+  A: ['binance_spot', 'binance_perp', 'binance_coinm_perp', 'binance_perp_btcusdc', 'binance_spot_usdc'],
+  B: ['bybit_perp', 'bybit_spot', 'okx_perp', 'okx_spot'],
+  C: ['coinbase_spot', 'kraken_spot', 'bitstamp_spot', 'gemini_spot'],
+  D: ['crypto_com_spot', 'bitfinex_spot', 'bitmex_perp', 'coinbase_international_perp', 'hyperliquid_perp'],
+};
 
 // ====== Arg parser ======
 
 function help() {
   console.log(`
-btc-receiver v3.00 — BTC orderbook & trade receiver
+btc-receiver v3.10 — multi-worker BTC orderbook & trade receiver
 
 Usage:
   node orderflow_monitor.mjs --config <path> [options]
@@ -53,7 +49,6 @@ Options:
 function arg(name, def) {
   const idx = process.argv.indexOf(`--${name}`);
   if (idx >= 0 && idx + 1 < process.argv.length) return process.argv[idx + 1];
-  // Also support --name=value
   for (const a of process.argv) {
     if (a.startsWith(`--${name}=`)) return a.slice(`--${name}=`.length);
   }
@@ -67,6 +62,7 @@ function hasFlag(name) {
 if (hasFlag('help')) help();
 
 // ====== Load config ======
+
 const configPath = arg('config', 'config.v3.json');
 let config;
 try {
@@ -85,285 +81,201 @@ const enabledMarkets = marketsArg
   : Object.keys(config.markets).filter(m => config.markets[m].enabled);
 const selfTestReconnectAfterMs = parseInt(arg('selfTestReconnectAfterMs', '0'), 10);
 
-function isMarketWritable(connector, book) {
-  return Boolean(connector && connector.getState() === 'running' && book && !book.isEmpty());
-}
+// ====== Initialize main-thread components ======
 
-// ====== Connector class map ======
-const CONNECTOR_CLASSES = {
-  binance_spot: BinanceSpotConnector,
-  binance_spot_usdc: BinanceSpotUsdcConnector,
-  binance_perp: BinancePerpConnector,
-  binance_coinm_perp: BinanceCoinmPerpConnector,
-  binance_perp_btcusdc: BinancePerpBtcusdcConnector,
-  bybit_perp: BybitConnector,
-  bybit_spot: BybitSpotConnector,
-  okx_perp: OkxConnector,
-  okx_spot: OkxSpotConnector,
-  kraken_spot: KrakenSpotConnectorAlias,
-  coinbase_spot: CoinbaseConnector,
-  crypto_com_spot: CryptoComConnector,
-  bitfinex_spot: BitfinexConnector,
-  bitstamp_spot: BitstampConnector,
-  gemini_spot: GeminiConnector,
-  coinbase_international_perp: CoinbaseInternationalConnector,
-  bitmex_perp: BitmexConnector,
-  hyperliquid_perp: HyperliquidConnector,
-};
-
-// ====== Initialize components ======
-const connectors = new Map();
-const aggregators = new Map();
-const books = new Map();
-const STARTUP_STAGGER_MS = 50;
-const STARTUP_MARKETS = enabledMarkets.filter(m => m !== 'binance_perp');
-if (enabledMarkets.includes('binance_perp')) STARTUP_MARKETS.push('binance_perp');
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Writers: rotation writers for raw data, fixed-path for aggregated data
-const rawTradeRotationWriters = new Map();   // market → RawRotationWriter (trades)
-const bookUpdateRotationWriters = new Map();  // market → RawRotationWriter (book_updates)
-const liquidationRotationWriters = new Map(); // market → RawRotationWriter (liquidations)
-const snapshotRotationWriters = new Map();    // market → RawRotationWriter (snapshots)
-const tradeWriters = new Map();               // aggregated trades (fixed path)
-const bookWriters = new Map();                // book snapshots (fixed path)
 const healthMonitor = new HealthMonitor(path.join(outputBase, 'health.jsonl'), {
   intervalMs: 1000,
 });
 
-const derivativesHelper = new DerivativesHelper(outputBase, {
-  intervalMs: 5000,
-});
+// ====== Worker management ======
 
-const marketDataCollector = new MarketDataCollector(outputBase, {
-  intervalMs: config.tick?.market_data_ms ?? 60000,
-});
+/** @type {Map<string, Worker>} workerId → Worker */
+const workers = new Map();
+/** @type {Map<string, string[]>} workerId → markets */
+const workerMarkets = new Map();
+/** @type {Set<string>} workers that have signalled ready */
+const readyWorkers = new Set();
+/** @type {Set<string>} workers that have finished replay */
+const replayDoneWorkers = new Set();
 
-// ====== Start connectors ======
-async function startConnector(market) {
-  const ConnectorClass = CONNECTOR_CLASSES[market];
-  if (!ConnectorClass) {
-    console.error(`[main] unknown market: ${market}`);
-    return;
+/** Number of workers expected after spawning. Used for fail-closed startup. */
+let expectedWorkerCount = 0;
+/** Set to true when a worker exits or errors before ready — triggers fail-closed. */
+let startupFailed = false;
+
+const STARTUP_STAGGER_MS = 50;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function createWorker(workerId, groupMarkets) {
+  const filtered = groupMarkets.filter(m => enabledMarkets.includes(m));
+  if (filtered.length === 0) {
+    console.log(`[main] worker ${workerId}: no enabled markets in group, skipping`);
+    return null;
   }
-  const cfg = config.markets[market];
-  const connector = new ConnectorClass(cfg);
 
-  // Create aggregator and book ref
-  const aggregator = new TradeAggregator(market, 1000);
-  aggregators.set(market, aggregator);
-  books.set(market, connector.book);
+  console.log(`[main] spawning worker ${workerId} with markets: ${filtered.join(', ')}`);
 
-  // Create writers — raw data uses rotation writers, aggregated data uses fixed-path
-  const basePath = outputBase;
-  rawTradeRotationWriters.set(market, new RawRotationWriter(basePath, market, 'trades', {
-    flushIntervalMs: config.output.flush_trades_ms ?? 200,
-  }));
-  bookUpdateRotationWriters.set(market, new RawRotationWriter(basePath, market, 'book_updates', {
-    flushIntervalMs: config.output.flush_book_ms ?? 1000,
-  }));
-  liquidationRotationWriters.set(market, new RawRotationWriter(basePath, market, 'liquidations', {
-    flushIntervalMs: config.output.flush_liquidations_ms ?? 200,
-  }));
-  snapshotRotationWriters.set(market, new RawRotationWriter(basePath, market, 'snapshots', {
-    flushIntervalMs: config.output.flush_book_ms ?? 1000,
-  }));
-  tradeWriters.set(market, new BufferedWriter(path.join(basePath, 'trades', `${market}.jsonl`), {
-    flushIntervalMs: config.output.flush_trades_ms ?? 200,
-  }));
-  bookWriters.set(market, new BufferedWriter(path.join(basePath, 'book', `${market}.jsonl`), {
-    flushIntervalMs: config.output.flush_book_ms ?? 1000,
-  }));
+  const worker = new Worker(
+    new URL('./lib/orderflow-worker.mjs', import.meta.url)
+  );
 
-  // Wire events — raw data goes to rotation writers
-  connector.on('trade', async (tradeEvent) => {
-    aggregator.addTrade(tradeEvent);
-    rawTradeRotationWriters.get(market)?.write(tradeEvent, tradeEvent.ts);
+  workers.set(workerId, worker);
+  workerMarkets.set(workerId, filtered);
+
+  // ── IPC: worker → main ────────────────────────────────────────────
+
+  worker.on('message', (msg) => {
+    switch (msg.type) {
+      case 'liquidation':
+        // Log liquidation events
+        break;
+
+      case 'stateChange':
+        console.log(`[${msg.market}] state: ${msg.from} → ${msg.to}`);
+        if (msg.stats) {
+          healthMonitor.updateConnector(msg.market, msg.stats);
+        }
+        break;
+
+      case 'stats':
+        healthMonitor.updateConnector(msg.market, msg.payload);
+        break;
+
+      case 'replayDone':
+        replayDoneWorkers.add(msg.workerId);
+        console.log(`[main] worker ${msg.workerId} replay done`);
+        break;
+
+      case 'ready':
+        readyWorkers.add(msg.workerId);
+        console.log(`[main] worker ${msg.workerId} ready`);
+        break;
+
+      case 'startupFailed':
+        console.error(`[main] worker ${msg.workerId} startup failed for market ${msg.market}: ${msg.reason}`);
+        startupFailed = true;
+        break;
+
+      default:
+        // ignore unknown types
+        break;
+    }
   });
 
-  connector.on('depth', async (depthEvent) => {
-    bookUpdateRotationWriters.get(market)?.write(depthEvent, depthEvent.ts);
+  worker.on('error', (err) => {
+    console.error(`[main] worker ${workerId} error:`, err.message);
+    // Worker error before ready is fatal
+    if (!readyWorkers.has(workerId)) {
+      startupFailed = true;
+    }
   });
 
-  connector.on('liquidation', async (row) => {
-    liquidationRotationWriters.get(market)?.write(row, row.ts);
+  worker.on('exit', (code) => {
+    console.log(`[main] worker ${workerId} exited with code ${code}`);
+    // Worker exit before ready is fatal
+    if (!readyWorkers.has(workerId)) {
+      startupFailed = true;
+    }
+    workers.delete(workerId);
   });
 
-  connector.on('error', ({ message }) => {
-    console.error(`[${market}] error:`, message);
+  // Send init to worker
+  worker.postMessage({
+    cmd: 'init',
+    workerId,
+    markets: filtered,
+    configMarkets: config.markets,
+    configOutput: config.output,
+    configTick: config.tick || {},
+    outputBase,
   });
 
-  connector.on('stateChange', (from, to) => {
-    console.log(`[${market}] state: ${from} → ${to}`);
-    healthMonitor.updateConnector(market, connector.getStats());
-  });
-
-  connectors.set(market, connector);
-  healthMonitor.updateConnector(market, connector.getStats());
-
-  // Connect
-  try {
-    await connector.connect();
-    await connector._syncBook();
-  } catch (err) {
-    console.error(`[main] ${market} initial connect failed:`, err.message);
-  }
+  return worker;
 }
 
-// ====== Main loop ======
+// ====== Main setup ======
+
 async function main() {
-  console.log(`[main] btc-receiver v3.00 starting with markets: ${enabledMarkets.join(', ')}`);
+  console.log(`[main] btc-receiver v3.10 multi-worker starting`);
+  console.log(`[main] enabled markets: ${enabledMarkets.join(', ')}`);
   console.log(`[main] output base: ${outputBase}`);
 
-  // Start all connectors with a tiny stagger to reduce burst contention.
-  for (const [index, market] of STARTUP_MARKETS.entries()) {
+  // Spawn workers with stagger
+  const groupEntries = Object.entries(WORKER_MARKET_GROUPS);
+  for (const [index, [workerId, groupMarkets]] of groupEntries.entries()) {
     if (index > 0) await sleep(STARTUP_STAGGER_MS);
-    await startConnector(market);
+    createWorker(workerId, groupMarkets);
   }
 
-  // Startup recovery: scan existing files and restore state for all rotation writers
-  const startupNowMs = Date.now();
-  for (const [market, writer] of rawTradeRotationWriters) {
-    await writer.startupRecovery(startupNowMs);
-  }
-  for (const [market, writer] of bookUpdateRotationWriters) {
-    await writer.startupRecovery(startupNowMs);
-  }
-  for (const [market, writer] of liquidationRotationWriters) {
-    await writer.startupRecovery(startupNowMs);
-  }
-  for (const [market, writer] of snapshotRotationWriters) {
-    await writer.startupRecovery(startupNowMs);
+  if (workers.size === 0) {
+    console.error('[main] no workers spawned — no enabled markets match any group');
+    process.exit(1);
   }
 
-  // Register perp markets for auxiliary data collection
-  const PERP_MARKETS = ['binance_perp', 'binance_coinm_perp', 'binance_perp_btcusdc', 'bybit_perp', 'okx_perp', 'hyperliquid_perp'];
-  for (const market of enabledMarkets) {
-    if (PERP_MARKETS.includes(market)) {
-      derivativesHelper.registerMarket(market, {});
+  expectedWorkerCount = workers.size;
+
+  // Wait for all workers to be ready (with timeout, fail-closed)
+  const readyTimeout = 60000;
+  const readyStart = Date.now();
+  while (readyWorkers.size < expectedWorkerCount && !startupFailed) {
+    if (Date.now() - readyStart > readyTimeout) {
+      console.error(`[main] timeout waiting for workers to be ready (${readyWorkers.size}/${expectedWorkerCount})`);
+      startupFailed = true;
+      break;
     }
+    await sleep(100);
   }
 
-  // Register all markets for REST market data collection
-  let hasCoinbase = false;
-  for (const market of enabledMarkets) {
-    const md = config.markets[market]?.marketData;
-    if (!md) continue;
-    const type = PERP_MARKETS.includes(market) ? 'perp' : 'spot';
-    const collect = {};
-    if (md.lsratio) collect.lsratio = true;
-    if (md.takervol) collect.takervol = true;
-    marketDataCollector.registerMarket(market, { type, urls: md, collect });
-    if (market === 'coinbase_spot') hasCoinbase = true;
-  }
-  // Coinbase Premium Index (needs binance_spot + coinbase_spot both registered)
-  if (hasCoinbase && enabledMarkets.includes('binance_spot')) {
-    marketDataCollector.registerPremium();
+  if (startupFailed) {
+    console.error('[main] startup failed — shutting down all workers');
+    // Send shutdown to all workers
+    for (const [, worker] of workers) {
+      try { worker.postMessage({ cmd: 'shutdown' }); } catch (_) {}
+    }
+    // Give workers a moment to flush, then exit
+    await sleep(2000);
+    process.exit(1);
   }
 
-  // Start health monitor
+  console.log(`[main] ${readyWorkers.size}/${expectedWorkerCount} workers ready`);
+
+  // Start auxiliary services
   healthMonitor.start();
-
-  // Start derivatives helper
-  derivativesHelper.start();
-
-  // Start market data collector
-  marketDataCollector.start();
 
   // Self-test reconnect trigger
   if (selfTestReconnectAfterMs > 0) {
     setTimeout(() => {
-      for (const [market, conn] of connectors) {
-        console.log(`[main] self-test: closing ${market} socket`);
-        if (conn._ws) {
-          try { conn._ws.close(1000, 'self-test reconnect'); } catch {}
-        }
+      console.log('[main] self-test: sending reconnect command to all workers');
+      for (const [, worker] of workers) {
+        worker.postMessage({ cmd: 'selfTestReconnect' });
       }
     }, selfTestReconnectAfterMs);
   }
 
-  // Tick loop
-  const tickMs = config.tick?.feature_ms ?? 1000;
-  const bookSnapshotMs = config.tick?.book_snapshot_ms ?? 30000;
-  let lastBookSnapshot = 0;
-
-  const tick = () => {
-    const now = Date.now();
-
-    // Flush trade aggregators (always, preserves buffer during reconnect)
-    for (const [market, aggregator] of aggregators) {
-      const aggTrade = aggregator.flushIfDue(now);
-      if (aggTrade) {
-        // Write aggregated trade row
-        tradeWriters.get(market)?.write(aggTrade);
-      }
-    }
-
-    // Book snapshot — skip for non-running connectors or empty books
-    if (now - lastBookSnapshot >= bookSnapshotMs) {
-      lastBookSnapshot = now;
-      for (const [market, book] of books) {
-        const connector = connectors.get(market);
-        if (isMarketWritable(connector, book)) {
-          const snap = book.toSnapshot(now);
-          bookWriters.get(market)?.write(snap);
-          // Also write snapshot to rotation writer (wall-clock bucketing)
-          snapshotRotationWriters.get(market)?.write(snap, now);
-        }
-      }
-    }
-
-    // Update health
-    for (const [market, conn] of connectors) {
-      healthMonitor.updateConnector(market, conn.getStats());
-    }
-  };
-
-  // Run tick every tickMs
-  const tickTimer = setInterval(tick, tickMs);
-
-  // Periodic stale check for rotation writers (every 15s)
-  const staleCheckMs = 15000;
-  const staleCheckTimer = setInterval(async () => {
-    const now = Date.now();
-    for (const [, writer] of rawTradeRotationWriters) await writer.checkStale(now);
-    for (const [, writer] of bookUpdateRotationWriters) await writer.checkStale(now);
-    for (const [, writer] of liquidationRotationWriters) await writer.checkStale(now);
-    for (const [, writer] of snapshotRotationWriters) await writer.checkStale(now);
-  }, staleCheckMs);
-  if (staleCheckTimer.unref) staleCheckTimer.unref();
-
   // Graceful shutdown
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('[main] shutting down...');
-    clearInterval(tickTimer);
-    clearInterval(staleCheckTimer);
 
-    for (const [, conn] of connectors) {
-      conn.disconnect();
+    // Send shutdown to all workers and wait for them
+    const workerExitPromises = [];
+    for (const [workerId, worker] of workers) {
+      workerExitPromises.push(new Promise((resolve) => {
+        worker.once('exit', resolve);
+        setTimeout(resolve, 10000); // 10s timeout
+      }));
+      try {
+        worker.postMessage({ cmd: 'shutdown' });
+      } catch (_) { /* worker may have exited */ }
     }
+    await Promise.allSettled(workerExitPromises);
 
-    // Flush remaining trade aggregator buffers before closing writers
-    for (const [market, aggregator] of aggregators) {
-      const aggTrade = aggregator.flushNow();
-      if (aggTrade) {
-        tradeWriters.get(market)?.write(aggTrade);
-      }
-    }
-
-    // Flush all writers
-    const writerFlushPromises = [];
-    for (const w of tradeWriters.values()) writerFlushPromises.push(w.close());
-    for (const w of bookWriters.values()) writerFlushPromises.push(w.close());
-    for (const w of rawTradeRotationWriters.values()) writerFlushPromises.push(w.finalize());
-    for (const w of bookUpdateRotationWriters.values()) writerFlushPromises.push(w.finalize());
-    for (const w of liquidationRotationWriters.values()) writerFlushPromises.push(w.finalize());
-    for (const w of snapshotRotationWriters.values()) writerFlushPromises.push(w.finalize());
-    writerFlushPromises.push(healthMonitor.close());
-    writerFlushPromises.push(derivativesHelper.close());
-    writerFlushPromises.push(marketDataCollector.close());
-    await Promise.allSettled(writerFlushPromises);
+    // Flush main-thread components
+    const promises = [];
+    promises.push(healthMonitor.close());
+    await Promise.allSettled(promises);
 
     console.log('[main] shutdown complete');
     process.exit(0);

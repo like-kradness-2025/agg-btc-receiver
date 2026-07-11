@@ -35,68 +35,102 @@ const PYTHON_BIN = fs.existsSync(PREFERRED_PYTHON) ? PREFERRED_PYTHON : 'python3
 
 // ── State ───────────────────────────────────────────────────────────────────
 const MAX_HISTORY = 30;
-let lastHealth = readLastLine(HEALTH_FILE);
-let healthHistory = readLastNLines(HEALTH_FILE, MAX_HISTORY);
-
-if (!lastHealth && healthHistory.length) {
-  lastHealth = healthHistory[healthHistory.length - 1];
-}
+let rawCountsSnapshot = null;
+let rawCountsHistory = [];
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-function readLastLine(filePath) {
-  try {
-    const stat = fs.statSync(filePath);
-    if (stat.size === 0) return null;
-    const fd = fs.openSync(filePath, 'r');
-    const buf = Buffer.alloc(Math.min(8192, stat.size));
-    fs.readSync(fd, buf, 0, buf.length, Math.max(0, stat.size - buf.length));
-    fs.closeSync(fd);
-    const lines = buf.toString('utf-8').split('\n').filter(Boolean);
-    return lines.length ? JSON.parse(lines[lines.length - 1]) : null;
-  } catch { return null; }
-}
-
-function readLastNLines(filePath, n) {
-  try {
-    const stat = fs.statSync(filePath);
-    if (stat.size === 0) return [];
-    const readSize = Math.min(64 * 1024, stat.size);
-    const fd = fs.openSync(filePath, 'r');
-    const buf = Buffer.alloc(readSize);
-    fs.readSync(fd, buf, 0, buf.length, Math.max(0, stat.size - readSize));
-    fs.closeSync(fd);
-    const lines = buf.toString('utf-8').split('\n').filter(Boolean);
-    return lines.slice(-n).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  } catch { return []; }
-}
-
-function computeRates(prev, curr) {
-  if (!prev || !curr) return {};
-  const dt = (curr.ts - prev.ts) / 1000;
-  if (dt <= 0) return {};
-  const rates = {};
-  for (const [market, m] of Object.entries(curr.markets || {})) {
-    const p = prev.markets?.[market];
-    if (!p) continue;
-    rates[market] = {
-      tradeRate: Math.max(0, Math.round((m.tradeMsgCount - p.tradeMsgCount) / dt)),
-      depthRate: Math.max(0, Math.round((m.depthMsgCount - p.depthMsgCount) / dt)),
-    };
+/**
+ * Read raw 30s block files for a given market + date, return line counts
+ * for both trades and book_updates in the last N files.
+ */
+function readRawBlockCounts(market, dateDir) {
+  const tradesDir = path.join(DATA_DIR, 'trades', market, dateDir);
+  const bookDir = path.join(DATA_DIR, 'book_updates', market, dateDir);
+  let tradeFiles = []; let bookFiles = [];
+  try { tradeFiles = fs.readdirSync(tradesDir).filter(f => f.endsWith('.jsonl')).sort(); } catch {}
+  try { bookFiles = fs.readdirSync(bookDir).filter(f => f.endsWith('.jsonl')).sort(); } catch {}
+  const len = tradeFiles.length;
+  // Keep last 2 blocks: current + previous (for delta calculation)
+  const result = { market, tradeLines: {}, bookLines: {}, latestTs: 0 };
+  for (const fileset of [['tradeLines', tradeFiles, tradesDir, 'trade'], ['bookLines', bookFiles, bookDir, 'book']]) {
+    const [key, files, dir] = fileset;
+    for (const f of files.slice(-2)) {
+      let count = 0; let maxTs = 0;
+      try {
+        const content = fs.readFileSync(path.join(dir, f), 'utf-8');
+        const lines = content.split('\n').filter(Boolean);
+        count = lines.length;
+        // Get the latest timestamp from last line
+        const lastLine = lines[lines.length - 1];
+        if (lastLine.startsWith('{')) {
+          const parsed = JSON.parse(lastLine);
+          if (parsed.ts > maxTs) maxTs = parsed.ts;
+        }
+      } catch {}
+      result[key][f] = { count, maxTs };
+      if (maxTs > result.latestTs) result.latestTs = maxTs;
+    }
   }
-  return rates;
+  return result;
 }
 
-function appendRateHistory(snapshot, rates) {
-  if (!snapshot || !rates || !Object.keys(rates).length) return;
+function readAllRawCounts() {
+  const now = new Date();
+  const dateDir = now.toISOString().slice(0, 10); // 2026-07-10
+  const tradesTop = path.join(DATA_DIR, 'trades');
+  let markets = [];
+  try { markets = fs.readdirSync(tradesTop).filter(d => {
+    try { return fs.statSync(path.join(tradesTop, d)).isDirectory(); } catch { return false; }
+  }); } catch { return { ts: Date.now(), markets: {} }; }
+
+  const out = { ts: Date.now(), markets: {} };
+  let globalLatest = 0;
+  for (const m of markets) {
+    const info = readRawBlockCounts(m, dateDir);
+    // Compute rates from the 2 most recent 30s blocks
+    const tradeFiles = Object.keys(info.tradeLines).sort();
+    const bookFiles = Object.keys(info.bookLines).sort();
+    let tradeRate = 0; let depthRate = 0;
+
+    if (tradeFiles.length >= 2) {
+      const prev = info.tradeLines[tradeFiles[tradeFiles.length - 2]];
+      const curr = info.tradeLines[tradeFiles[tradeFiles.length - 1]];
+      tradeRate = Math.max(0, Math.round((curr.count - prev.count) / 30));
+    } else if (tradeFiles.length === 1) {
+      // Only one file — approximate as its total lines / 30
+      tradeRate = Math.max(0, Math.round(info.tradeLines[tradeFiles[0]].count / 30));
+    }
+
+    if (bookFiles.length >= 2) {
+      const prev = info.bookLines[bookFiles[bookFiles.length - 2]];
+      const curr = info.bookLines[bookFiles[bookFiles.length - 1]];
+      depthRate = Math.max(0, Math.round((curr.count - prev.count) / 30));
+    } else if (bookFiles.length === 1) {
+      depthRate = Math.max(0, Math.round(info.bookLines[bookFiles[0]].count / 30));
+    }
+
+    out.markets[m] = {
+      state: 'running',
+      tradeRate,
+      depthRate,
+      latestTs: info.latestTs,
+    };
+    if (info.latestTs > globalLatest) globalLatest = info.latestTs;
+  }
+  out.ts = globalLatest || Date.now();
+  return out;
+}
+
+function appendRateHistory(snapshot) {
+  if (!snapshot) return;
   const lines = [];
-  for (const [market, rate] of Object.entries(rates)) {
-    const curr = snapshot.markets?.[market];
+  for (const [market, m] of Object.entries(snapshot.markets || {})) {
     lines.push(JSON.stringify({
       ts: snapshot.ts,
       market,
-      tradeMsgCount: curr?.tradeMsgCount ?? 0,
-      depthMsgCount: curr?.depthMsgCount ?? 0,
+      tradeMsgCount: m.tradeRate,
+      depthMsgCount: m.depthRate,
     }));
   }
   if (!lines.length) return;
@@ -125,7 +159,7 @@ setTimeout(() => { try { generateChartPng(); } catch {} }, 3000);
 setInterval(() => { try { generateChartPng(); } catch {} }, 5000);
 
 async function getFileCounts() {
-  const counts = { trades: 0, book_updates: 0, liquidations: 0, snapshots: 0, open: 0 };
+  const counts = { trades: 0, book_updates: 0, liquidations: 0, open: 0 };
   try {
     const entries = await fsp.readdir(DATA_DIR, { withFileTypes: true });
     for (const e of entries) {
@@ -162,26 +196,23 @@ function getProcessInfo() {
   };
 }
 
-// ── Periodic health poll ────────────────────────────────────────────────────
+// ── Periodic poll (based on raw file counts) ────────────────────────────────
 
-function refreshHealthSnapshot() {
-  const h = readLastLine(HEALTH_FILE);
-  if (h) {
-    const lastTs = healthHistory.length ? healthHistory[healthHistory.length - 1].ts : null;
-    if (lastTs !== h.ts) {
-      const prev = healthHistory.length ? healthHistory[healthHistory.length - 1] : null;
-      appendRateHistory(h, computeRates(prev, h));
-      healthHistory.push(h);
-      if (healthHistory.length > MAX_HISTORY) healthHistory.shift();
-    } else if (healthHistory.length) {
-      healthHistory[healthHistory.length - 1] = h;
+function refreshRawCounts() {
+  const snap = readAllRawCounts();
+  if (snap && snap.markets) {
+    // Append to rate history for chart
+    if (rawCountsSnapshot) {
+      appendRateHistory(snap);
     }
-    lastHealth = h;
+    rawCountsSnapshot = snap;
+    rawCountsHistory.push(snap);
+    if (rawCountsHistory.length > MAX_HISTORY) rawCountsHistory.shift();
   }
 }
 
-refreshHealthSnapshot();
-setInterval(refreshHealthSnapshot, POLL_MS);
+refreshRawCounts();
+setInterval(refreshRawCounts, POLL_MS);
 
 // ── HTTP server ─────────────────────────────────────────────────────────────
 
@@ -189,13 +220,27 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
   if (url.pathname === '/api/status') {
-    const rates = healthHistory.length >= 2
-      ? computeRates(healthHistory[healthHistory.length - 2], healthHistory[healthHistory.length - 1])
-      : {};
+    const snap = rawCountsSnapshot;
     const fileCounts = await getFileCounts();
     const proc = getProcessInfo();
+
+    // Total trade/depth rate across all markets
+    let totalTradeRate = 0, totalDepthRate = 0;
+    const markets = snap?.markets || {};
+    for (const [m, info] of Object.entries(markets)) {
+      totalTradeRate += info.tradeRate || 0;
+      totalDepthRate += info.depthRate || 0;
+    }
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ health: lastHealth, rates, fileCounts, proc }));
+    res.end(JSON.stringify({
+      markets,
+      totalTradeRate,
+      totalDepthRate,
+      ts: snap?.ts || Date.now(),
+      fileCounts,
+      proc,
+    }));
     return;
   }
 
@@ -617,26 +662,22 @@ function switchTab(name) {
 }
 
 function render(data) {
-  var h = data && data.health;
-  var rates = data && data.rates || {};
+  var markets = data && data.markets || {};
   var fc = data && data.fileCounts || {};
   var proc = data && data.proc || {};
-  if (!h) return;
-  var ms = h.markets || {};
-  var mv = Object.values(ms);
+  if (!Object.keys(markets).length) return;
+  var mv = Object.values(markets);
   var t = mv.length, run = mv.filter(function(m){return m.state==='running'}).length;
-  var tr = 0, dr = 0;
-  Object.values(rates).forEach(function(r){ tr+=r.tradeRate||0; dr+=r.depthRate||0; });
+  var tr = data.totalTradeRate || 0;
+  var dr = data.totalDepthRate || 0;
 
-  document.getElementById('ts').textContent = clock(h.ts);
+  document.getElementById('ts').textContent = clock(data.ts);
 
   var sd = document.getElementById('status-dot');
   var sl = document.getElementById('status-label');
   var sdet = document.getElementById('status-detail');
-  if (h.state==='critical'||h.state==='error') {
-    sd.className='status-dot red'; sl.textContent='障害発生'; sdet.textContent=run+'/'+t+' 稼働';
-  } else if (h.state==='warning'||run<t) {
-    sd.className='status-dot yellow'; sl.textContent='注意'; sdet.textContent=t-run+' 停止';
+  if (!run || run < t) {
+    sd.className='status-dot yellow'; sl.textContent='注意'; sdet.textContent=(t-run)+' 停止';
   } else {
     sd.className='status-dot green'; sl.textContent='正常稼働中'; sdet.textContent=t+' 全マーケット稼働';
   }
@@ -652,9 +693,8 @@ function render(data) {
     ' ／ メモリ <strong>'+fmt(proc.rss||0)+'MB</strong>' +
     ' ／ 稼働時間 <strong>'+ups+'</strong>';
 
-  var list = Object.entries(ms).map(function(e){
-    var r = rates[e[0]]||{};
-    return {name:e[0], state:e[1].state||'unknown', tr:r.tradeRate||0, dr:r.depthRate||0};
+  var list = Object.entries(markets).map(function(e){
+    return {name:e[0], state:e[1].state||'unknown', tr:e[1].tradeRate||0, dr:e[1].depthRate||0};
   });
   list.sort(function(a,b){return b.tr!==a.tr?b.tr-a.tr:b.dr!==a.dr?b.dr-a.dr:a.name.localeCompare(b.name);});
   var html = '<div class="market-row"><span></span><span class="label-row" style="text-align:right">取引</span>' +
@@ -664,7 +704,7 @@ function render(data) {
       '<span class="name">'+m.name.replace(/_/g,' ')+'</span>' +
       '<span class="trade">'+fmt(m.tr)+'</span>' +
       '<span class="depth">'+fmt(m.dr)+'</span>' +
-      '<span class="dot '+tone(m.state)+'\"></span></div>';
+      '<span class="dot '+tone(m.state)+'"></span></div>';
   });
   document.getElementById('market-list').innerHTML = html;
 }

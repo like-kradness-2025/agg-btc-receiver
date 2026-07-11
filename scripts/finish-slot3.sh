@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# finish-slot3.sh — Run SLOT 3 missing markets in parallel
+# finish-slot3.sh — legacy burst_agg helper for one historical backfill slot.
+
+echo "finish-slot3.sh is legacy and targets burst_agg outputs." >&2
+echo "Set BURST_AGG_LEGACY_OK=1 if you intentionally need the old backfill path." >&2
+if [[ "${BURST_AGG_LEGACY_OK:-0}" != "1" ]]; then
+  exit 1
+fi
+
 set -euo pipefail
 cd /home/weed420/dev/github/like-kradness-2025/agg-btc-receiver
 DATA=data/live_v3

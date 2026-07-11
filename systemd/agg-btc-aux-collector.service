@@ -1,0 +1,15 @@
+[Unit]
+Description=Agg BTC Auxiliary Data Collector (REST derivatives + market data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/weed420/dev/github/like-kradness-2025/agg-btc-receiver
+ExecStart=/usr/bin/node aux_data_collector.mjs --config config.v3.json
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/weed420/dev/github/like-kradness-2025/agg-btc-receiver/runtime/aux-collector.log
+StandardError=append:/home/weed420/dev/github/like-kradness-2025/agg-btc-receiver/runtime/aux-collector.log
+
+[Install]
+WantedBy=default.target
