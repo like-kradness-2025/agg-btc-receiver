@@ -23,12 +23,24 @@ acquire_market_lock() {
   local lock_dir="${output_root}/locks"
   local lock_file="${lock_dir}/${market}.lock"
 
-  mkdir -p "${lock_dir}" 2>/dev/null || true
+  # mkdir -p failure → FATAL with dedicated code
+  if ! mkdir -p "${lock_dir}" 2>/dev/null; then
+    echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"level\":\"FATAL\",\"reason\":\"lock-dir-create-failed\",\"market\":\"${market}\",\"lock_dir\":\"${lock_dir}\"}" >&2
+    return 75
+  fi
 
-  # Open lock file on a new fd and try exclusive non-blocking flock
-  exec {LOCK_FD}<>"${lock_file}"
+  # Open lock file on a new fd — catch open failure
+  # NOTE: do NOT add 2>/dev/null to the exec — exec applies all redirections to the
+  # current shell, which would permanently silence stderr (→ SKIP/INFO lost).
+  exec {LOCK_FD}<>"${lock_file}" || {
+    echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"level\":\"FATAL\",\"reason\":\"lock-file-open-failed\",\"market\":\"${market}\",\"lock_file\":\"${lock_file}\"}" >&2
+    return 76
+  }
+
+  # Try exclusive non-blocking flock
   if ! flock -x -n "${LOCK_FD}" 2>/dev/null; then
-    exec {LOCK_FD}>&- 2>/dev/null || true
+    # Close the fd — use subshell to avoid exec redirections leaking to current shell
+    { exec {LOCK_FD}>&-; } 2>/dev/null || true
     LOCK_FD=""
     echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"level\":\"SKIP\",\"reason\":\"lock-contention\",\"market\":\"${market}\",\"lock_file\":\"${lock_file}\"}" >&2
     return 1

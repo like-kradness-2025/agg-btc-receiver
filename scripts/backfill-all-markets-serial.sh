@@ -5,9 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-# Source lock helper (P0-1: single-writer safety)
-source scripts/lock-helper.sh
-
 MARKETS=(
   binance_perp binance_perp_btcusdc binance_spot binance_spot_usdc
   bitfinex_spot bitmex_perp bitstamp_spot bybit_perp bybit_spot
@@ -36,9 +33,7 @@ for MARKET in "${MARKETS[@]}"; do
     continue
   fi
 
-  # P0-1: Acquire same-host flock for this market
-  acquire_market_lock "$MARKET" "$OUTPUT_ROOT" || continue
-
+  # Run pipeline (tfp.mjs handles per-market flock internally — Gate A)
   LOG_FILE="${LOG_DIR}/${MARKET}.log"
   echo "--- $(TZ=UTC date -Iseconds) Processing: $MARKET ---"
 

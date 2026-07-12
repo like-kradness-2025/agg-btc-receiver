@@ -6,9 +6,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-# Source lock helper (P0-1: single-writer safety)
-source scripts/lock-helper.sh
-
 MARKETS=(
   binance_perp binance_perp_btcusdc binance_spot binance_spot_usdc
   bitfinex_spot bitmex_perp bitstamp_spot bybit_perp bybit_spot
@@ -41,31 +38,34 @@ for MARKET in "${MARKETS[@]}"; do
     continue
   fi
 
-  # P0-1: Acquire same-host flock for this market
-  acquire_market_lock "$MARKET" "$ALL_OUTPUT_ROOT" || continue
-
-  # Check if pipeline output already exists for this block range (idempotency check)
-  # If manifest has the latest block committed, skip (fast path)
+  # Idempotency fast-path: skip if manifest shows block already processed.
+  # Read-only check — does NOT acquire lock (Gate A tfp.mjs handles per-market flock).
   MANIFEST_PATH="${ALL_OUTPUT_ROOT}/manifests/${MARKET}.json"
-  LATEST_COMMITTED=""
   if [ -f "$MANIFEST_PATH" ]; then
     LATEST_COMMITTED=$(python3 -c "
-import json, sys
+import json
 try:
     m = json.load(open('$MANIFEST_PATH'))
-    print(m.get('last_checkpoint_block_start', '') or '')
+    v = m.get('last_checkpoint_block_start')
+    if v is not None: print(v)
 except: pass
 " 2>/dev/null || true)
+    # FROM_TS is epoch seconds; manifest stores epoch ms
+    FROM_MS=$((FROM_TS * 1000))
+    if [ -n "$LATEST_COMMITTED" ] && [ "$LATEST_COMMITTED" -ge "$FROM_MS" ] 2>/dev/null; then
+      continue
+    fi
   fi
 
-  # Run pipeline
+  # Run pipeline (tfp.mjs handles per-market flock internally — Gate A)
+  set +e
   OUTPUT=$(node scripts/tfp.mjs \
     --markets "${MARKET}" \
     --from "${FROM_ISO}" \
     --to "${TO_ISO}" \
-    --output-root "${ALL_OUTPUT_ROOT}" 2>&1) || true
-
+    --output-root "${ALL_OUTPUT_ROOT}" 2>&1)
   EXIT_CODE=$?
+  set -euo pipefail
   if echo "$OUTPUT" | grep -q '"processed":0'; then
     # No new blocks processed — normal
     :
@@ -85,8 +85,8 @@ for line in sys.stdin:
     fi
   fi
 
-  # Check for FATAL
-  if echo "$OUTPUT" | grep -q '"level":"FATAL"'; then
+  # Check for FATAL (stderr pattern) or non-zero exit code
+  if [ "$EXIT_CODE" -ne 0 ] || echo "$OUTPUT" | grep -q '"level":"FATAL"'; then
     TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
     FAILED_MARKETS="${FAILED_MARKETS} ${MARKET}"
   fi

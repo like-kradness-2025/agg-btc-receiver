@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // scripts/tfp.mjs — TradeFlow Pipeline (TFP) CLI entry point
 // Follows plan Task 9 + P0-4 finalized input horizon + P0-1 kind/horizon-proof
+// Gate A: direct-entry per-market flock protection via lock-helper.sh subprocess
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import { runPipeline } from '../lib/burst-reducer/pipeline.mjs';
 import { INPUT_KIND, VALID_INPUT_KINDS, BLOCK_DURATION_MS } from '../lib/burst-reducer/schema.mjs';
 
@@ -253,6 +255,125 @@ function loadAndValidateFrozenInventory(path) {
   return { byKindAndMarket, entries, errors: [] };
 }
 
+const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.TFP_LOCK_ACQUIRE_TIMEOUT_MS || '15000', 10);
+const LOCK_PRE_ACQUIRE_DELAY_MS = parseInt(process.env.TFP_LOCK_PRE_ACQUIRE_DELAY_MS || '0', 10);
+
+/**
+ * Acquire an exclusive non-blocking flock for a market via lock-helper.sh subprocess.
+ * The subprocess holds the lock FD open until killed (kernel releases on process death).
+ *
+ * @param {string} market - market name
+ * @param {string} outputRoot - output root dir (determines lock file path)
+ * @returns {Promise<import('child_process').ChildProcess|null>}
+ *   ChildProcess on success (lock held), null on flock contention (exit 2).
+ * @throws {Error} on source failure, helper missing, spawn error, unexpected exit, or timeout.
+ */
+function acquireLock(market, outputRoot) {
+  const __dirname = fileURLToPath(new URL('.', import.meta.url));
+  const repoRoot = resolve(__dirname, '..');
+  const lockHelperPath = join(repoRoot, 'scripts', 'lock-helper.sh');
+
+  return new Promise((resolve, reject) => {
+    const preDelayLine = LOCK_PRE_ACQUIRE_DELAY_MS > 0
+      ? `sleep ${(LOCK_PRE_ACQUIRE_DELAY_MS / 1000).toFixed(1)}`
+      : '';
+    const script =
+      `${preDelayLine}${preDelayLine ? '\n' : ''}test -r "${lockHelperPath}" || { echo '{"level":"FATAL","reason":"lock-helper-not-found","path":"${lockHelperPath}"}' >&2; exit 3; }
+source "${lockHelperPath}" || { echo '{"level":"FATAL","reason":"lock-helper-source-failed","path":"${lockHelperPath}"}' >&2; exit 3; }
+acquire_market_lock "$TFP_LOCK_MARKET" "$TFP_LOCK_OUTPUT_ROOT"
+RET=$?
+case $RET in
+  0) ;;
+  1) exit 2 ;;
+  *) exit 3 ;;
+esac
+echo '{"status":"ACQUIRED"}'
+sleep 86400`;
+
+    const child = spawn('/bin/bash', ['-c', script], {
+      stdio: ['ignore', 'pipe', 'inherit'],  // inherit stderr → lock-helper SKIP/INFO visible
+      env: {
+        ...process.env,
+        TFP_LOCK_MARKET: market,
+        TFP_LOCK_OUTPUT_ROOT: outputRoot,
+      },
+      detached: true,  // separate proc group for process group kill on release
+    });
+
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const pid = child.pid;
+        // Process group TERM like releaseLock, then KILL fallback
+        try { process.kill(-pid, 'SIGTERM'); } catch (_) {}
+        try { child.kill('SIGTERM'); } catch (_) {}
+        setTimeout(() => {
+          try { process.kill(-pid, 'SIGKILL'); } catch (_) {}
+          try { child.kill('SIGKILL'); } catch (_) {}
+        }, 3000);
+        reject(new Error(`lock acquisition timed out after ${LOCK_ACQUIRE_TIMEOUT_MS}ms for market ${market}`));
+      }
+    }, LOCK_ACQUIRE_TIMEOUT_MS);
+
+    child.stdout.on('data', (data) => {
+      const line = data.toString().trim();
+      try {
+        const msg = JSON.parse(line);
+        if (msg.status === 'ACQUIRED' && !resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          resolve(child);
+        }
+      } catch (_) { /* not JSON yet, wait */ }
+    });
+
+    child.on('exit', (code) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        if (code === 2) {
+          // exit 2 = lock contention (from acquire_market_lock returning 1 → exit 2)
+          resolve(null);
+        } else {
+          reject(new Error(`lock helper exited with code ${code} for market ${market}`));
+        }
+      }
+    });
+
+    child.on('error', (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        reject(new Error(`lock helper spawn error for market ${market}: ${err.message}`));
+      }
+    });
+  });
+}
+
+/**
+ * Release a held market lock by killing the holder subprocess.
+ * Kernel releases the advisory flock on process death.
+ *
+ * @param {import('child_process').ChildProcess|null} lockProc - holder from acquireLock()
+ */
+async function releaseLock(lockProc) {
+  if (!lockProc || lockProc.killed) return;
+  const pid = lockProc.pid;
+  // Send TERM to process group (bash + sleep), then KILL fallback after timeout
+  try { process.kill(-pid, 'SIGTERM'); } catch (_) {}
+  try { lockProc.kill('SIGTERM'); } catch (_) {}
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      try { process.kill(-pid, 'SIGKILL'); } catch (_) {}
+      try { lockProc.kill('SIGKILL'); } catch (_) {}
+      resolve();
+    }, 3000);
+    lockProc.on('exit', () => { clearTimeout(timer); resolve(); });
+    lockProc.on('error', () => { clearTimeout(timer); resolve(); });
+  });
+}
+
 async function main() {
   const opts = parseArgs();
   const fromMs = isoToMs(opts.from);
@@ -294,9 +415,29 @@ async function main() {
   let totalProcessed = 0;
   let totalErrors = 0;
   let anyBlocked = false;
+  let exitCode = 0;
 
   for (const market of markets) {
+    /** @type {import('child_process').ChildProcess|null} */
+    let lockProc = null;
     try {
+      // Gate A: acquire per-market exclusive flock via lock-helper.sh subprocess
+      // Lock FD is held by subprocess until killed; kernel releases on process death.
+      lockProc = await acquireLock(market, outputRoot);
+      if (!lockProc) {
+        // Contention or timeout — lock-helper.sh already emitted structured SKIP to stderr.
+        // Emit additional machine-readable SKIP for log parsers.
+        process.stderr.write(JSON.stringify({
+          ts: new Date().toISOString(),
+          level: 'SKIP',
+          reason: 'lock-contention',
+          market,
+          lock_file: `${outputRoot}/locks/${market}.lock`,
+        }) + '\n');
+        // IMPORTANT: continue (not exit) — cursor unchanged, commit untouched
+        continue;
+      }
+
       const result = await runPipeline({
         dataDir: opts.data,
         market,
@@ -316,7 +457,11 @@ async function main() {
       }
     } catch (e) {
       process.stderr.write(JSON.stringify({ level: 'FATAL', market, error: e.message }) + '\n');
-      process.exit(1);
+      exitCode = 1;
+      break;  // let finally release the lock
+    } finally {
+      // Gate A: release lock on normal exit, exception, or skip
+      await releaseLock(lockProc);
     }
   }
 
@@ -327,10 +472,10 @@ async function main() {
   }) + '\n');
 
   // P0-4: blocked exit = 0 (not an error)
-  if (totalErrors > 0) {
-    process.exit(1);
+  if (exitCode === 0 && totalErrors > 0) {
+    exitCode = 1;
   }
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 // Only run main when executed directly (not when imported as module)
