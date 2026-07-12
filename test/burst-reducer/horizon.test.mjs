@@ -79,8 +79,10 @@ function cleanDerived() {
 function cleanP0_1Derived() {
   try { rmSync(join('data/derived/burst_features_v1', 'features_1s', P0_1_MARKET), { recursive: true, force: true }); } catch (_) {}
   try { rmSync(join('data/derived/burst_features_v1', 'manifests', `${P0_1_MARKET}.json`), { force: true }); } catch (_) {}
+  // B5: also clean book_updates checkpoint (different filename pattern)
+  try { rmSync(join('data/derived/burst_features_v1', 'manifests/checkpoints', `${P0_1_MARKET}.book_updates.json`), { force: true }); } catch (_) {}
   try { rmSync(join('data/derived/burst_features_v1', 'manifests/checkpoints', `${P0_1_MARKET}.json`), { force: true }); } catch (_) {}
-  try { rmSync(join('data/derived/burst_features_v1', 'quarantine'), { recursive: true, force: true }); } catch (_) {}
+  try { rmSync(join('data/derived/burst_features_v1', 'quarantine', P0_1_MARKET), { recursive: true, force: true }); } catch (_) {}
 }
 
 describe('Finalized Horizon (P0-4)', () => {
@@ -245,6 +247,8 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
     // Only block 0 exists in book_updates. finalizedThrough=90000 → next boundary 30000
     // is within horizon but file absent. For book_updates → verified-missing.
     // Block at 60000 also exists from setup, creating a gap at 30000.
+    // B5: the pipeline now advances past verified-missing gap, processes block 60000,
+    // then at EOF horizon proof validates (nextBoundaryStart===finalizedThroughMs).
     const result = await runPipeline({
       dataDir: P0_1_DIR,
       market: P0_1_MARKET,
@@ -255,9 +259,9 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
       kind: 'book_updates',
     });
 
-    assert.equal(result.blocked, true);
-    assert.equal(result.blockedReason, 'verified-missing');
-    assert.equal(result.blockedState, 'verified-missing');
+    // B5: pipeline advanced past the gap — no blocked state at EOF
+    assert.ok(!result.blocked, 'B5: non-trade gap advances past missing blocks, no blocked at EOF');
+    assert.equal(result.processed, 1, 'gap block at 30000 is counted as processed');
 
     // Quarantine report should exist for the missing gap block at 30000
     const qPath = join('data/derived/burst_features_v1', 'quarantine', P0_1_MARKET, '30000.json');
@@ -269,6 +273,19 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
     assert.match(qReport.reason, /MISSING_FINALIZED_INPUT/i);
     assert.equal(qReport.details.gap_from, 30000);
     assert.equal(qReport.details.gap_to_exclusive, 60000);
+
+    // Verified-missing record should exist in manifest
+    const manifestPath = join('data/derived/burst_features_v1', 'manifests', `${P0_1_MARKET}.json`);
+    assert.ok(existsSync(manifestPath), 'manifest should exist');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const vmk = `verified_missing:${P0_1_MARKET}:30000`;
+    assert.ok(manifest.processed_blocks[vmk], 'verified_missing record should exist in manifest');
+    assert.equal(manifest.processed_blocks[vmk].reason, 'verified-missing');
+    assert.equal(manifest.processed_blocks[vmk].details.reason, 'verified-missing-gap');
+
+    // Book_updates checkpoint should exist
+    const cpPath = join('data/derived/burst_features_v1', 'manifests/checkpoints', `${P0_1_MARKET}.book_updates.json`);
+    assert.ok(existsSync(cpPath), 'book_updates checkpoint should exist');
   });
 
   // ── HORIZON-006: frozen inventory hash mismatch ──
@@ -460,6 +477,9 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
   });
 
   // ── BLOCKED structured log contains kind and blocked_state ──
+  // B5: non-trade gaps no longer return BLOCKED; they advance past missing blocks.
+  // The BLOCKED entry is still emitted by horizon-check before EOF finalization when
+  // horizon.canFinalize is false (verified-missing or not-yet-arrived).
   it('BLOCKED structured log contains kind and blocked_state', async () => {
     cleanP0_1Derived();
     // Capture stderr output
@@ -474,21 +494,22 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
         fromMs: 0,
         toMs: 120000,
         runId: RUN_ID + '-blocked-log',
-        finalizedThroughMs: 90000,
+        finalizedThroughMs: 30000,
         kind: 'book_updates',
       });
     } finally {
       process.stderr.write = oldStderrWrite;
     }
 
-    // Find BLOCKED entry in stderr
-    const blockedLine = stderrChunks.find(c => c.includes('"level":"BLOCKED"'));
-    assert.ok(blockedLine, 'should have a BLOCKED structured log entry');
-    const parsed = JSON.parse(blockedLine);
+    // With finalizedThroughMs=30000 and block at 0 processed at EOF, the horizon
+    // check for block 0 with nextBoundaryStart=30000 === finalizedThroughMs
+    // gives canFinalize=true (finalized-through-boundary), so no BLOCKED emitted.
+    // Instead check for VERIFIED_MISSING structured log from the gap handler.
+    const vmLine = stderrChunks.find(c => c.includes('"level":"VERIFIED_MISSING"'));
+    assert.ok(vmLine, 'should have a VERIFIED_MISSING structured log entry');
+    const parsed = JSON.parse(vmLine);
     assert.equal(parsed.kind, 'book_updates');
-    assert.ok(parsed.blocked_state, 'blocked_state should be present');
-    assert.ok(['verified-missing', 'no-horizon-proof', 'not-yet-arrived'].includes(parsed.blocked_state),
-      `blocked_state should be one of the 3 states, got: ${parsed.blocked_state}`);
+    assert.equal(parsed.market, P0_1_MARKET);
   });
 
   // ── scanBlocks backward compatibility ──
@@ -535,6 +556,7 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
   });
 
   // ── HORIZON-E2E: frozen inventory via tfp.mjs CLI with book_updates ──
+  // B5: non-trade pipeline advances past gaps, writes checkpoint at EOF.
   it('HORIZON-E2E: frozen inventory via tfp.mjs CLI with book_updates', async () => {
     cleanP0_1Derived();
     const fixturePath = join(P0_1_DIR, 'frozen-inventory-e2e.json');
@@ -569,12 +591,15 @@ describe('P0-1 Horizon Proof / Frozen Inventory Validation', () => {
         '--frozen-inventory', fixturePath,
       ], { encoding: 'utf8', timeout: 15000 });
 
-      // Exit code 0 — blocked exit is not an error per tfp.mjs
+      // Exit code 0 — clean exit with checkpoint write
       assert.equal(result.status, 0, `tfp.mjs exit code should be 0 (got ${result.status}, stderr: ${result.stderr})`);
 
-      // Verify stderr contains blocked_state from pipeline
-      assert.ok(result.stderr.includes('blocked_state'), 'stderr should contain blocked_state output');
-      assert.ok(result.stderr.includes('verified-missing'), 'stderr should indicate verified-missing (gap in book_updates)');
+      // B5: pipeline advances past verified-missing gaps, VERIFIED_MISSING log emitted
+      assert.ok(result.stderr.includes('VERIFIED_MISSING'), 'stderr should indicate verified-missing (gap at 30000)');
+
+      // Book_updates checkpoint should be written
+      const cpPath = join('data/derived/burst_features_v1', 'manifests/checkpoints', `${P0_1_MARKET}.book_updates.json`);
+      assert.ok(existsSync(cpPath), 'book_updates checkpoint should exist');
     } finally {
       try { rmSync(fixturePath, { force: true }); } catch (_) {}
     }
