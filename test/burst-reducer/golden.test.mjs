@@ -65,11 +65,17 @@ describe('Golden fixtures', () => {
         }
       }
 
-      // P1 contract: #13=null, #14=0, #15-#22=0
-      assert.equal(row.burst_notional_vs_top_depth, null);
-      assert.equal(row.burst_mid_move_bps_1s, 0);
-      assert.equal(row.same_price_burst_max_len_1s, 0);
-      assert.equal(row.outlier_trade_flag_1s, 0);
+      // P4 activation: #13=null when no book, #14=0, #15-#22 computed from bursts
+      if (row.burst_count_1s > 0) {
+        // For the trades-basic fixture (all same-price at 100): one burst, 4 prints
+        assert.ok(row.same_price_burst_max_len_1s > 0, `expected #15 > 0 for ts ${row.ts}, got ${row.same_price_burst_max_len_1s}`);
+        assert.ok(row.same_price_burst_notional_1s > 0, `expected #16 > 0 for ts ${row.ts}`);
+        assert.equal(row.multilevel_burst_max_span_ticks_1s, 0, `expected #17=0 for same-price burst`);
+        assert.equal(row.multilevel_burst_max_span_bps_1s, 0, `expected #18=0 for same-price burst`);
+        assert.equal(row.multilevel_burst_notional_1s, 0, `expected #19=0 for same-price burst`);
+        assert.ok(row.same_price_absorption_ratio_1s > 0, `expected #20 > 0 for same-price burst`);
+        assert.equal(row.outlier_trade_flag_1s, 0, `expected #22=0 (no outlier in fixture)`);
+      }
       // B4 board candidate fields are null when book not passed
       assert.equal(row.board_top_depth_ratio, null);
       assert.equal(row.board_mid_move_bps_1s, null);

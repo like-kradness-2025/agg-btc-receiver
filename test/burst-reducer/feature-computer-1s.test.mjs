@@ -105,9 +105,23 @@ describe('FeatureComputer 1s', () => {
       // book-dependent: #13=null, #14=0 per P1 contract
       assert.equal(row.burst_notional_vs_top_depth, null);
       assert.equal(row.burst_mid_move_bps_1s, 0);
-      // research: #15-#22 = 0 per P1 contract
-      assert.equal(row.same_price_burst_max_len_1s, 0);
-      assert.equal(row.outlier_trade_flag_1s, 0);
+      // P4: #15 = max burst_print_count among same-price bursts
+      assert.ok(row.same_price_burst_max_len_1s >= (row.same_price_burst_count_1s > 0 ? 1 : 0),
+        `#15 >= 1 when same-price bursts exist: ${row.same_price_burst_max_len_1s} / ${row.same_price_burst_count_1s}`);
+      // #16 = same_price_notional >= 0
+      assert.ok(row.same_price_burst_notional_1s >= 0);
+      // #17 = multilevel span (0 when no multilevel)
+      assert.ok(row.multilevel_burst_max_span_ticks_1s >= 0);
+      // #18 = bps span (0 when no multilevel)
+      assert.ok(row.multilevel_burst_max_span_bps_1s >= 0);
+      // #19 = multilevel notional >= 0
+      assert.ok(row.multilevel_burst_notional_1s >= 0);
+      // #20 = absorption ratio in [0, 1]
+      assert.ok(row.same_price_absorption_ratio_1s >= 0 && row.same_price_absorption_ratio_1s <= 1.0);
+      // #21 = delta = buy - sell
+      assert.equal(row.burst_delta_notional_1s, row.buy_burst_notional_1s - row.sell_burst_notional_1s);
+      // #22 = outlier flag (0 or 1)
+      assert.ok(row.outlier_trade_flag_1s === 0 || row.outlier_trade_flag_1s === 1);
     }
   });
 

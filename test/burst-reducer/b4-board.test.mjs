@@ -149,7 +149,7 @@ describe('B4: Board candidate computation', () => {
     }
   });
 
-  it('#13/#14 unchanged when bookSnapshot is provided', () => {
+  it('#13 set when bookSnapshot provided with seeded state', () => {
     const detector = new BurstDetector('test');
     detector.feedTrades([{ ts: 1000, side: 'buy', price: 100, qty: 1 }]);
     detector.flushAll();
@@ -171,8 +171,14 @@ describe('B4: Board candidate computation', () => {
     });
 
     for (const row of rows) {
-      assert.equal(row.burst_notional_vs_top_depth, null); // #13 unchanged
-      assert.equal(row.burst_mid_move_bps_1s, 0);          // #14 unchanged
+      // #13 = board_top_depth_ratio when book is seeded
+      if (row.burst_count_1s > 0) {
+        assert.equal(row.burst_notional_vs_top_depth, row.board_top_depth_ratio, `#13 should equal board_top_depth_ratio at ts ${row.ts}`);
+      } else {
+        assert.equal(row.burst_notional_vs_top_depth, null, `#13 should be null at ts ${row.ts} (no burst)`);
+      }
+      // #14 stays 0 (no cross-block mid state at row level)
+      assert.equal(row.burst_mid_move_bps_1s, 0, `#14 should be 0 at ts ${row.ts}`);
     }
   });
 });
