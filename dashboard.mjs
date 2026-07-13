@@ -282,148 +282,197 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>agg-btc-receiver</title>
+<title>BTC Receiver — EffiZen</title>
 <style>
-  /* ── Design Tokens ── */
   :root {
-    --bg-start: #0a0e1a;
-    --bg-mid: #0d1525;
-    --bg-end: #0a1628;
-    --card-bg: rgba(22, 27, 34, 0.7);
-    --card-border: rgba(255,255,255,0.06);
+    --bg-deep: #070b16;
+    --bg: #0d1225;
+    --bg-card: rgba(17, 24, 39, 0.75);
+    --bg-card-hover: rgba(25, 35, 55, 0.85);
+    --border: rgba(255,255,255,0.07);
+    --border-light: rgba(255,255,255,0.12);
     --text: #e6edf3;
-    --muted: #8b949e;
-    --blue: #58a6ff;
-    --green: #3fb950;
-    --yellow: #d29922;
-    --red: #f85149;
-    --radius: 12px;
-    --radius-sm: 8px;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --accent-blue: #58a6ff;
+    --accent-purple: #a78bfa;
+    --accent-green: #3fb950;
+    --accent-yellow: #d29922;
+    --accent-red: #f85149;
+    --accent-cyan: #38bdf8;
+    --accent-pink: #f472b6;
+    --radius: 14px;
+    --radius-sm: 10px;
+    --radius-xs: 6px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP", Helvetica, Arial, sans-serif;
   }
-
-  /* ── Animations ── */
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
   @keyframes glowPulse {
-    0%, 100% { box-shadow: 0 0 6px var(--glow-color, var(--blue)); }
-    50% { box-shadow: 0 0 16px var(--glow-color, var(--blue)); }
+    0%,100% { box-shadow: 0 0 6px var(--glow-color, var(--accent-green)); }
+    50% { box-shadow: 0 0 16px var(--glow-color, var(--accent-green)); }
   }
-  @keyframes livePulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.35; transform: scale(1.2); }
-  }
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes slideIn { from { opacity:0; transform:translateX(-6px); } to { opacity:1; transform:translateX(0); } }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { font-size: 15px; }
   html, body {
-    background: linear-gradient(135deg, var(--bg-start) 0%, var(--bg-mid) 50%, var(--bg-end) 100%);
+    background: var(--bg-deep);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP", Helvetica, Arial, sans-serif;
-    font-size: 15px;
+    font-family: var(--font);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     min-height: 100vh;
   }
-  .app { max-width: 480px; margin: 0 auto; padding: 16px 14px; }
+  body {
+    background:
+      radial-gradient(ellipse 600px 400px at 20% 0%, rgba(56,189,248,0.07), transparent),
+      radial-gradient(ellipse 500px 500px at 80% 100%, rgba(167,139,250,0.05), transparent),
+      linear-gradient(180deg, var(--bg) 0%, var(--bg-deep) 100%);
+    background-attachment: fixed;
+  }
+  .app {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 18px 16px 40px;
+    animation: fadeIn 0.5s ease;
+  }
 
-  /* ── Header ── */
+  /* ─── Nav ─── */
+  .nav {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 20px;
+    padding: 4px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .nav a {
+    flex: 0 0 auto;
+    padding: 7px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-decoration: none;
+    border-radius: 8px;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+  .nav a:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+  .nav a.active {
+    color: var(--text);
+    background: rgba(88,166,255,0.15);
+    box-shadow: 0 0 10px rgba(88,166,255,0.08);
+  }
+
+  /* ─── Header ─── */
   .header {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 4px 0 18px;
-    border-bottom: 1px solid var(--card-border);
+    justify-content: space-between;
     margin-bottom: 18px;
   }
-  .header h1 {
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .header-logo {
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent-green), var(--accent-blue));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 800; color: #fff;
+    flex-shrink: 0;
+  }
+  .header-info h1 {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    background: linear-gradient(135deg, var(--accent-green), var(--accent-blue));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .header-info .sub {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .header-right {
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 19px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    background: linear-gradient(135deg, var(--blue) 0%, #79d4ff 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
   }
   .live-dot {
-    display: inline-block;
     width: 8px; height: 8px;
     border-radius: 50%;
-    background: var(--red);
-    animation: livePulse 1.6s ease-in-out infinite;
-    flex-shrink: 0;
-    box-shadow: 0 0 8px rgba(248,81,73,0.7);
+    background: var(--accent-red);
+    animation: glowPulse 1.6s ease-in-out infinite;
+    --glow-color: var(--accent-red);
   }
-  .header .ts {
+  .live-dot.green { background: var(--accent-green); --glow-color: var(--accent-green); }
+  .live-dot.yellow { background: var(--accent-yellow); --glow-color: var(--accent-yellow); }
+  .live-dot.red { background: var(--accent-red); --glow-color: var(--accent-red); }
+  .ts {
     font-size: 13px;
-    color: var(--muted);
+    color: var(--text-muted);
     font-variant-numeric: tabular-nums;
-    font-weight: 500;
+    font-family: "SF Mono", "Fira Code", monospace;
   }
 
-  /* ── Status Bar ── */
+  /* ─── Status Bar ─── */
   .status-bar {
     display: flex;
     align-items: center;
     gap: 10px;
     padding: 14px 16px;
     border-radius: var(--radius);
-    background: var(--card-bg);
+    background: var(--bg-card);
     backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--card-border);
-    margin-bottom: 22px;
+    border: 1px solid var(--border);
+    margin-bottom: 20px;
     transition: border-color 0.4s;
   }
-  .status-bar:has(.status-dot.green) { border-color: rgba(63,185,80,0.25); }
-  .status-bar:has(.status-dot.yellow) { border-color: rgba(210,153,34,0.25); }
-  .status-bar:has(.status-dot.red) { border-color: rgba(248,81,73,0.25); }
+  .status-bar.green { border-color: rgba(63,185,80,0.2); }
+  .status-bar.yellow { border-color: rgba(210,153,34,0.2); }
+  .status-bar.red { border-color: rgba(248,81,73,0.2); }
   .status-dot {
-    width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto;
+    width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto;
     animation: pulse 2s ease-in-out infinite;
   }
-  .status-dot.green { background: var(--green); box-shadow: 0 0 12px rgba(63,185,80,0.55); }
-  .status-dot.yellow { background: var(--yellow); box-shadow: 0 0 12px rgba(210,153,34,0.55); }
-  .status-dot.red { background: var(--red); box-shadow: 0 0 12px rgba(248,81,73,0.55); }
+  .status-dot.green { background: var(--accent-green); box-shadow: 0 0 10px rgba(63,185,80,0.5); }
+  .status-dot.yellow { background: var(--accent-yellow); box-shadow: 0 0 10px rgba(210,153,34,0.5); }
+  .status-dot.red { background: var(--accent-red); box-shadow: 0 0 10px rgba(248,81,73,0.5); }
   .status-label { font-size: 14px; font-weight: 600; }
-  .status-detail { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .status-detail { font-size: 12px; color: var(--text-secondary); margin-left: auto; }
 
-  /* ── Section Title ── */
+  /* ─── Section Title ─── */
   .section-title {
     font-size: 11px;
-    font-weight: 600;
-    color: var(--muted);
+    font-weight: 700;
+    color: var(--text-secondary);
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     margin: 22px 0 10px;
   }
 
-  /* ── Metrics Grid (2x2) ── */
+  /* ─── Metrics Grid (2x2) ─── */
   .metrics {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
     gap: 10px;
-    margin-bottom: 22px;
+    margin-bottom: 20px;
   }
   .metric-card {
-    background: var(--card-bg);
+    background: var(--bg-card);
     backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--card-border);
+    border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 15px 12px 12px;
+    padding: 14px 12px 12px;
     text-align: center;
     position: relative;
     overflow: hidden;
-    transition: background 0.2s, border-color 0.2s;
+    transition: border-color 0.2s;
   }
-  .metric-card:active { background: rgba(28,35,50,0.7); }
+  .metric-card:hover { border-color: var(--border-light); }
   .metric-card::before {
     content: '';
     position: absolute;
@@ -431,9 +480,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     height: 3px;
     border-radius: var(--radius) var(--radius) 0 0;
   }
-  .metric-card.blue::before { background: var(--blue); }
-  .metric-card.green::before { background: var(--green); }
-  .metric-card.yellow::before { background: var(--yellow); }
+  .metric-card.blue::before { background: var(--accent-blue); }
+  .metric-card.green::before { background: var(--accent-green); }
+  .metric-card.yellow::before { background: var(--accent-yellow); }
   .metric-card .icon {
     font-size: 16px;
     margin-bottom: 2px;
@@ -448,53 +497,50 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
   .metric-card .lbl {
     font-size: 10px;
-    color: var(--muted);
+    color: var(--text-muted);
     margin-top: 4px;
     letter-spacing: 0.02em;
   }
-  .metric-card.blue .val { color: var(--blue); }
-  .metric-card.green .val { color: var(--green); }
-  .metric-card.yellow .val { color: var(--yellow); }
+  .metric-card.blue .val { color: var(--accent-blue); }
+  .metric-card.green .val { color: var(--accent-green); }
+  .metric-card.yellow .val { color: var(--accent-yellow); }
 
-  /* ── System Info ── */
+  /* ─── System Info ─── */
   .sys-row {
     display: flex;
     flex-wrap: wrap;
     gap: 6px 14px;
-    padding: 14px 16px;
-    background: var(--card-bg);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--card-border);
+    padding: 12px 16px;
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--border);
     border-radius: var(--radius);
-    margin-bottom: 22px;
+    margin-bottom: 20px;
     font-size: 13px;
-    color: var(--muted);
+    color: var(--text-muted);
   }
   .sys-row strong { color: var(--text); font-weight: 600; }
 
-  /* ── Tab Bar (pill-style) ── */
+  /* ─── Tab Bar ─── */
   .tab-bar {
     display: flex;
     gap: 4px;
-    margin-bottom: 16px;
-    background: var(--card-bg);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--card-border);
-    border-radius: var(--radius);
+    margin-bottom: 14px;
     padding: 4px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
   }
   .tab-btn {
     flex: 1;
-    padding: 10px 0;
+    padding: 9px 0;
     text-align: center;
     font-size: 13px;
     font-weight: 600;
     border: none;
-    border-radius: 10px;
+    border-radius: 8px;
     background: transparent;
-    color: var(--muted);
+    color: var(--text-muted);
     cursor: pointer;
     transition: all 0.2s ease;
   }
@@ -502,17 +548,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .tab-btn.active {
     background: rgba(88,166,255,0.15);
     color: var(--text);
-    box-shadow: 0 0 14px rgba(88,166,255,0.12);
+    box-shadow: 0 0 14px rgba(88,166,255,0.1);
   }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
 
-  /* ── Chart Area ── */
+  /* ─── Chart Area ─── */
   .chart-card {
-    background: var(--card-bg);
+    background: var(--bg-card);
     backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--card-border);
+    border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 10px;
     overflow: hidden;
@@ -523,43 +568,44 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     border: 0;
     border-radius: var(--radius-sm);
     min-height: 180px;
-    background: rgba(0,0,0,0.25);
+    background: rgba(0,0,0,0.2);
   }
   .chart-loading {
     display: flex;
     align-items: center;
     justify-content: center;
     height: 180px;
-    color: var(--muted);
+    color: var(--text-muted);
     font-size: 13px;
     gap: 10px;
   }
   .chart-loading::before {
     content: '';
     width: 18px; height: 18px;
-    border: 2px solid var(--card-border);
-    border-top-color: var(--blue);
+    border: 2px solid var(--border);
+    border-top-color: var(--accent-blue);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
 
-  /* ── Market List (card-based) ── */
-  .market-list { display: flex; flex-direction: column; gap: 8px; }
+  /* ─── Market List ─── */
+  .market-list { display: flex; flex-direction: column; gap: 6px; }
   .market-row {
     display: grid;
     grid-template-columns: 1fr auto auto auto;
     align-items: center;
     gap: 10px;
-    padding: 13px 14px;
-    background: var(--card-bg);
+    padding: 12px 14px;
+    background: var(--bg-card);
     backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--card-border);
-    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
     font-size: 13px;
-    transition: background 0.15s, border-color 0.15s;
+    transition: border-color 0.2s;
+    animation: slideIn 0.3s ease;
+    animation-fill-mode: backwards;
   }
-  .market-row:active, .market-row:hover { background: rgba(28,35,50,0.7); border-color: rgba(255,255,255,0.1); }
+  .market-row:hover { border-color: var(--border-light); }
   .market-row .name {
     font-weight: 600;
     white-space: nowrap;
@@ -568,50 +614,68 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     font-size: 13px;
   }
   .market-row .trade {
-    color: var(--blue);
+    color: var(--accent-blue);
     text-align: right;
     font-variant-numeric: tabular-nums;
     font-weight: 600;
     font-size: 12px;
     padding: 3px 8px;
-    background: rgba(88,166,255,0.1);
+    background: rgba(88,166,255,0.08);
     border-radius: 5px;
     min-width: 50px;
   }
   .market-row .depth {
-    color: var(--green);
+    color: var(--accent-green);
     text-align: right;
     font-variant-numeric: tabular-nums;
     font-weight: 600;
     font-size: 12px;
     padding: 3px 8px;
-    background: rgba(63,185,80,0.1);
+    background: rgba(63,185,80,0.08);
     border-radius: 5px;
     min-width: 50px;
   }
   .market-row .dot {
-    width: 10px; height: 10px; border-radius: 50%; justify-self: center;
+    width: 9px; height: 9px; border-radius: 50%; justify-self: center;
   }
-  .market-row .dot.green { background: var(--green); box-shadow: 0 0 6px rgba(63,185,80,0.5); }
-  .market-row .dot.yellow { background: var(--yellow); box-shadow: 0 0 6px rgba(210,153,34,0.5); }
-  .market-row .dot.red { background: var(--red); box-shadow: 0 0 6px rgba(248,81,73,0.5); }
-  .market-row .label-row { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .market-row .dot.green { background: var(--accent-green); box-shadow: 0 0 6px rgba(63,185,80,0.5); }
+  .market-row .dot.yellow { background: var(--accent-yellow); box-shadow: 0 0 6px rgba(210,153,34,0.5); }
+  .market-row .dot.red { background: var(--accent-red); box-shadow: 0 0 6px rgba(248,81,73,0.5); }
+  .market-row .label-row { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
 
-  /* ── Responsive ── */
+  /* ─── Responsive ─── */
   @media (max-width: 480px) {
     .app { padding: 12px 10px; }
     .chart-card { margin: 0 -10px; border-radius: 0; border-left: 0; border-right: 0; }
+    .header { flex-wrap: wrap; gap: 6px; }
+    .header-right { margin-left: auto; }
   }
 </style>
 </head>
 <body>
 <div class="app" id="app">
+  <nav class="nav">
+    <a href="/">🏠 Home</a>
+    <a href="/sentinel/">🛡️ Server Patrol</a>
+    <a href="/receiver/" class="active">📡 BTC Receiver</a>
+    <a href="/usage/">📊 Usage</a>
+    <a href="/kanban/">📋 管理</a>
+  </nav>
   <div class="header">
-    <h1><span class="live-dot"></span>agg-btc-receiver</h1>
-    <span class="ts" id="ts">--:--:--</span>
+    <div class="header-left">
+      <div class="header-logo">B</div>
+      <div class="header-info">
+        <h1>BTC Receiver</h1>
+        <div class="sub">agg-btc-receiver · market data</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <span class="live-dot green" id="status-dot"></span>
+      <span class="ts" id="ts">--:--:--</span>
+    </div>
   </div>
-  <div class="status-bar" id="status-bar">
-    <span class="status-dot green" id="status-dot"></span>
+  <div class="status-bar green" id="status-bar">
+    <span class="status-dot green" id="status-bar-dot"></span>
     <span class="status-label" id="status-label">接続中...</span>
     <span class="status-detail" id="status-detail"></span>
   </div>
@@ -673,13 +737,19 @@ function render(data) {
 
   document.getElementById('ts').textContent = clock(data.ts);
 
-  var sd = document.getElementById('status-dot');
+  var sd = document.getElementById('status-bar-dot');
   var sl = document.getElementById('status-label');
   var sdet = document.getElementById('status-detail');
+  var sbar = document.getElementById('status-bar');
+  var ldot = document.getElementById('status-dot');
   if (!run || run < t) {
-    sd.className='status-dot yellow'; sl.textContent='注意'; sdet.textContent=(t-run)+' 停止';
+    sd.className='status-dot yellow'; sbar.className='status-bar yellow';
+    sl.textContent='注意'; sdet.textContent=(t-run)+' 停止';
+    if(ldot) { ldot.className='live-dot yellow'; }
   } else {
-    sd.className='status-dot green'; sl.textContent='正常稼働中'; sdet.textContent=t+' 全マーケット稼働';
+    sd.className='status-dot green'; sbar.className='status-bar green';
+    sl.textContent='正常稼働中'; sdet.textContent=t+' 全マーケット稼働';
+    if(ldot) { ldot.className='live-dot green'; }
   }
 
   document.getElementById('m-trades').textContent = fmt(tr);
