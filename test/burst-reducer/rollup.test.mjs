@@ -24,6 +24,7 @@ function makeRows({ start = START, market = MARKET, empty = false } = {}) {
     max_burst_duration_ms_1s: empty ? 0 : (i === 18 ? 275 : i * 10),
     _quality: {
       source_layer: 'features_1s',
+      finalized: true,
       input_block_ids: [SOURCE_BLOCK],
       empty_block: empty,
       warmup: false,
@@ -111,6 +112,7 @@ describe('C1 pure 30s rollup', () => {
       phase: 'P2',
       operator: 'rollup',
       source_layer: 'features_1s',
+      finalized: true,
       source_window_count: 30,
       source_window_start_ms: START,
       source_window_end_ms: START + 30_000,

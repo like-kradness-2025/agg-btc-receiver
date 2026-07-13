@@ -22,6 +22,7 @@ function makeRows(start = 30_000) {
   return Array.from({ length: 30 }, (_, i) => createBaseRow(start + i * 1000, MARKET, {
     trade_count_this_second: i === 0 ? 1 : 0,
     input_block_ids: [String(start)],
+    finalized: true,
     warmup: false,
   }));
 }

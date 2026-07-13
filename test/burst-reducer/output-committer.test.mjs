@@ -21,6 +21,7 @@ function makeTestRows(blockStartMs) {
       trade_count_this_second: 0,
       warmup: blockStartMs === 0,
       input_block_ids: [String(blockStartMs)],
+      finalized: true,
     }));
   }
   // Set some features for verifiability
