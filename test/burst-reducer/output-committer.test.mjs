@@ -8,7 +8,7 @@ import { OutputCommitter } from '../../lib/burst-reducer/output-committer.mjs';
 import { createBaseRow } from '../../lib/burst-reducer/schema.mjs';
 import { loadManifest, loadCheckpoint } from '../../lib/burst-reducer/manifest-manager.mjs';
 
-const MARKET = 'test_committer';
+const MARKET = 'test_committer_' + randomUUID().replace(/-/g, '').slice(0, 8);
 const RUN_ID = 'test-run-1';
 const DEFAULT_DERIVED = 'data/derived/burst_features_v1';
 
@@ -74,7 +74,7 @@ describe('OutputCommitter', () => {
     );
 
     // Check output path
-    assert.ok(result.key.includes('burst_features_v1:test_committer:0:abc123'));
+    assert.ok(result.key.includes(':0:abc123'), `key ${result.key} should contain :0:abc123`);
     assert.equal(result.nextGeneration, 1);
     assert.equal(result.stagedHash.length, 64);
     assert.equal(result.finalHash.length, 64);

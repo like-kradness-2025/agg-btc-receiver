@@ -1,7 +1,7 @@
 // test/raw-rotation-writer.test.mjs — RawRotationWriter unit tests
 // Aligned to lib/raw-rotation-writer.mjs API
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import fs from 'node:fs';
@@ -15,6 +15,8 @@ import {
   noClobberRename,
   noClobberQuarantine,
   RawRotationWriter,
+  _setTestLinkFn,
+  _setTestMakeWriterFn,
 } from '../lib/raw-rotation-writer.mjs';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -162,39 +164,184 @@ describe('noClobberRename', () => {
   });
 });
 
-// ─── 5. noClobberQuarantine ─────────────────────────────────────────────────
+// ─── 5. noClobberRename — EXDEV cross-device fallback ──────────────────────
 
-describe('noClobberQuarantine', () => {
+describe('noClobberRename EXDEV fallback', () => {
   let dir;
-  before(() => { dir = tmpDir('quarantine'); });
+  before(() => { dir = tmpDir('exdev'); });
   after(async () => { await rmDir(dir); });
 
-  it('moves file to quarantine with suffix', async () => {
-    const src = path.join(dir, '12-00-00.jsonl.open');
-    fs.mkdirSync(path.dirname(src), { recursive: true });
-    fs.writeFileSync(src, 'quarantine test');
-    const qdir = path.join(dir, '_quarantine');
-    const result = await noClobberQuarantine(src, qdir);
-    assert.strictEqual(result.ok, true);
-    assert.ok(fs.existsSync(result.dest));
+  /** Force EXDEV by replacing the link function via test seam. */
+  function forceEXDEV() {
+    _setTestLinkFn(async () => {
+      throw Object.assign(new Error('cross-device link'), { code: 'EXDEV' });
+    });
+  }
+
+  function restoreLink() {
+    _setTestLinkFn(null);
+  }
+
+  it('link+unlink path succeeds on same filesystem (normal rename)', async () => {
+    restoreLink();
+    const src = path.join(dir, 'exdev-norm-src.txt');
+    const dest = path.join(dir, 'exdev-norm-dest.txt');
+    fs.writeFileSync(src, 'exdev data');
+    const result = await noClobberRename(src, dest);
+    assert.deepStrictEqual(result, { ok: true });
     assert.ok(!fs.existsSync(src));
-    assert.strictEqual(fs.readFileSync(result.dest, 'utf-8'), 'quarantine test');
+    assert.ok(fs.existsSync(dest));
+    assert.strictEqual(fs.readFileSync(dest, 'utf-8'), 'exdev data');
   });
 
-  it('generates unique name when quarantine dest exists', async () => {
-    const src = path.join(dir, '12-00-30.jsonl.open');
+  it('EXDEV copy+unlink fallback succeeds when dest does not exist', async () => {
+    forceEXDEV();
+    try {
+      const src = path.join(dir, 'exdev-copy-src.txt');
+      const dest = path.join(dir, 'exdev-copy-dest.txt');
+      fs.writeFileSync(src, 'exdev copy data');
+      const result = await noClobberRename(src, dest);
+      assert.deepStrictEqual(result, { ok: true });
+      assert.ok(!fs.existsSync(src), 'src should be unlinked after copy');
+      assert.ok(fs.existsSync(dest), 'dest should exist after copy');
+      assert.strictEqual(fs.readFileSync(dest, 'utf-8'), 'exdev copy data');
+    } finally {
+      restoreLink();
+    }
+  });
+
+  it('EXDEV copy+unlink quarantines src when dest already exists (EEXIST during copyFile)', async () => {
+    forceEXDEV();
+    try {
+      const src = path.join(dir, 'exdev-conflict-src.txt');
+      const dest = path.join(dir, 'exdev-conflict-dest.txt');
+      fs.writeFileSync(src, 'new data');
+      fs.writeFileSync(dest, 'existing data');
+      const result = await noClobberRename(src, dest);
+      assert.deepStrictEqual(result, { ok: false, reason: 'EEXIST' });
+      // Dest must still contain original content (no-clobber invariant)
+      assert.strictEqual(fs.readFileSync(dest, 'utf-8'), 'existing data');
+      // Source should be quarantined
+      assert.ok(!fs.existsSync(src), 'src should be quarantined');
+      assert.ok(fs.existsSync(src + '.conflict'), 'conflict file should exist');
+      // Verify conflict contains new data
+      assert.strictEqual(fs.readFileSync(src + '.conflict', 'utf-8'), 'new data');
+    } finally {
+      restoreLink();
+    }
+  });
+
+  it('EXDEV copy+unlink no-clobber always protects dest', async () => {
+    // Verify that even when link fails with EXDEV, the no-clobber invariant
+    // is maintained — dest is never overwritten.
+    forceEXDEV();
+    try {
+      const src = path.join(dir, 'exdev-protect-src.txt');
+      const dest = path.join(dir, 'exdev-protect-dest.txt');
+      fs.writeFileSync(src, 'should not overwrite');
+      fs.writeFileSync(dest, 'protected content');
+      const result = await noClobberRename(src, dest);
+      assert.deepStrictEqual(result, { ok: false, reason: 'EEXIST' });
+      assert.strictEqual(fs.readFileSync(dest, 'utf-8'), 'protected content');
+    } finally {
+      restoreLink();
+    }
+  });
+
+  it('EXDEV copy+unlink re-throws non-EXDEV, non-EEXIST errors', async () => {
+    // Force EXDEV on link AND make copyFile throw EACCES
+    forceEXDEV();
+    const origCopy = fsp.copyFile;
+    try {
+      // Override copyFile to throw EACCES
+      fsp.copyFile = async () => {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      };
+      const src = path.join(dir, 'exdev-error-src.txt');
+      const dest = path.join(dir, 'exdev-error-dest.txt');
+      fs.writeFileSync(src, 'error test');
+      await assert.rejects(
+        () => noClobberRename(src, dest),
+        /permission denied/,
+      );
+    } finally {
+      fsp.copyFile = origCopy;
+      restoreLink();
+    }
+  });
+});
+
+// ─── 6. noClobberQuarantine — suffix escalation ───────────────────────────
+
+describe('noClobberQuarantine suffix escalation', () => {
+  let dir;
+  before(() => { dir = tmpDir('quar-escalation'); });
+  after(async () => { await rmDir(dir); });
+
+  it('first conflict produces .conflict (no numeric suffix)', async () => {
+    const src = path.join(dir, 'file-a.jsonl.open');
     fs.mkdirSync(path.dirname(src), { recursive: true });
-    fs.writeFileSync(src, 'second quarantine');
+    fs.writeFileSync(src, 'first');
     const qdir = path.join(dir, '_quarantine');
-    // Pre-create the first conflict file
-    const firstDest = path.join(qdir, '12-00-30.jsonl.open.conflict');
-    fs.mkdirSync(qdir, { recursive: true });
-    fs.writeFileSync(firstDest, 'existing');
     const result = await noClobberQuarantine(src, qdir);
     assert.strictEqual(result.ok, true);
-    assert.notStrictEqual(result.dest, firstDest);
+    assert.ok(result.dest.endsWith('.conflict'), `expected .conflict suffix, got: ${result.dest}`);
     assert.ok(fs.existsSync(result.dest));
-    assert.ok(!fs.existsSync(src));
+    assert.strictEqual(fs.readFileSync(result.dest, 'utf-8'), 'first');
+  });
+
+  it('second conflict produces .conflict.1', async () => {
+    const baseName = 'file-b.jsonl.open';
+    const src = path.join(dir, baseName);
+    fs.writeFileSync(src, 'second');
+    const qdir = path.join(dir, '_quarantine');
+    // Pre-occupy .conflict
+    const firstConflict = path.join(qdir, `${baseName}.conflict`);
+    fs.mkdirSync(qdir, { recursive: true });
+    fs.writeFileSync(firstConflict, 'first occupant');
+    const result = await noClobberQuarantine(src, qdir);
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.dest.endsWith('.conflict.1'), `expected .conflict.1, got: ${result.dest}`);
+    assert.strictEqual(fs.readFileSync(result.dest, 'utf-8'), 'second');
+    // First occupant still intact
+    assert.strictEqual(fs.readFileSync(firstConflict, 'utf-8'), 'first occupant');
+  });
+
+  it('can escalate to double-digit suffix', async () => {
+    const baseName = 'file-c.jsonl.open';
+    const src = path.join(dir, baseName);
+    fs.writeFileSync(src, 'triple digit test');
+    const qdir = path.join(dir, '_quarantine');
+    fs.mkdirSync(qdir, { recursive: true });
+    // Pre-occupy .conflict through .conflict.9
+    for (let i = 0; i <= 9; i++) {
+      const p = i === 0
+        ? path.join(qdir, `${baseName}.conflict`)
+        : path.join(qdir, `${baseName}.conflict.${i}`);
+      fs.writeFileSync(p, 'occupied');
+    }
+    const result = await noClobberQuarantine(src, qdir);
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.dest.endsWith('.conflict.10'), `expected .conflict.10, got: ${result.dest}`);
+  });
+
+  it('stops at MAX_QUARANTINE_ATTEMPTS (100) and throws', async () => {
+    const baseName = 'file-d.jsonl.open';
+    const src = path.join(dir, baseName);
+    fs.writeFileSync(src, 'overflow');
+    const qdir = path.join(dir, '_quarantine');
+    fs.mkdirSync(qdir, { recursive: true });
+    // Occupy .conflict through .conflict.99
+    for (let i = 0; i <= 99; i++) {
+      const p = i === 0
+        ? path.join(qdir, `${baseName}.conflict`)
+        : path.join(qdir, `${baseName}.conflict.${i}`);
+      fs.writeFileSync(p, 'occupied');
+    }
+    await assert.rejects(
+      () => noClobberQuarantine(src, qdir),
+      /exceeded.*100/,
+    );
   });
 });
 
@@ -353,6 +500,120 @@ describe('Startup recovery', () => {
     await writer.startupRecovery(Date.now());
     assert.strictEqual(writer.getWatermark(), null);
     assert.strictEqual(writer.getCurrentWindowMs(), null);
+    await writer.finalize();
+  });
+});
+
+// ─── FIX4: raw I/O error propagation ────────────────────────────────────────
+
+describe('FIX4 raw I/O error propagation', () => {
+  let dir;
+
+  before(() => { dir = tmpDir('fix4'); });
+  after(async () => { await rmDir(dir); });
+
+  /** 指定したメソッドで throw する擬似 writer を返すファクトリ */
+  function createFailingWriter(failOn = 'write') {
+    return {
+      _filePath: '/tmp/fake-path',
+      async write() {
+        if (failOn === 'write' || failOn === 'all') throw new Error('injected: write failed');
+      },
+      async flush() {
+        if (failOn === 'flush' || failOn === 'all') throw new Error('injected: flush failed');
+      },
+      async close() {
+        if (failOn === 'close' || failOn === 'all') throw new Error('injected: close failed');
+      },
+    };
+  }
+
+  afterEach(() => {
+    _setTestMakeWriterFn(null);
+  });
+
+  it('F4-1: write() エラーで errorCount が増加する', async () => {
+    _setTestMakeWriterFn(() => createFailingWriter('write'));
+    const writer = new RawRotationWriter(dir, 'market_a', 'trades', { flushIntervalMs: 50 });
+
+    assert.strictEqual(writer.getWriteErrorCount(), 0, '初期状態は 0');
+    // 最初の write で _createWriter → 失敗 writer が使われ、write が throw する
+    await writer.write({ price: 100 }, Date.now());
+    assert.strictEqual(writer.getWriteErrorCount(), 1, 'write エラー後は 1');
+
+    const lastErr = writer.getLastWriteError();
+    assert.ok(lastErr !== null, 'lastError がセットされている');
+    assert.ok(lastErr.message.includes('injected'), `メッセージに "injected" を含む: ${lastErr.message}`);
+    assert.ok(typeof lastErr.at === 'number', `at は数値: ${typeof lastErr.at}`);
+
+    await writer.finalize();
+  });
+
+  it('F4-2: 複数エラーが累積する', async () => {
+    _setTestMakeWriterFn(() => createFailingWriter('write'));
+    const writer = new RawRotationWriter(dir, 'market_b', 'trades', { flushIntervalMs: 50 });
+
+    await writer.write({ a: 1 }, Date.now());
+    await writer.write({ a: 2 }, Date.now() + 1);
+    await writer.write({ a: 3 }, Date.now() + 2);
+    assert.strictEqual(writer.getWriteErrorCount(), 3, '3回のエラーが累積');
+
+    await writer.finalize();
+  });
+
+  it('F4-3: finalize() エラーも errorCount にカウントされる', async () => {
+    // write は成功させるが finalize 時の close で失敗させる
+    _setTestMakeWriterFn(() => createFailingWriter('close'));
+    const writer = new RawRotationWriter(dir, 'market_c', 'trades', { flushIntervalMs: 50 });
+
+    // 最初の write で writer 作成、write は成功（failOn='close'）
+    await writer.write({ price: 200 }, Date.now());
+    assert.strictEqual(writer.getWriteErrorCount(), 0, 'write 段階ではエラーなし');
+
+    // finalize で close が throw → エラーカウント増加
+    await writer.finalize();
+    assert.strictEqual(writer.getWriteErrorCount(), 1, 'finalize エラー後は 1');
+  });
+
+  it('F4-4: checkStale() エラーも errorCount にカウントされる', async () => {
+    // flush で失敗させる writer
+    _setTestMakeWriterFn(() => createFailingWriter('flush'));
+    const writer = new RawRotationWriter(dir, 'market_d', 'trades', { flushIntervalMs: 50 });
+
+    // まず write で writer を生成（flush は呼ばれない）
+    await writer.write({ price: 300 }, Date.now());
+    assert.strictEqual(writer.getWriteErrorCount(), 0, 'write 段階ではエラーなし');
+
+    // far-future で checkStale → 60s 条件を満たし _finalizeWriter → flush() が throw
+    await writer.checkStale(Date.now() + 120_000);
+    assert.strictEqual(writer.getWriteErrorCount(), 1, 'checkStale エラー後は 1');
+  });
+
+  it('F4-5: clearWriteError() でリセットされる', async () => {
+    _setTestMakeWriterFn(() => createFailingWriter('write'));
+    const writer = new RawRotationWriter(dir, 'market_e', 'trades', { flushIntervalMs: 50 });
+
+    await writer.write({ price: 400 }, Date.now());
+    assert.strictEqual(writer.getWriteErrorCount(), 1);
+
+    writer.clearWriteError();
+    assert.strictEqual(writer.getWriteErrorCount(), 0, 'clear 後は 0');
+    assert.strictEqual(writer.getLastWriteError(), null, 'lastError も null');
+
+    await writer.finalize();
+  });
+
+  it('F4-6: エラー後も後続の write はキューを継続する（未処理例外なし）', async () => {
+    _setTestMakeWriterFn(() => createFailingWriter('write'));
+    const writer = new RawRotationWriter(dir, 'market_f', 'trades', { flushIntervalMs: 50 });
+
+    // 連続 write — すべて失敗するが未処理例外にならないことを確認
+    await writer.write({ x: 1 }, Date.now());
+    await writer.write({ x: 2 }, Date.now() + 1);
+    // ここに到達 = 未処理例外なし
+    assert.ok(true, '未処理例外なく継続');
+    assert.strictEqual(writer.getWriteErrorCount(), 2);
+
     await writer.finalize();
   });
 });

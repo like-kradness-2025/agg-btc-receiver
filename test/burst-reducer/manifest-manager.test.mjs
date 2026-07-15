@@ -17,8 +17,8 @@ describe('ManifestManager', () => {
   const testCpDir = join('data/derived/burst_features_v1', 'manifests/checkpoints');
 
   before(() => {
-    // Clean any leftover test state from all test markets
-    const cleanMarkets = ['test_manifest', 'test_committer', 'test_pipeline', 'test_committer_err', 'test_committer_err2'];
+    // Clean any leftover test state — only our own market, not other test files' markets
+    const cleanMarkets = [MARKET];
     const testManifestDir = join('data/derived/burst_features_v1', 'manifests');
     const testCpDir = join('data/derived/burst_features_v1', 'manifests/checkpoints');
     for (const m of cleanMarkets) {

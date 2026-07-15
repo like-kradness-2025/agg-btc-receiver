@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
+import { validateConfig } from './lib/config-validator.mjs';
 
 // ====== Market grouping (4 workers) ======
 
@@ -73,6 +74,14 @@ try {
   process.exit(1);
 }
 
+// Structural validation before any config access.
+// Fail-closed: any violation prevents worker startup and output creation.
+const validation = validateConfig(config);
+if (!validation.valid) {
+  console.error(`[main] config validation failed:\n${validation.errors.map(e => `  - ${e}`).join('\n')}`);
+  process.exit(1);
+}
+
 const outputBase = arg('output', config.output.base_path);
 const seconds = parseInt(arg('seconds', '0'), 10);
 const marketsArg = arg('markets', '');
@@ -80,6 +89,14 @@ const enabledMarkets = marketsArg
   ? marketsArg.split(',').map(s => s.trim()).filter(Boolean)
   : Object.keys(config.markets).filter(m => config.markets[m].enabled);
 const selfTestReconnectAfterMs = parseInt(arg('selfTestReconnectAfterMs', '0'), 10);
+
+// C2 G1: unknown market on CLI → fail-closed（exit(1)）。
+// --markets で指定された名前が config.markets に存在しない場合、プロセスは即座に終了する。
+const unknownMarkets = enabledMarkets.filter(m => !config.markets[m]);
+if (unknownMarkets.length > 0) {
+  console.error(`[main] unknown market(s) in --markets: ${unknownMarkets.join(', ')} — fail-closed`);
+  process.exit(1);
+}
 
 // ====== Initialize main-thread components ======
 
@@ -98,10 +115,10 @@ const readyWorkers = new Set();
 /** @type {Set<string>} workers that have finished replay */
 const replayDoneWorkers = new Set();
 
-/** Number of workers expected after spawning. Used for fail-closed startup. */
+/** Number of workers expected after spawning. Used for startup tracking. */
 let expectedWorkerCount = 0;
-/** Set to true when a worker exits or errors before ready — triggers fail-closed. */
-let startupFailed = false;
+/** Workers that exited or errored before sending ready — B2/G4 per-worker tracking. */
+const failedWorkers = new Set();
 
 const STARTUP_STAGGER_MS = 50;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -153,7 +170,7 @@ function createWorker(workerId, groupMarkets) {
 
       case 'startupFailed':
         console.error(`[main] worker ${msg.workerId} startup failed for market ${msg.market}: ${msg.reason}`);
-        startupFailed = true;
+        // B2/G4: per-market failure is isolated — not process-fatal.
         break;
 
       default:
@@ -164,17 +181,17 @@ function createWorker(workerId, groupMarkets) {
 
   worker.on('error', (err) => {
     console.error(`[main] worker ${workerId} error:`, err.message);
-    // Worker error before ready is fatal
+    // B2/G4: a worker error before ready is per-worker, not global.
     if (!readyWorkers.has(workerId)) {
-      startupFailed = true;
+      failedWorkers.add(workerId);
     }
   });
 
   worker.on('exit', (code) => {
     console.log(`[main] worker ${workerId} exited with code ${code}`);
-    // Worker exit before ready is fatal
+    // B2/G4: a worker exit before ready is per-worker, not global.
     if (!readyWorkers.has(workerId)) {
-      startupFailed = true;
+      failedWorkers.add(workerId);
     }
     workers.delete(workerId);
   });
@@ -214,20 +231,20 @@ async function main() {
 
   expectedWorkerCount = workers.size;
 
-  // Wait for all workers to be ready (with timeout, fail-closed)
-  const readyTimeout = 60000;
+  // Wait for all workers to be ready or failed (B2/G4: per-worker error, not fail-closed)
+  // BTCRECEIVER_READY_TIMEOUT_MS 環境変数でタイムアウトを上書き可能（テスト用）。
+  const readyTimeout = parseInt(process.env.BTCRECEIVER_READY_TIMEOUT_MS, 10) || 60000;
   const readyStart = Date.now();
-  while (readyWorkers.size < expectedWorkerCount && !startupFailed) {
+  while (readyWorkers.size + failedWorkers.size < expectedWorkerCount) {
     if (Date.now() - readyStart > readyTimeout) {
-      console.error(`[main] timeout waiting for workers to be ready (${readyWorkers.size}/${expectedWorkerCount})`);
-      startupFailed = true;
+      console.error(`[main] timeout waiting for workers (${readyWorkers.size}/${expectedWorkerCount} ready)`);
       break;
     }
     await sleep(100);
   }
 
-  if (startupFailed) {
-    console.error('[main] startup failed — shutting down all workers');
+  if (readyWorkers.size === 0) {
+    console.error('[main] no workers ready — shutting down');
     // Send shutdown to all workers
     for (const [, worker] of workers) {
       try { worker.postMessage({ cmd: 'shutdown' }); } catch (_) {}
