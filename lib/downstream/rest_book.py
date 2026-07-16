@@ -200,19 +200,55 @@ def _load_rest_config(config_path: str = "config.v3.json"):
 
 
 def fetch_rest_book(market: str, config_path: str = "config.v3.json",
-                    force: bool = False) -> Optional[Tuple[Dict[float, float], Dict[float, float]]]:
+                    force: bool = False, allow_once: bool = True) -> Optional[Tuple[Dict[float, float], Dict[float, float]]]:
     """
     Fetch full orderbook from REST API for a market.
 
     Returns (bids_dict, asks_dict) or None if unavailable/failed.
     Uses cache (30s TTL) to avoid rate limits.
+
+    Parameters
+    ----------
+    market : str
+        Market identifier (e.g. "binance_spot", "bitfinex_spot").
+    config_path : str
+        Path to config.v3.json (default: "config.v3.json").
+    force : bool
+        If True, bypass cache and perform a fresh fetch. Mutually exclusive
+        with ``allow_once=True`` — passing both raises ``ValueError``.
+        Default: False.
+    allow_once : bool
+        If True (default), only the first successful fetch for a given market
+        is performed; subsequent calls return the cached values regardless of
+        TTL. This supports the "REST seed only on first run" requirement.
+        Set ``allow_once=False`` to restore TTL-based caching (30s refresh).
+
+    Returns
+    -------
+    Optional[Tuple[Dict[float, float], Dict[float, float]]]
+        (bids_dict, asks_dict) where keys are prices (float) and values are
+        quantities (float). Returns None if fetch fails or market not configured.
+
+    Raises
+    ------
+    ValueError
+        If both ``force=True`` and ``allow_once=True`` are passed explicitly.
+        These parameters are mutually exclusive by design: ``force`` means
+        "always refetch", while ``allow_once`` means "fetch only once".
     """
     global _rest_cache
 
-    # Check cache
-    if not force and market in _rest_cache:
+    # Guard against contradictory parameters
+    if force and allow_once:
+        raise ValueError(
+            "fetch_rest_book: force=True and allow_once=True are mutually exclusive. "
+            "Use force=True to always refetch, or allow_once=True for one-shot seeding."
+        )
+
+    # Check cache (one-shot or TTL)
+    if market in _rest_cache:
         cached_at, bids, asks = _rest_cache[market]
-        if time.time() - cached_at < CACHE_TTL_SECONDS:
+        if allow_once or (not force and time.time() - cached_at < CACHE_TTL_SECONDS):
             return bids, asks
 
     _load_rest_config(config_path)
@@ -248,6 +284,15 @@ def fetch_rest_book(market: str, config_path: str = "config.v3.json",
     # Update cache
     _rest_cache[market] = (time.time(), bids, asks)
     return bids, asks
+
+
+def clear_rest_cache(market: Optional[str] = None):
+    """Clear REST cache for a market or all markets."""
+    global _rest_cache
+    if market is None:
+        _rest_cache.clear()
+    else:
+        _rest_cache.pop(market, None)
 
 
 def seed_book_replay(book_replay, market: str, config_path: str = "config.v3.json") -> bool:

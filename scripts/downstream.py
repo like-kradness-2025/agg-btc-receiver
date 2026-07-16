@@ -60,6 +60,13 @@ log = logging.getLogger("downstream")
 _BOOK_STATES: Dict[str, BookReplay] = {}
 
 
+def _get_book_state(market: str, create: bool = True) -> Optional[BookReplay]:
+    """Return the persistent per-market BookReplay, creating if requested."""
+    if create:
+        return _BOOK_STATES.setdefault(market, BookReplay())
+    return _BOOK_STATES.get(market)
+
+
 def process_block(
     file_path: str,
     block_start_ms: int,
@@ -67,6 +74,7 @@ def process_block(
     tick_size: float,
     lookback_trades: Optional[List[dict]] = None,
     book_updates_path: Optional[str] = None,
+    seed_rest: bool = True,
 ) -> int:
     """
     Process a single 30s block: read trades → detect bursts → compute features → write Parquet.
@@ -80,6 +88,9 @@ def process_block(
         tick_size: Tick size for span calculation.
         lookback_trades: Trades from prior blocks for 30s lookback window (#12).
         book_updates_path: Path to matching book_updates JSONL block (optional).
+        seed_rest: If True (default), fetch REST snapshot to seed or upsert book
+            levels. The underlying fetch_rest_book caches the first successful
+            result per market, so REST is effectively only fetched once.
 
     Returns:
         Number of feature rows written (30 on success, 0 on empty/skip).
@@ -111,26 +122,30 @@ def process_block(
         updates = read_book_updates(book_updates_path)
         if updates:
             # Reuse the continuous per-market state; do not reset each block.
-            br = _BOOK_STATES.setdefault(market, BookReplay())
+            br = _get_book_state(market, create=True)
+            assert br is not None
 
             # Apply WS updates first (chronological order)
             br.apply_updates(updates)
 
             # Then upsert REST snapshot to fill static levels not covered by WS diffs
-            from lib.downstream.rest_book import fetch_rest_book
-            rest_bids, rest_asks = fetch_rest_book(market) or ({}, {})
-            if rest_bids or rest_asks:
-                # Merge as regular update — adds new levels, updates existing
-                merge_update = {
-                    "bids": [[str(p), str(q)] for p, q in rest_bids.items()],
-                    "asks": [[str(p), str(q)] for p, q in rest_asks.items()],
-                    "ts": 0,
-                }
-                br.apply_json(merge_update)
-                log.info("  [%s] book — %d WS updates + REST upsert (%d/%d levels)",
-                         market, len(updates), len(rest_bids), len(rest_asks))
+            if seed_rest:
+                from lib.downstream.rest_book import fetch_rest_book
+                rest_bids, rest_asks = fetch_rest_book(market) or ({}, {})
+                if rest_bids or rest_asks:
+                    # Merge as regular update — adds new levels, updates existing
+                    merge_update = {
+                        "bids": [[str(p), str(q)] for p, q in rest_bids.items()],
+                        "asks": [[str(p), str(q)] for p, q in rest_asks.items()],
+                        "ts": 0,
+                    }
+                    br.apply_json(merge_update)
+                    log.info("  [%s] book — %d WS updates + REST upsert (%d/%d levels)",
+                             market, len(updates), len(rest_bids), len(rest_asks))
+                else:
+                    log.info("  [%s] book — %d WS updates only (no REST)", market, len(updates))
             else:
-                log.info("  [%s] book — %d WS updates only (no REST)", market, len(updates))
+                log.info("  [%s] book — %d WS updates only (REST seed disabled)", market, len(updates))
 
             book_replay = br
 

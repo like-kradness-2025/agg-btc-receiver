@@ -1,10 +1,14 @@
 node_modules/
+.venv/
 data/
 runtime/
 docs/WIRING_DIAGRAM.md
 __pycache__/
 *.pyc
 charts/
+
+# Local verification scripts
+verify_6_items.py
 
 # CVD analysis (moved to burst-cvd-analysis/)
 plot_cvd.py

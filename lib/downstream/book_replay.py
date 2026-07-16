@@ -8,6 +8,28 @@ Provides snapshot at any timestamp: best bid/ask, top depth, mid price.
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Maximum distance from fair/mid price to retain a price level (each side).
+# Applies to both snapshot_at and binned snapshots. Seedless books are empty.
+#
+# MAX_PRICE_DISTANCE: float = 10000.0
+#
+# Unit: USD (United States Dollar)
+# Meaning: The maximum absolute price difference from the fair price (mid price)
+#          that a price level can have and still be included in snapshots.
+# Boundary: Inclusive — levels at exactly ±10000 USD from fair are retained.
+# Example: If fair price is $100,000, levels from $90,000 to $110,000 are kept.
+#
+# This filter prevents outlier prices (e.g., flash crashes, fat-finger orders)
+# from distorting aggregate statistics while retaining realistic market depth.
+MAX_PRICE_DISTANCE: float = 10000.0
+
+# Upper bound on the number of price levels scanned during fallback searches
+# (_best_bid_within_window, _best_ask_within_window).  Exchange orderbooks are
+# naturally bounded (typically < 5000 levels), but a misbehaving feed could
+# inject unbounded levels.  This cap prevents unbounded CPU in pathological
+# cases while still being large enough that legitimate books are never truncated.
+MAX_FALLBACK_SCAN_LEVELS: int = 100_000
+
 
 @dataclass
 class BookSnapshot:
@@ -52,6 +74,16 @@ class BookReplay:
         self._seeded = False
         self._best_bid = (0.0, 0.0)
         self._best_ask = (0.0, 0.0)
+
+    def _fair_price(self) -> Optional[float]:
+        """Return current fair/mid price, or None if not seeded."""
+        if not self._seeded:
+            return None
+        bid_price, _ = self._best_bid
+        ask_price, _ = self._best_ask
+        if bid_price > 0 and ask_price > 0 and bid_price < ask_price:
+            return (bid_price + ask_price) / 2.0
+        return None
 
     def apply_json(self, obj: dict):
         """
@@ -100,7 +132,11 @@ class BookReplay:
         self._recompute_best()
 
     def _recompute_best(self):
-        """Find best bid (max price) and best ask (min price)."""
+        """Recompute best bid/ask from currently stored levels only.
+
+        Uses single-pass max/min over the bid/ask dictionaries.  Best is
+        recomputed after every apply so cached values are always fresh.
+        """
         if self._bids:
             best_bid_price = max(self._bids.keys())
             self._best_bid = (best_bid_price, self._bids[best_bid_price])
@@ -113,7 +149,12 @@ class BookReplay:
         else:
             self._best_ask = (0.0, 0.0)
 
-        self._seeded = (len(self._bids) > 0 and len(self._asks) > 0)
+        # Seed only when both sides are present and non-crossed.
+        self._seeded = (
+            len(self._bids) > 0
+            and len(self._asks) > 0
+            and self._best_bid[0] < self._best_ask[0]
+        )
 
     def apply_updates(self, updates: List[dict]):
         """Apply multiple updates in sequence."""
@@ -135,8 +176,22 @@ class BookReplay:
         if not self._seeded:
             return snap
 
+        fair = self._fair_price()
+        if fair is None:
+            return snap
+
+        # Filter best levels to the fair-price window and recompute if needed.
         bid_price, bid_qty = self._best_bid
         ask_price, ask_qty = self._best_ask
+        if not self._within_price_window(bid_price, fair):
+            bid_price = self._best_bid_within_window(fair)
+            bid_qty = self._bids.get(bid_price, 0.0)
+        if not self._within_price_window(ask_price, fair):
+            ask_price = self._best_ask_within_window(fair)
+            ask_qty = self._asks.get(ask_price, 0.0)
+
+        if bid_price <= 0 or ask_price <= 0 or bid_price >= ask_price:
+            return snap
 
         snap.best_bid_price = bid_price
         snap.best_bid_qty = bid_qty
@@ -144,11 +199,51 @@ class BookReplay:
         snap.best_ask_qty = ask_qty
         snap.seeded = True
 
-        if bid_price > 0 and ask_price > 0:
-            snap.mid_price = (bid_price + ask_price) / 2.0
-            snap.top_depth_notional = (bid_price * bid_qty) + (ask_price * ask_qty)
+        snap.mid_price = (bid_price + ask_price) / 2.0
+        snap.top_depth_notional = (bid_price * bid_qty) + (ask_price * ask_qty)
 
         return snap
+
+    def _best_bid_within_window(self, fair: float) -> float:
+        """Return the best bid inside the fair-price window, or 0.0 if none.
+
+        Performance: O(n) scan over all stored bid levels, capped at
+        MAX_FALLBACK_SCAN_LEVELS iterations to prevent unbounded CPU in
+        pathological cases (e.g., feed injecting millions of spurious levels).
+        Normal exchange orderbooks (< 5000 levels) are never affected.
+
+        The MAX_PRICE_DISTANCE filter prunes levels outside ±$10k from fair,
+        but this scan visits ALL stored levels (not just those in the window)
+        to find the best one that qualifies.
+        """
+        best = 0.0
+        scanned = 0
+        for price in self._bids:
+            if self._within_price_window(price, fair) and price > best:
+                best = price
+            scanned += 1
+            if scanned >= MAX_FALLBACK_SCAN_LEVELS:
+                break
+        return best
+
+    def _best_ask_within_window(self, fair: float) -> float:
+        """Return the best ask inside the fair-price window, or 0.0 if none.
+
+        See _best_bid_within_window for performance notes.
+        """
+        best = 0.0
+        scanned = 0
+        for price in self._asks:
+            if self._within_price_window(price, fair) and (best == 0.0 or price < best):
+                best = price
+            scanned += 1
+            if scanned >= MAX_FALLBACK_SCAN_LEVELS:
+                break
+        return best
+
+    def _within_price_window(self, price: float, fair: float) -> bool:
+        """Check if price is within +/- MAX_PRICE_DISTANCE of fair price."""
+        return abs(price - fair) <= MAX_PRICE_DISTANCE
 
     def get_binned_snapshot(self, ts: int, bin_size: float = 1.0) -> dict:
         """
@@ -156,6 +251,10 @@ class BookReplay:
 
         Bids sorted descending (best first), asks sorted ascending.
         Each bin sums qty for [bin_floor, bin_floor + bin_size).
+
+        Only retains price levels within +/- MAX_PRICE_DISTANCE of the fair
+        price. If the book is not seeded (fair price unknown), returns an
+        empty seedless snapshot.
 
         Returns dict:
         {ts, seeded,
@@ -165,7 +264,8 @@ class BookReplay:
         import math
         result = {"ts": ts, "seeded": self._seeded}
 
-        if not self._seeded:
+        fair = self._fair_price()
+        if fair is None:
             result["bid_prices"] = []
             result["bid_qtys"] = []
             result["ask_prices"] = []
@@ -173,10 +273,12 @@ class BookReplay:
             return result
 
         def _bin(levels: Dict[float, float], ascending: bool) -> tuple:
-            """Bin price→qty levels into bin_size buckets."""
+            """Bin price→qty levels into bin_size buckets, filtered by fair-price window."""
             bins: Dict[float, float] = {}
             for price, qty in levels.items():
                 if qty <= 0:
+                    continue
+                if not self._within_price_window(price, fair):
                     continue
                 bin_key = math.floor(price / bin_size) * bin_size
                 bins[bin_key] = bins.get(bin_key, 0.0) + qty
