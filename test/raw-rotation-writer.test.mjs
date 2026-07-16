@@ -356,3 +356,181 @@ describe('Startup recovery', () => {
     await writer.finalize();
   });
 });
+
+// ─── 8. I/O failure propagation ──────────────────────────────────────────────
+
+describe('I/O failure propagation', () => {
+  let dir;
+
+  before(() => { dir = tmpDir('io-fail'); });
+  after(async () => { await rmDir(dir); });
+
+  it('records error from write() and exposes via getIoFailure()', async () => {
+    const writer = new RawRotationWriter(dir, 'test_market', 'trades', {
+      flushIntervalMs: 500,
+    });
+
+    // Fresh writer: no failures
+    assert.deepStrictEqual(writer.getIoFailure(), { count: 0, message: null });
+
+    // Replace _writeImpl to simulate an I/O failure
+    const origImpl = writer._writeImpl.bind(writer);
+    writer._writeImpl = async () => { throw new Error('ENOSPC: no space left'); };
+
+    // Write fails internally, error is recorded (method doesn't throw)
+    await writer.write({ test: true }, Date.now());
+
+    const fail = writer.getIoFailure();
+    assert.strictEqual(fail.count, 1, 'should record 1 I/O failure');
+    assert.ok(fail.message.includes('ENOSPC'), `message should mention ENOSPC, got: ${fail.message}`);
+
+    // Restore original impl so finalize works
+    writer._writeImpl = origImpl;
+    await writer.finalize();
+  });
+
+  it('records error from checkStale() via getIoFailure()', async () => {
+    const writer = new RawRotationWriter(dir, 'test_market_2', 'book_updates', {
+      flushIntervalMs: 500,
+    });
+
+    // Set up a valid writer first (write once so rotation happens)
+    await writer.write({ init: true }, Date.now());
+    const before = writer.getIoFailure();
+    assert.strictEqual(before.count, 0, 'no failures before stale check');
+
+    // Replace _checkStaleImpl to simulate failure
+    const origStale = writer._checkStaleImpl.bind(writer);
+    writer._checkStaleImpl = async () => { throw new Error('EACCES: permission denied'); };
+
+    await writer.checkStale(Date.now());
+
+    const fail = writer.getIoFailure();
+    assert.strictEqual(fail.count, 1, 'should record 1 checkStale failure');
+    assert.ok(fail.message.includes('EACCES'), `message should mention EACCES, got: ${fail.message}`);
+
+    writer._checkStaleImpl = origStale;
+    await writer.finalize();
+  });
+
+  it('cascading failures increment count', async () => {
+    const writer = new RawRotationWriter(dir, 'test_market_3', 'liquidations', {
+      flushIntervalMs: 500,
+    });
+
+    const origImpl = writer._writeImpl.bind(writer);
+    writer._writeImpl = async () => { throw new Error('EIO: I/O error'); };
+
+    // Three consecutive write failures
+    await writer.write({ a: 1 }, Date.now());
+    await writer.write({ a: 2 }, Date.now() + 10);
+    await writer.write({ a: 3 }, Date.now() + 20);
+
+    const fail = writer.getIoFailure();
+    assert.strictEqual(fail.count, 3, 'count should reflect all 3 failures');
+    assert.ok(fail.message.includes('EIO'), `message should mention EIO, got: ${fail.message}`);
+
+    writer._writeImpl = origImpl;
+    await writer.finalize();
+  });
+
+  it('normal writes do not produce false failures', async () => {
+    const writer = new RawRotationWriter(dir, 'test_market_4', 'trades', {
+      flushIntervalMs: 50,
+    });
+
+    const base = Date.now();
+    for (let i = 0; i < 5; i++) {
+      await writer.write({ idx: i }, base + i * 100);
+    }
+
+    await writer.finalize();
+
+    assert.deepStrictEqual(
+      writer.getIoFailure(),
+      { count: 0, message: null },
+      'normal writes should not produce I/O failures',
+    );
+  });
+
+  it('records error from finalize() when _finalizeWriter throws', async () => {
+    const writer = new RawRotationWriter(dir, 'finalize_fail_1', 'trades', {
+      flushIntervalMs: 500,
+    });
+
+    // Fresh writer: no failures
+    assert.deepStrictEqual(writer.getIoFailure(), { count: 0, message: null });
+
+    // Write to create a current writer
+    await writer.write({ init: true }, Date.now());
+
+    // Mock _finalizeWriter to throw (simulates flush/close/rename failure)
+    const origFinalizeWriter = writer._finalizeWriter.bind(writer);
+    writer._finalizeWriter = async () => { throw new Error('EIO: finalize flush failed'); };
+
+    await writer.finalize();
+
+    const fail = writer.getIoFailure();
+    assert.strictEqual(fail.count, 1, 'should record 1 finalize I/O failure');
+    assert.ok(fail.message.includes('EIO'), `message should mention EIO, got: ${fail.message}`);
+
+    // Restore original — no cleanup finalize needed (tmp dir handles it)
+    writer._finalizeWriter = origFinalizeWriter;
+  });
+
+  it('records error from finalize() with both writers failing', async () => {
+    const writer = new RawRotationWriter(dir, 'finalize_fail_2', 'trades', {
+      flushIntervalMs: 500,
+    });
+
+    const ts = Date.now();
+    const currentWs = windowStartMs(ts);
+    const prevWs = currentWs - 30000;
+
+    // Write to current window
+    await writer.write({ a: 1 }, currentWs + 100);
+    // Write to previous window — triggers late-event path, creates _previousWriter
+    await writer.write({ b: 2 }, prevWs + 100);
+
+    // Both writers should now be populated
+    assert.ok(writer._previousWriter !== null, 'previous writer should exist');
+    assert.ok(writer._currentWriter !== null, 'current writer should exist');
+
+    // Mock _finalizeWriter to throw on both calls
+    const origFinalizeWriter = writer._finalizeWriter.bind(writer);
+    let callCount = 0;
+    writer._finalizeWriter = async () => {
+      callCount++;
+      throw new Error(`EIO: finalize error #${callCount}`);
+    };
+
+    await writer.finalize();
+
+    const fail = writer.getIoFailure();
+    assert.strictEqual(
+      fail.count, 2,
+      'should record 2 I/O failures (one per writer)',
+    );
+    assert.ok(
+      fail.message.includes('error #2'),
+      `message should reflect last error, got: ${fail.message}`,
+    );
+
+    writer._finalizeWriter = origFinalizeWriter;
+  });
+
+  it('finalize does not produce false I/O failures on success', async () => {
+    const writer = new RawRotationWriter(dir, 'finalize_success', 'trades', {
+      flushIntervalMs: 50,
+    });
+
+    await writer.write({ ok: true }, Date.now());
+    await writer.finalize();
+
+    assert.deepStrictEqual(
+      writer.getIoFailure(),
+      { count: 0, message: null },
+      'successful finalize should not produce I/O failures',
+    );
+  });
+});

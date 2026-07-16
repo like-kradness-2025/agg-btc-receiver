@@ -16,6 +16,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
+import { validateConfig } from './lib/config-validator.mjs';
+import { acquireOutputRootLock, releaseOutputRootLock } from './lib/lock.mjs';
 
 // ====== Market grouping (4 workers) ======
 
@@ -73,7 +75,23 @@ try {
   process.exit(1);
 }
 
+// Structural validation before any config access.
+// Fail-closed: any violation prevents worker startup and output creation.
+const validation = validateConfig(config);
+if (!validation.valid) {
+  console.error(`[main] config validation failed:\n${validation.errors.map(e => `  - ${e}`).join('\n')}`);
+  process.exit(1);
+}
+
+// ====== Acquire output-root lock ======
+
 const outputBase = arg('output', config.output.base_path);
+const lockResult = await acquireOutputRootLock(outputBase);
+if (!lockResult.ok) {
+  console.error(`[main] failed to acquire output-root lock: ${lockResult.status}${lockResult.holder ? ` (holder: ${lockResult.holder})` : ''}`);
+  process.exit(1);
+}
+process.on('exit', () => { try { releaseOutputRootLock(outputBase); } catch (_) {} });
 const seconds = parseInt(arg('seconds', '0'), 10);
 const marketsArg = arg('markets', '');
 const enabledMarkets = marketsArg
@@ -154,6 +172,15 @@ function createWorker(workerId, groupMarkets) {
       case 'startupFailed':
         console.error(`[main] worker ${msg.workerId} startup failed for market ${msg.market}: ${msg.reason}`);
         startupFailed = true;
+        break;
+
+      case 'writerStatus':
+        healthMonitor.updateWriterHealth(msg.market, msg.payload);
+        if (msg.payload.count > 0) {
+          console.error(
+            `[main] writer I/O failure detected for ${msg.market}: ${msg.payload.count} error(s), last: ${msg.payload.message}`,
+          );
+        }
         break;
 
       default:

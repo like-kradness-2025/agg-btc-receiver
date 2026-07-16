@@ -11,7 +11,7 @@ import { BufferedWriter } from '../lib/buffered-writer.mjs';
  * Helper: resolve tmpdir within this project (safe cleanup).
  */
 function tmpPath(name) {
-  const dir = path.join(os.tmpdir(), 'btc-receiver-test', `bw-${name}-${Date.now()}`);
+  const dir = path.join(os.tmpdir(), `btc-receiver-test-${process.pid}`, `bw-${name}-${Date.now()}`);
   fs.mkdirSync(dir, { recursive: true });
   return path.join(dir, 'test.jsonl');
 }

@@ -165,8 +165,11 @@ describe('Binance sync logic', () => {
       // Suppress expected error events
       conn.on('error', () => {});
 
-      await conn._syncBook();
-      // After 3 retries, should end up in 'error' state (not forced running)
+      await assert.rejects(
+        () => conn._syncBook(),
+        /init sync failed/
+      );
+      // After 3 retries, should end up in 'error' state
       assert.strictEqual(conn.getState(), 'error');
     });
 

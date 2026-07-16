@@ -5,7 +5,7 @@ import path from 'node:path';
 import { FairPriceCollector } from '../lib/fair-price-collector.mjs';
 import { FullBook } from '../lib/full-book.mjs';
 
-const TEST_BASE = path.join('data', 'test_raw_hot');
+const TEST_BASE = path.join('data', `test_raw_hot_${process.pid}`);
 
 class MockConnector {
   constructor() {

@@ -19,7 +19,10 @@ describe('HyperliquidConnector sync', () => {
     const errors = [];
     conn.on('error', (ev) => errors.push(ev));
 
-    await conn._syncBook();
+    await assert.rejects(
+      () => conn._syncBook(),
+      /l2Book not received/
+    );
 
     assert.strictEqual(conn.getState(), 'error');
     assert.ok(errors.some((ev) => String(ev.message).includes('l2Book not received')));
