@@ -295,6 +295,100 @@ class BookReplay:
         result["ask_prices"], result["ask_qtys"] = _bin(self._asks, ascending=True)
         return result
 
+    def compute_book_features(self, ts: int) -> dict:
+        """
+        Compute book features B1-B9 at a specific timestamp.
+
+        Returns dict with keys:
+        - book_mid_price, book_spread_bps
+        - book_bid_depth_100, book_ask_depth_100
+        - book_bid_depth_1000, book_ask_depth_1000
+        - book_imbalance_100, book_imbalance_1000
+        - book_microprice
+
+        All values are None if book is unseeded or crossed.
+        """
+        null_features = {
+            "book_mid_price": None,
+            "book_spread_bps": None,
+            "book_bid_depth_100": None,
+            "book_ask_depth_100": None,
+            "book_bid_depth_1000": None,
+            "book_ask_depth_1000": None,
+            "book_imbalance_100": None,
+            "book_imbalance_1000": None,
+            "book_microprice": None,
+        }
+
+        snap = self.snapshot_at(ts)
+        if not snap.seeded:
+            return null_features
+
+        mid = snap.mid_price
+        bid_price = snap.best_bid_price
+        ask_price = snap.best_ask_price
+
+        # B1: mid_price
+        book_mid_price = mid
+
+        # B2: spread_bps
+        if mid > 0:
+            book_spread_bps = (ask_price - bid_price) / mid * 10000
+        else:
+            return null_features
+
+        # B3-B6: depth at windows (1-pass over bids/asks)
+        bid_depth_100 = 0.0
+        bid_depth_1000 = 0.0
+        for price, qty in self._bids.items():
+            if price <= 0 or qty <= 0:
+                continue
+            notional = price * qty
+            if mid - 100 <= price <= mid:
+                bid_depth_100 += notional
+            if mid - 1000 <= price <= mid:
+                bid_depth_1000 += notional
+
+        ask_depth_100 = 0.0
+        ask_depth_1000 = 0.0
+        for price, qty in self._asks.items():
+            if price <= 0 or qty <= 0:
+                continue
+            notional = price * qty
+            if mid <= price <= mid + 100:
+                ask_depth_100 += notional
+            if mid <= price <= mid + 1000:
+                ask_depth_1000 += notional
+
+        # B7: imbalance_100
+        denom_100 = bid_depth_100 + ask_depth_100
+        book_imbalance_100 = (bid_depth_100 - ask_depth_100) / denom_100 if denom_100 > 0 else 0.0
+
+        # B8: imbalance_1000
+        denom_1000 = bid_depth_1000 + ask_depth_1000
+        book_imbalance_1000 = (bid_depth_1000 - ask_depth_1000) / denom_1000 if denom_1000 > 0 else 0.0
+
+        # B9: microprice (uses best level qty)
+        bid_qty = snap.best_bid_qty
+        ask_qty = snap.best_ask_qty
+        denom_micro = bid_qty + ask_qty
+        if denom_micro > 0:
+            book_microprice = (ask_price * bid_qty + bid_price * ask_qty) / denom_micro
+        else:
+            book_microprice = None
+
+        return {
+            "book_mid_price": book_mid_price,
+            "book_spread_bps": book_spread_bps,
+            "book_bid_depth_100": bid_depth_100,
+            "book_ask_depth_100": ask_depth_100,
+            "book_bid_depth_1000": bid_depth_1000,
+            "book_ask_depth_1000": ask_depth_1000,
+            "book_imbalance_100": book_imbalance_100,
+            "book_imbalance_1000": book_imbalance_1000,
+            "book_microprice": book_microprice,
+        }
+
 
 def read_book_updates(file_path: str) -> List[dict]:
     """Read book_updates from a 30s block JSONL file (one JSON object per line)."""

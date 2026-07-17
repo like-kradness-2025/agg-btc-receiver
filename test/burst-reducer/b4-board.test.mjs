@@ -22,13 +22,15 @@ describe('B4: Schema contract — board fields', () => {
     }
   });
 
-  it('board fields are in FEATURE_1S_FIELDS after #22', () => {
+  it('board fields are in FEATURE_1S_FIELDS after #22 and book features', () => {
     const idx = FEATURE_1S_FIELDS.indexOf('outlier_trade_flag_1s');
     assert.ok(idx >= 0);
-    assert.equal(FEATURE_1S_FIELDS[idx + 1], 'board_top_depth_ratio');
-    assert.equal(FEATURE_1S_FIELDS[idx + 2], 'board_mid_move_bps_1s');
-    assert.equal(FEATURE_1S_FIELDS[idx + 3], 'board_vs_30s');
-    assert.equal(FEATURE_1S_FIELDS[idx + 4], 'board_vs_depth');
+    // After #22 come book features B1-B9 (9 fields), then board fields
+    const boardStart = idx + 1 + 9; // skip #22 + 9 book features
+    assert.equal(FEATURE_1S_FIELDS[boardStart], 'board_top_depth_ratio');
+    assert.equal(FEATURE_1S_FIELDS[boardStart + 1], 'board_mid_move_bps_1s');
+    assert.equal(FEATURE_1S_FIELDS[boardStart + 2], 'board_vs_30s');
+    assert.equal(FEATURE_1S_FIELDS[boardStart + 3], 'board_vs_depth');
   });
 
   it('createBaseRow initializes board fields to null', () => {

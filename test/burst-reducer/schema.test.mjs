@@ -27,22 +27,22 @@ describe('Schema / contract', () => {
     assert.equal(MAX_BURST_DURATION_MS, 5000);
   });
 
-  it('FEATURE_1S_FIELDS has exactly 26 logical feature columns (#1-#22 + B4 board_* fields)', () => {
-    assert.equal(FEATURE_1S_FIELDS.length, 26);
+  it('FEATURE_1S_FIELDS has exactly 35 logical feature columns (#1-#22 + B1-B9 book + B4 board_* fields)', () => {
+    assert.equal(FEATURE_1S_FIELDS.length, 35);
   });
 
   it('ROW_ENVELOPE_FIELDS are ts, market, _quality', () => {
     assert.deepEqual(ROW_ENVELOPE_FIELDS, ['ts', 'market', '_quality']);
   });
 
-  it('createBaseRow produces 29 physical JSON top-level keys', () => {
+  it('createBaseRow produces 38 physical JSON top-level keys', () => {
     const row = createBaseRow(1000, 'test', {
       book_seeded: false,
       trade_count_this_second: 0,
       warmup: true,
       input_block_ids: [],
     });
-    assert.equal(Object.keys(row).length, 29);
+    assert.equal(Object.keys(row).length, 38);
   });
 
   it('createBaseRow has correct P1 contract values', () => {

@@ -81,6 +81,16 @@ FEATURE_1S_SCHEMA = pa.schema([
 
     # ── Monitoring #22 ──
     pa.field("outlier_trade_flag_1s", pa.int32(), nullable=False),
+    # ── Book features B1-B9 (nullable: null when book unseeded/crossed) ──
+    pa.field("book_mid_price", pa.float64(), nullable=True),
+    pa.field("book_spread_bps", pa.float64(), nullable=True),
+    pa.field("book_bid_depth_100", pa.float64(), nullable=True),
+    pa.field("book_ask_depth_100", pa.float64(), nullable=True),
+    pa.field("book_bid_depth_1000", pa.float64(), nullable=True),
+    pa.field("book_ask_depth_1000", pa.float64(), nullable=True),
+    pa.field("book_imbalance_100", pa.float64(), nullable=True),
+    pa.field("book_imbalance_1000", pa.float64(), nullable=True),
+    pa.field("book_microprice", pa.float64(), nullable=True),
 ])
 
 

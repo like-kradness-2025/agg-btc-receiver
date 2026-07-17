@@ -863,3 +863,149 @@ class TestCrossedBookRecovery:
         assert not snap["seeded"]
         assert snap["bid_prices"] == []
         assert snap["ask_prices"] == []
+
+
+class TestNoPartitionScan:
+    """partition全体走査が発生しないことを検証。"""
+
+    def test_read_existing_ts_not_called(self, tmp_path, monkeypatch):
+        """_read_existing_tsが呼ばれないことを確認（partition走査ゼロ）。"""
+        from lib.downstream import book_snapshot_writer
+        from lib.downstream.book_snapshot_writer import write_book_snapshots
+
+        monkeypatch.setattr("lib.downstream.book_snapshot_writer.DERIVED_DIR", str(tmp_path))
+
+        # _read_existing_tsが存在しないことを確認（削除済み）
+        assert not hasattr(book_snapshot_writer, "_read_existing_ts")
+
+        # 大量データを書いてもpq.read_*が呼ばれない
+        read_count = {"n": 0}
+        original_read = pq.read_table
+
+        def counting_read(*args, **kwargs):
+            read_count["n"] += 1
+            return original_read(*args, **kwargs)
+
+        monkeypatch.setattr(pq, "read_table", counting_read)
+
+        # 10バッチ、各100行
+        ts_base = 1784204160000
+        for batch_idx in range(10):
+            batch = [
+                {"ts": ts_base + batch_idx * 100000 + i, "seeded": True,
+                 "bid_prices": [100.0], "bid_qtys": [1.0],
+                 "ask_prices": [101.0], "ask_qtys": [2.0]}
+                for i in range(100)
+            ]
+            write_book_snapshots(batch, "test_mkt")
+
+        # 書き込み時のreadは0回（存在チェックはfile statのみ）
+        assert read_count["n"] == 0, f"pq.read_table が {read_count['n']} 回呼ばれた（期待: 0）"
+
+    def test_batch_deterministic_filename(self, tmp_path, monkeypatch):
+        """同じbatchは同じファイル名を生成する（retryで重複しない）。"""
+        from lib.downstream.book_snapshot_writer import write_book_snapshots
+
+        monkeypatch.setattr("lib.downstream.book_snapshot_writer.DERIVED_DIR", str(tmp_path))
+
+        ts0 = 1784204160000
+        batch = [
+            {"ts": ts0 + i, "seeded": True,
+             "bid_prices": [100.0], "bid_qtys": [1.0],
+             "ask_prices": [101.0], "ask_qtys": [2.0]}
+            for i in range(5)
+        ]
+
+        # 1回目
+        n1 = write_book_snapshots(batch, "mkt1")
+        files1 = list((tmp_path / "book_snapshots").rglob("*.parquet"))
+        assert len(files1) == 1
+
+        # 2回目（同じbatch）
+        n2 = write_book_snapshots(batch, "mkt1")
+        files2 = list((tmp_path / "book_snapshots").rglob("*.parquet"))
+        assert len(files2) == 1, "同じbatchは同じファイルに上書きされない"
+        assert files1[0].name == files2[0].name, "ファイル名が同一"
+
+        # 3回目（異なるbatch）
+        batch2 = [{"ts": ts0 + 1000 + i, "seeded": True,
+                   "bid_prices": [100.0], "bid_qtys": [1.0],
+                   "ask_prices": [101.0], "ask_qtys": [2.0]}
+                  for i in range(5)]
+        n3 = write_book_snapshots(batch2, "mkt1")
+        files3 = list((tmp_path / "book_snapshots").rglob("*.parquet"))
+        assert len(files3) == 2, "異なるbatchは別ファイル"
+        assert n1 == 5 and n2 == 0 and n3 == 5
+
+    def test_memory_scales_with_batch_not_partition(self, tmp_path, monkeypatch):
+        """メモリ使用量がpartitionサイズでなくbatchサイズに比例することを確認。"""
+        from lib.downstream.book_snapshot_writer import write_book_snapshots
+
+        monkeypatch.setattr("lib.downstream.book_snapshot_writer.DERIVED_DIR", str(tmp_path))
+
+        # 事前に1000行のpartitionを作成
+        ts_base = 1784204160000
+        for i in range(10):
+            batch = [
+                {"ts": ts_base + i * 1000 + j, "seeded": True,
+                 "bid_prices": [100.0], "bid_qtys": [1.0],
+                 "ask_prices": [101.0], "ask_qtys": [2.0]}
+                for j in range(100)
+            ]
+            write_book_snapshots(batch, "mkt")
+
+        # 1行だけのbatchを書き込む
+        small_batch = [{"ts": ts_base + 100000, "seeded": True,
+                        "bid_prices": [100.0], "bid_qtys": [1.0],
+                        "ask_prices": [101.0], "ask_qtys": [2.0]}]
+
+        read_count = {"n": 0}
+        original_read = pq.read_table
+
+        def counting_read(*args, **kwargs):
+            read_count["n"] += 1
+            return original_read(*args, **kwargs)
+
+        monkeypatch.setattr(pq, "read_table", counting_read)
+
+        write_book_snapshots(small_batch, "mkt")
+
+        # 1000行のpartitionがあっても、1行batchの書き込みでreadは0回
+        assert read_count["n"] == 0, "partition走査が発生した"
+
+    def test_multiple_markets_isolated(self, tmp_path, monkeypatch):
+        """複数marketが独立して管理されることを確認。"""
+        from lib.downstream.book_snapshot_writer import write_book_snapshots
+
+        monkeypatch.setattr("lib.downstream.book_snapshot_writer.DERIVED_DIR", str(tmp_path))
+
+        ts0 = 1784204160000
+        batch_m1 = [
+            {"ts": ts0 + i, "seeded": True,
+             "bid_prices": [100.0], "bid_qtys": [1.0],
+             "ask_prices": [101.0], "ask_qtys": [2.0]}
+            for i in range(3)
+        ]
+        batch_m2 = [
+            {"ts": ts0 + i, "seeded": True,
+             "bid_prices": [200.0], "bid_qtys": [1.0],
+             "ask_prices": [201.0], "ask_qtys": [2.0]}
+            for i in range(3)
+        ]
+
+        n1 = write_book_snapshots(batch_m1, "market1")
+        n2 = write_book_snapshots(batch_m2, "market2")
+
+        assert n1 == 3 and n2 == 3
+
+        # 各marketのファイル数
+        files_m1 = list((tmp_path / "book_snapshots" / "market=market1").rglob("*.parquet"))
+        files_m2 = list((tmp_path / "book_snapshots" / "market=market2").rglob("*.parquet"))
+        assert len(files_m1) == 1 and len(files_m2) == 1
+
+        # データが独立していることを確認
+        import pyarrow.parquet as pq
+        t1 = pq.read_table(str(files_m1[0]))
+        t2 = pq.read_table(str(files_m2[0]))
+        assert t1["bid_prices"][0].as_py() == [100.0]
+        assert t2["bid_prices"][0].as_py() == [200.0]

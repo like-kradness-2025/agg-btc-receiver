@@ -96,6 +96,22 @@ def compute_1s_features(
             vs_top_depth = None
             mid_move_bps = 0.0
 
+        # ── Book features B1-B9 ──
+        if book_replay is not None:
+            book_features = book_replay.compute_book_features(second_ts)
+        else:
+            book_features = {
+                "book_mid_price": None,
+                "book_spread_bps": None,
+                "book_bid_depth_100": None,
+                "book_ask_depth_100": None,
+                "book_bid_depth_1000": None,
+                "book_ask_depth_1000": None,
+                "book_imbalance_100": None,
+                "book_imbalance_1000": None,
+                "book_microprice": None,
+            }
+
         # ── Research features #15-#21 ──
         same_price_max_len = max(
             (b.same_price_runs for b in overlapping if b.distinct_price_count == 1),
@@ -148,6 +164,16 @@ def compute_1s_features(
             "same_price_absorption_ratio_1s": round(absorption_ratio, 6),
             "burst_delta_notional_1s": round(delta_notional, 2),
             "outlier_trade_flag_1s": outlier_flag,
+            # Book features B1-B9
+            "book_mid_price": round(book_features["book_mid_price"], 4) if book_features["book_mid_price"] is not None else None,
+            "book_spread_bps": round(book_features["book_spread_bps"], 4) if book_features["book_spread_bps"] is not None else None,
+            "book_bid_depth_100": round(book_features["book_bid_depth_100"], 2) if book_features["book_bid_depth_100"] is not None else None,
+            "book_ask_depth_100": round(book_features["book_ask_depth_100"], 2) if book_features["book_ask_depth_100"] is not None else None,
+            "book_bid_depth_1000": round(book_features["book_bid_depth_1000"], 2) if book_features["book_bid_depth_1000"] is not None else None,
+            "book_ask_depth_1000": round(book_features["book_ask_depth_1000"], 2) if book_features["book_ask_depth_1000"] is not None else None,
+            "book_imbalance_100": round(book_features["book_imbalance_100"], 6) if book_features["book_imbalance_100"] is not None else None,
+            "book_imbalance_1000": round(book_features["book_imbalance_1000"], 6) if book_features["book_imbalance_1000"] is not None else None,
+            "book_microprice": round(book_features["book_microprice"], 4) if book_features["book_microprice"] is not None else None,
         }
         rows.append(row)
 
