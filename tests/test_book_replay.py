@@ -357,10 +357,20 @@ class TestRealDataReplay:
         root = Path("data/live_v3")
         if not root.exists():
             pytest.skip("No live data available")
-        trade_dir = root / "trades" / "bitfinex_spot" / "2026-07-16"
-        book_dir = root / "book_updates" / "bitfinex_spot" / "2026-07-16"
-        if not trade_dir.exists() or not book_dir.exists():
+        trade_dir_base = root / "trades" / "bitfinex_spot"
+        book_dir_base = root / "book_updates" / "bitfinex_spot"
+        if not trade_dir_base.exists() or not book_dir_base.exists():
             pytest.skip("bitfinex_spot data not present")
+
+        # Find latest date directory dynamically
+        date_dirs = sorted([d for d in book_dir_base.iterdir() if d.is_dir()])
+        if not date_dirs:
+            pytest.skip("No date directories found")
+        latest_date = date_dirs[-1].name
+        trade_dir = trade_dir_base / latest_date
+        book_dir = book_dir_base / latest_date
+        if not trade_dir.exists() or not book_dir.exists():
+            pytest.skip(f"bitfinex_spot data not present for {latest_date}")
 
         files = sorted(book_dir.glob("*.jsonl"))
         if not files:
