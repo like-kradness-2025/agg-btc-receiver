@@ -38,6 +38,7 @@ from lib.downstream.config import (
 from lib.downstream.burst_detector import detect_bursts
 from lib.downstream.book_replay import BookReplay, read_book_updates
 from lib.downstream.feature_compiler import compute_1s_features
+from lib.downstream.incremental_features import IncrementalFeatureComputer
 from lib.downstream.parquet_writer import (
     load_cursor, save_cursor, get_last_processed, set_last_processed,
     write_features_1s,
@@ -59,6 +60,18 @@ log = logging.getLogger("downstream")
 # The receiver emits incremental diffs, so the state must be continuous.
 _BOOK_STATES: Dict[str, BookReplay] = {}
 
+# Keep one incremental feature computer per market across 30s blocks.
+# Required for RV rolling window (price_series) to accumulate beyond a single
+# 30s block. RV_60s needs 60s of history; RV_10s needs 10s.
+_FEATURE_COMPUTERS: Dict[str, IncrementalFeatureComputer] = {}
+
+
+def _get_feature_computer(market: str, tick_size: float) -> IncrementalFeatureComputer:
+    """Return the persistent per-market IncrementalFeatureComputer."""
+    if market not in _FEATURE_COMPUTERS:
+        _FEATURE_COMPUTERS[market] = IncrementalFeatureComputer(market, tick_size)
+    return _FEATURE_COMPUTERS[market]
+
 
 def _get_book_state(market: str, create: bool = True) -> Optional[BookReplay]:
     """Return the persistent per-market BookReplay, creating if requested."""
@@ -77,8 +90,9 @@ def process_block(
     seed_rest: bool = True,
 ) -> int:
     """
-    Process a single 30s block: read trades → detect bursts → compute features → write Parquet.
-
+    Process a single 30s block: read trades → compute features → write Parquet.
+    
+    Uses IncrementalFeatureComputer for per-second feature accumulation.
     Also captures $1-binned full book snapshots when book_updates available.
 
     Args:
@@ -93,7 +107,7 @@ def process_block(
             result per market, so REST is effectively only fetched once.
 
     Returns:
-        Number of feature rows written (30 on success, 0 on empty/skip).
+        Number of feature rows written (up to 30 on success, 0 on empty/skip).
     """
     trades = read_trades_from_block(file_path)
     if not trades:
@@ -103,17 +117,8 @@ def process_block(
     # Sort by ts just in case
     trades.sort(key=lambda t: int(t.get("ts", 0)))
 
-    # Combine with lookback trades for rolling 30s traded notional
-    all_trades = list(trades)
-    if lookback_trades:
-        cutoff = block_start_ms - BLOCK_DURATION_MS
-        filtered_lookback = [t for t in lookback_trades if int(t.get("ts", 0)) >= cutoff]
-        all_trades = filtered_lookback + all_trades
-
-    # Burst detection
-    bursts = detect_bursts(trades, tick_size)
-    log.info("  [%s] %s — %d trades, %d bursts",
-             market, Path(file_path).name, len(trades), len(bursts))
+    log.info("  [%s] %s — %d trades",
+             market, Path(file_path).name, len(trades))
 
     # Book replay (optional)
     book_replay = None
@@ -128,8 +133,12 @@ def process_block(
             # Apply WS updates first (chronological order)
             br.apply_updates(updates)
 
-            # Then upsert REST snapshot to fill static levels not covered by WS diffs
-            if seed_rest:
+            # Then upsert REST snapshot to fill static levels not covered by WS diffs.
+            # IMPORTANT: Only apply REST if book is not yet seeded.
+            # If WS has already built a valid (non-crossed) state, REST snapshot
+            # may contain stale price levels that would cause best_bid > best_ask
+            # (crossed state), breaking the book.
+            if seed_rest and not br._seeded:
                 from lib.downstream.rest_book import fetch_rest_book
                 rest_bids, rest_asks = fetch_rest_book(market) or ({}, {})
                 if rest_bids or rest_asks:
@@ -162,15 +171,32 @@ def process_block(
                      len(book_snapshots[0].get("ask_prices", [])) if book_snapshots else 0,
                      ", seeded" if mid_snap.seeded else ", NOT seeded")
 
-    # Compute features (with book if available)
-    rows = compute_1s_features(
-        block_start_ms=block_start_ms,
-        market=market,
-        all_bursts=bursts,
-        all_trades=all_trades,
-        book_replay=book_replay,
-    )
+    # Compute features incrementally per-second
+    computer = _get_feature_computer(market, tick_size)
+    computer.book_replay = book_replay  # may be None if no book_updates
+    rows = []
+    
+    for trade in trades:
+        row = computer.process_trade(trade)
+        if row is not None:
+            # Second boundary crossed, emit row
+            rows.append(row)
+    
+    # Flush final second + backfill empty seconds to maintain 30-row grid
+    block_end_ms = block_start_ms + BLOCK_DURATION_MS
+    remaining_rows = computer.flush_block(block_start_ms, block_end_ms)
+    rows.extend(remaining_rows)
+    
+    # Deduplicate by ts (keep first occurrence)
+    seen_ts = set()
+    deduped_rows = []
+    for row in rows:
+        if row["ts"] not in seen_ts:
+            deduped_rows.append(row)
+            seen_ts.add(row["ts"])
+    rows = deduped_rows
 
+    # Write features
     n = write_features_1s(rows, market)
 
     # Write book snapshots
@@ -178,6 +204,11 @@ def process_block(
         from lib.downstream.book_snapshot_writer import write_book_snapshots
         ns = write_book_snapshots(book_snapshots, market)
         log.debug("  [%s] wrote %d book snapshots", market, ns)
+
+    # Prune P1 change events to prevent unbounded memory growth
+    if book_replay is not None:
+        # Keep only events within the last 120s (2min) window
+        book_replay.clear_p1_change_events_before(block_end_ms - 120_000)
 
     return n
 

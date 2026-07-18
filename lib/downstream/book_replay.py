@@ -65,6 +65,13 @@ class BookReplay:
         self._seeded: bool = False
         self._best_bid: Tuple[float, float] = (0.0, 0.0)
         self._best_ask: Tuple[float, float] = (0.0, 0.0)
+        
+        # P1: change event log (book_updates → IncrementalFeatureComputer)
+        # Each entry: (ts_ms, change_event_dict)
+        # change_event_dict contains raw change amounts for that update
+        # IncrementalFeatureComputer aggregates by second boundary
+        # Pruned via clear_p1_change_events_before() to avoid memory buildup
+        self._p1_change_events: List[Tuple[int, Dict]] = []
 
     def reset(self):
         """Reset book state (for new block)."""
@@ -74,6 +81,7 @@ class BookReplay:
         self._seeded = False
         self._best_bid = (0.0, 0.0)
         self._best_ask = (0.0, 0.0)
+        self._p1_change_events.clear()
 
     def _fair_price(self) -> Optional[float]:
         """Return current fair/mid price, or None if not seeded."""
@@ -106,30 +114,140 @@ class BookReplay:
         bids_raw = obj.get("bids", [])
         asks_raw = obj.get("asks", [])
 
+        # P1: Capture best bid/ask BEFORE update for OFI and replenishment/pulling
+        old_best_bid_price = self._best_bid[0]
+        old_best_bid_qty = self._best_bid[1]
+        old_best_ask_price = self._best_ask[0]
+        old_best_ask_qty = self._best_ask[1]
+
+        # P1: Calculate add/cancel quantities for this update
+        bid_add_qty = 0.0
+        bid_cancel_qty = 0.0
+        ask_add_qty = 0.0
+        ask_cancel_qty = 0.0
+
         for price_str, qty_str in bids_raw:
             price = float(price_str)
             try:
-                qty = float(qty_str)
+                new_qty = float(qty_str)
             except (ValueError, TypeError):
-                qty = 0.0
-            if qty <= 0:
+                new_qty = 0.0
+            
+            old_qty = self._bids.get(price, 0.0)
+            
+            if new_qty <= 0:
+                # Cancel or delete
+                bid_cancel_qty += old_qty
                 self._bids.pop(price, None)
             else:
-                self._bids[price] = qty
+                # Add or update
+                delta = new_qty - old_qty
+                if delta > 0:
+                    bid_add_qty += delta
+                elif delta < 0:
+                    bid_cancel_qty += abs(delta)
+                self._bids[price] = new_qty
 
         for price_str, qty_str in asks_raw:
             price = float(price_str)
             try:
-                qty = float(qty_str)
+                new_qty = float(qty_str)
             except (ValueError, TypeError):
-                qty = 0.0
-            if qty <= 0:
+                new_qty = 0.0
+            
+            old_qty = self._asks.get(price, 0.0)
+            
+            if new_qty <= 0:
+                # Cancel or delete
+                ask_cancel_qty += old_qty
                 self._asks.pop(price, None)
             else:
-                self._asks[price] = qty
+                # Add or update
+                delta = new_qty - old_qty
+                if delta > 0:
+                    ask_add_qty += delta
+                elif delta < 0:
+                    ask_cancel_qty += abs(delta)
+                self._asks[price] = new_qty
 
         # Recompute best bid/ask
         self._recompute_best()
+
+        # P1: Record change event for IncrementalFeatureComputer
+        # BookReplay responsibility: record raw change amounts only
+        # IncrementalFeatureComputer responsibility: aggregate by second boundary
+        if ts > 0 and self._seeded:
+            # OFI: Order Flow Imbalance (Cont-style)
+            # Bid side: +ΔQ if price didn't drop
+            new_best_bid_price = self._best_bid[0]
+            new_best_bid_qty = self._best_bid[1]
+            new_best_ask_price = self._best_ask[0]
+            new_best_ask_qty = self._best_ask[1]
+            
+            ofi = 0.0
+            if new_best_bid_price > 0 and new_best_bid_price >= old_best_bid_price:
+                ofi += (new_best_bid_qty - old_best_bid_qty)
+            # Ask side: -ΔQ if price didn't rise
+            if new_best_ask_price > 0 and new_best_ask_price <= old_best_ask_price:
+                ofi -= (new_best_ask_qty - old_best_ask_qty)
+
+            # Replenishment/Pulling (based on best level quantity changes)
+            replenishment = 0.0
+            pulling = 0.0
+            best_bid_qty_delta = new_best_bid_qty - old_best_bid_qty
+            if best_bid_qty_delta > 0:
+                replenishment += best_bid_qty_delta
+            elif best_bid_qty_delta < 0:
+                pulling += abs(best_bid_qty_delta)
+
+            best_ask_qty_delta = new_best_ask_qty - old_best_ask_qty
+            if best_ask_qty_delta > 0:
+                replenishment += best_ask_qty_delta
+            elif best_ask_qty_delta < 0:
+                pulling += abs(best_ask_qty_delta)
+
+            # Record change event (raw amounts, not aggregated)
+            change_event = {
+                "ofi": ofi,
+                "bid_add_qty": bid_add_qty,
+                "bid_cancel_qty": bid_cancel_qty,
+                "ask_add_qty": ask_add_qty,
+                "ask_cancel_qty": ask_cancel_qty,
+                "replenishment": replenishment,
+                "pulling": pulling,
+            }
+            self._p1_change_events.append((ts, change_event))
+
+    def get_p1_change_events_in_window(self, second_ts: int) -> List[Dict]:
+        """Return change events for a given second.
+        
+        Args:
+            second_ts: Second boundary (epoch ms, 1s aligned)
+        
+        Returns:
+            List of change event dicts for events in [second_ts, second_ts + 1000)
+        """
+        window_start = second_ts
+        window_end = second_ts + 1000
+        
+        return [
+            event for ts, event in self._p1_change_events
+            if window_start <= ts < window_end
+        ]
+
+    def clear_p1_change_events_before(self, cutoff_ts: int):
+        """Clear change events before cutoff_ts to avoid memory buildup."""
+        # Find first index >= cutoff_ts using binary search
+        lo, hi = 0, len(self._p1_change_events)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._p1_change_events[mid][0] < cutoff_ts:
+                lo = mid + 1
+            else:
+                hi = mid
+        # Keep only events >= cutoff_ts
+        if lo > 0:
+            self._p1_change_events = self._p1_change_events[lo:]
 
     def _recompute_best(self):
         """Recompute best bid/ask from currently stored levels only.
@@ -320,15 +438,20 @@ class BookReplay:
             "book_microprice": None,
         }
 
-        snap = self.snapshot_at(ts)
-        if not snap.seeded:
+        if not self._seeded:
             return null_features
 
-        mid = snap.mid_price
-        bid_price = snap.best_bid_price
-        ask_price = snap.best_ask_price
+        # Compute best bid/ask directly from stored levels
+        if not self._bids or not self._asks:
+            return null_features
 
-        # B1: mid_price
+        bid_price = max(self._bids.keys())
+        ask_price = min(self._asks.keys())
+
+        if bid_price <= 0 or ask_price <= 0 or bid_price >= ask_price:
+            return null_features
+
+        mid = (bid_price + ask_price) / 2.0
         book_mid_price = mid
 
         # B2: spread_bps
@@ -360,22 +483,32 @@ class BookReplay:
             if mid <= price <= mid + 1000:
                 ask_depth_1000 += notional
 
-        # B7: imbalance_100
-        denom_100 = bid_depth_100 + ask_depth_100
-        book_imbalance_100 = (bid_depth_100 - ask_depth_100) / denom_100 if denom_100 > 0 else 0.0
-
-        # B8: imbalance_1000
-        denom_1000 = bid_depth_1000 + ask_depth_1000
-        book_imbalance_1000 = (bid_depth_1000 - ask_depth_1000) / denom_1000 if denom_1000 > 0 else 0.0
-
-        # B9: microprice (uses best level qty)
-        bid_qty = snap.best_bid_qty
-        ask_qty = snap.best_ask_qty
-        denom_micro = bid_qty + ask_qty
-        if denom_micro > 0:
-            book_microprice = (ask_price * bid_qty + bid_price * ask_qty) / denom_micro
+        # B7-B8: imbalance
+        total_bid = bid_depth_1000
+        total_ask = ask_depth_1000
+        total = total_bid + total_ask
+        if total > 0:
+            imbalance_1000 = (total_bid - total_ask) / total
         else:
-            book_microprice = None
+            imbalance_1000 = None
+
+        total_bid_100 = bid_depth_100
+        total_ask_100 = ask_depth_100
+        total_100 = total_bid_100 + total_ask_100
+        if total_100 > 0:
+            imbalance_100 = (total_bid_100 - total_ask_100) / total_100
+        else:
+            imbalance_100 = None
+
+        # B9: microprice (weighted average of bid/ask prices by qty)
+        # microprice = (ask_price * bid_qty + bid_price * ask_qty) / (bid_qty + ask_qty)
+        bid_qty = self._bids.get(bid_price, 0.0)
+        ask_qty = self._asks.get(ask_price, 0.0)
+        total_qty = bid_qty + ask_qty
+        if total_qty > 0:
+            microprice = (ask_price * bid_qty + bid_price * ask_qty) / total_qty
+        else:
+            microprice = None
 
         return {
             "book_mid_price": book_mid_price,
@@ -384,9 +517,9 @@ class BookReplay:
             "book_ask_depth_100": ask_depth_100,
             "book_bid_depth_1000": bid_depth_1000,
             "book_ask_depth_1000": ask_depth_1000,
-            "book_imbalance_100": book_imbalance_100,
-            "book_imbalance_1000": book_imbalance_1000,
-            "book_microprice": book_microprice,
+            "book_imbalance_100": imbalance_100,
+            "book_imbalance_1000": imbalance_1000,
+            "book_microprice": microprice,
         }
 
 

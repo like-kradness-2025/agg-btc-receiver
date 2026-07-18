@@ -7,6 +7,7 @@ all 22 feature columns. P1 contract: #1-#12 computed, #13=null, #14=0, #15-#22=0
 When book_replay is provided, #13 and #14 are computed from live book state.
 """
 
+import math
 from typing import List, Dict, Optional, TYPE_CHECKING
 
 from .config import BLOCK_DURATION_MS, SECOND_MS
@@ -26,6 +27,45 @@ def _traded_notional_in_window(trades: List[dict], window_start: int, window_end
             qty = float(t.get("qty", 0))
             total += price * qty
     return total
+
+
+def _compute_realized_vol(trades: List[dict], at_ts: int, window_ms: int) -> Optional[float]:
+    """Compute realized volatility as std of log-returns over rolling window.
+
+    Returns None if insufficient data (<2 returns, i.e., <3 trades).
+    This prevents computing volatility during warmup periods.
+    """
+    window_start = at_ts - window_ms
+    window_trades = [t for t in trades if window_start <= int(t.get("ts", 0)) < at_ts]
+
+    # Sort by timestamp
+    window_trades.sort(key=lambda t: int(t.get("ts", 0)))
+
+    # Extract price series
+    prices = []
+    for t in window_trades:
+        p = float(t.get("price", 0))
+        if p > 0:
+            prices.append(p)
+
+    # Need at least 3 prices for 2 log-returns
+    if len(prices) < 3:
+        return None
+
+    # Compute log-returns
+    log_returns = []
+    for i in range(1, len(prices)):
+        if prices[i - 1] > 0 and prices[i] > 0:
+            log_ret = math.log(prices[i] / prices[i - 1])
+            log_returns.append(log_ret)
+
+    if len(log_returns) < 2:
+        return None
+
+    # Compute standard deviation
+    mean = sum(log_returns) / len(log_returns)
+    variance = sum((r - mean) ** 2 for r in log_returns) / len(log_returns)
+    return math.sqrt(variance)
 
 
 def compute_1s_features(
@@ -112,6 +152,26 @@ def compute_1s_features(
                 "book_microprice": None,
             }
 
+        # ── OrderFlow P0 features ──
+        # Count trades in this 1s bucket [second_ts, second_ts+1000)
+        bucket_trades = [t for t in all_trades if second_ts <= int(t.get("ts", 0)) < second_ts + 1000]
+        trade_count = len(bucket_trades)
+        traded_notional = sum(float(t.get("price", 0)) * float(t.get("qty", 0)) for t in bucket_trades)
+
+        # Signed volume: buy_qty - sell_qty
+        buy_qty = sum(float(t.get("qty", 0)) for t in bucket_trades if t.get("side") == "buy")
+        sell_qty = sum(float(t.get("qty", 0)) for t in bucket_trades if t.get("side") == "sell")
+        signed_volume = buy_qty - sell_qty
+
+        # Trade imbalance: (buy-sell)/(buy+sell), 0 when no trades
+        total_qty = buy_qty + sell_qty
+        trade_imbalance_qty = (buy_qty - sell_qty) / total_qty if total_qty > 0 else 0.0
+
+        # Realized volatility: std of log-returns over rolling windows
+        # Need price series from trades in the window
+        realized_vol_10s = _compute_realized_vol(all_trades, second_ts, window_ms=10000)
+        realized_vol_60s = _compute_realized_vol(all_trades, second_ts, window_ms=60000)
+
         # ── Research features #15-#21 ──
         same_price_max_len = max(
             (b.same_price_runs for b in overlapping if b.distinct_price_count == 1),
@@ -137,7 +197,15 @@ def compute_1s_features(
                 if span_bps > multilevel_max_span_bps:
                     multilevel_max_span_bps = span_bps
 
-        outlier_flag = 0
+        # UNIMPLEMENTED: burst_mid_move_bps_1s is fixed at 0.0 (not yet computed).
+        # This is NOT a valid mid-move value — it's a placeholder indicating
+        # the feature has not been implemented yet.
+        mid_move_bps = 0.0  # UNIMPLEMENTED
+
+        # UNIMPLEMENTED: outlier_trade_flag_1s is fixed at 0 (never flags).
+        # This is NOT a valid outlier detection — it's a placeholder indicating
+        # the feature has not been implemented yet.
+        outlier_flag = 0  # UNIMPLEMENTED
 
         row = {
             "ts": second_ts,
@@ -174,6 +242,13 @@ def compute_1s_features(
             "book_imbalance_100": round(book_features["book_imbalance_100"], 6) if book_features["book_imbalance_100"] is not None else None,
             "book_imbalance_1000": round(book_features["book_imbalance_1000"], 6) if book_features["book_imbalance_1000"] is not None else None,
             "book_microprice": round(book_features["book_microprice"], 4) if book_features["book_microprice"] is not None else None,
+            # OrderFlow P0
+            "trade_count_1s": trade_count,
+            "traded_notional_1s": round(traded_notional, 2),
+            "signed_volume_1s": round(signed_volume, 8),
+            "trade_imbalance_qty_1s": round(trade_imbalance_qty, 6),
+            "realized_vol_10s": round(realized_vol_10s, 10) if realized_vol_10s is not None else None,
+            "realized_vol_60s": round(realized_vol_60s, 10) if realized_vol_60s is not None else None,
         }
         rows.append(row)
 

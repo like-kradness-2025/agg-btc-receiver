@@ -21,3 +21,18 @@ docs/*cvd*
 docs/burst_cvd_*
 docs/size-dominance-*
 docs/size_distribution_*
+
+# Diagnostic / one-off scripts
+_*.py
+scripts/_*.py
+verify_*.py
+*_report*.md
+*_report*.py
+
+# Backups
+*.bak
+
+# Environment
+.venv/
+__pycache__/
+*.pyc

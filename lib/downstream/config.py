@@ -68,7 +68,7 @@ FEATURE_1S_SCHEMA = pa.schema([
 
     # ── Book-dependent #13-#14 (P1: nullable=null / 0) ──
     pa.field("burst_notional_vs_top_depth", pa.float64(), nullable=True),
-    pa.field("burst_mid_move_bps_1s", pa.float64(), nullable=False),
+    pa.field("burst_mid_move_bps_1s", pa.float64(), nullable=True),
 
     # ── Research #15-#21 (P1: 0) ──
     pa.field("same_price_burst_max_len_1s", pa.int32(), nullable=False),
@@ -91,6 +91,31 @@ FEATURE_1S_SCHEMA = pa.schema([
     pa.field("book_imbalance_100", pa.float64(), nullable=True),
     pa.field("book_imbalance_1000", pa.float64(), nullable=True),
     pa.field("book_microprice", pa.float64(), nullable=True),
+
+    # ── OrderFlow P0 features (v2) ──
+    # All computed from raw trades in the 1s bucket [ts, ts+1000).
+    # No lookahead: only trades with ts_bucket <= ts < ts_bucket+1000.
+    pa.field("trade_count_1s", pa.int32(), nullable=False),         # total trade prints
+    pa.field("traded_notional_1s", pa.float64(), nullable=False),   # sum(price*qty)
+    pa.field("signed_volume_1s", pa.float64(), nullable=False),     # buy_qty - sell_qty
+    pa.field("trade_imbalance_qty_1s", pa.float64(), nullable=False),  # (buy-sell)/(buy+sell)
+    pa.field("realized_vol_10s", pa.float64(), nullable=True),      # log-return std, null during warmup
+    pa.field("realized_vol_60s", pa.float64(), nullable=True),      # log-return std, null during warmup
+
+    # ── OrderFlow P1 features (v3, book-dependent) ──
+    # Computed from book_updates change events + cross-second state.
+    # No lookahead: only book_updates with ts_bucket <= ts < ts_bucket+1000.
+    pa.field("ofi_1s", pa.float64(), nullable=False),               # OFI = ΔQ_bid*I(ΔP_bid>=0) - ΔQ_ask*I(ΔP_ask<=0)
+    pa.field("spread_delta_1s", pa.float64(), nullable=True),       # spread_bps(t) - spread_bps(t-1)
+    pa.field("depth_delta_1s", pa.float64(), nullable=True),        # top_depth(t) - top_depth(t-1)
+    pa.field("depth_delta_30s", pa.float64(), nullable=True),       # top_depth(t) - top_depth(t-30s)
+    pa.field("imbalance_delta_1s", pa.float64(), nullable=True),    # imbalance_100(t) - imbalance_100(t-1)
+    pa.field("bid_add_qty_1s", pa.float64(), nullable=False),       # sum(delta_qty where qty increased)
+    pa.field("bid_cancel_qty_1s", pa.float64(), nullable=False),    # sum(-delta_qty where qty decreased)
+    pa.field("ask_add_qty_1s", pa.float64(), nullable=False),       # sum(delta_qty where qty increased)
+    pa.field("ask_cancel_qty_1s", pa.float64(), nullable=False),    # sum(-delta_qty where qty decreased)
+    pa.field("replenishment_qty_1s", pa.float64(), nullable=False), # sum(best_level_qty_increase)
+    pa.field("pulling_qty_1s", pa.float64(), nullable=False),       # sum(-best_level_qty_decrease)
 ])
 
 
