@@ -1,16 +1,16 @@
 #!/usr/bin/env node
-// scripts/cleanup-raw.mjs — safe cleanup of raw trade/book files
+// scripts/cleanup-raw.mjs — safe cleanup of converted raw trade files
 //
-// After the downstream aggregator writes 1s features to data/1s_features/<date>/<market>.jsonl,
-// this script safely deletes the corresponding raw 30-second window files
-// (trades, book_updates) from data/live_v3/.
+// TFP mode deletes trade blocks only after committed manifest and finalized
+// features_1s verification. Legacy timestamp mode remains available.
 //
 // Safety guarantees:
 //   1. 300-second safety margin — only files whose mtime is >300s old are candidates
-//   2. 30-second file granularity — entire HH-MM-SS.jsonl deleted only when ALL
-//      30 contained 1-second rows exist in the features output
-//   3. Verification — each second's ts is confirmed present in 1s_features before delete
-//   4. Dry-run mode — preview what would be deleted without actually deleting
+//   2. TFP manifest status must be committed and output shard must exist
+//   3. Exactly 30 consecutive finalized rows must cover the raw block
+//   4. A finalized, internally consistent 5m Footprint must cover the raw block
+//   5. Input/output paths must remain inside configured roots
+//   6. Dry-run mode — preview what would be deleted without actually deleting
 //
 // Usage:
 //   node scripts/cleanup-raw.mjs [options]
@@ -29,9 +29,11 @@ import readline from 'node:readline';
 // ── Constants ──────────────────────────────────────────────────────────
 
 const WIN_MS = 30000; // 30-second window
+const FOOTPRINT_MS = 300000; // 5-minute window
 const SEC_MS = 1000;
 const DEFAULT_DATA_DIR = 'data/live_v3';
 const DEFAULT_FEATURES_DIR = 'data/1s_features';
+const DEFAULT_DERIVED_DIR = 'data/derived/burst_features_v1';
 const DEFAULT_SAFETY_MARGIN_SEC = 300;
 
 const RAW_KINDS = ['trades', 'book_updates'];
@@ -46,6 +48,8 @@ function parseArgs() {
     safetyMarginSec: DEFAULT_SAFETY_MARGIN_SEC,
     dryRun: false,
     verbose: false,
+    derived: DEFAULT_DERIVED_DIR,
+    tfpMode: true,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -58,7 +62,15 @@ function parseArgs() {
         break;
       case '--features':
         opts.features = next;
+        opts.tfpMode = false;
         i++;
+        break;
+      case '--derived':
+        opts.derived = next;
+        i++;
+        break;
+      case '--legacy-features':
+        opts.tfpMode = false;
         break;
       case '--safety-margin':
         opts.safetyMarginSec = parseInt(next, 10);
@@ -80,7 +92,9 @@ Usage:
 
 Options:
   --data <path>          Raw data directory (default: ${DEFAULT_DATA_DIR})
-  --features <path>      1s features directory (default: ${DEFAULT_FEATURES_DIR})
+  --features <path>      1s features directory (legacy mode, default: ${DEFAULT_FEATURES_DIR})
+  --derived <path>       TFP derived root (default: ${DEFAULT_DERIVED_DIR})
+  --legacy-features      Use legacy timestamp-only verification
   --safety-margin <s>    Seconds before a file is eligible for deletion (default: ${DEFAULT_SAFETY_MARGIN_SEC})
   --dry-run              Show what would be deleted without actually deleting
   --verbose              Print per-file skip/delete decisions
@@ -91,7 +105,8 @@ How it works:
   2. For each file, checks that its mtime is at least --safety-margin seconds old
   3. Verifies ALL 30 seconds in that window exist in the corresponding
      ${DEFAULT_FEATURES_DIR}/<date>/<market>.jsonl file
-  4. If all 30 seconds are confirmed present → deletes the raw file
+  4. Verifies a finalized 5-minute Footprint durably covers the raw window
+  5. If both proofs are present → deletes the raw file
 `);
         process.exit(0);
       default:
@@ -252,12 +267,153 @@ function discoverMarkets(dataDir) {
   return Array.from(markets).sort();
 }
 
+function loadTfpManifest(derivedDir, market) {
+  const manifestPath = path.join(derivedDir, 'manifests', `${market}.json`);
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (!manifest || typeof manifest !== 'object' || !manifest.processed_blocks) return null;
+    return manifest;
+  } catch (_) { return null; }
+}
+
+const rollupManifestCache = new Map();
+const footprintProofCache = new Map();
+
+function verifyFootprintWindow(derivedDir, file) {
+  const intervalMs = Math.floor(file.windowMs / FOOTPRINT_MS) * FOOTPRINT_MS;
+  const { dateDir, fileBase } = windowMsToParts(intervalMs);
+  const outputPath = path.join(derivedDir, 'footprint_5m', file.market, dateDir, `${fileBase}.jsonl`);
+  const cacheKey = outputPath;
+  if (footprintProofCache.has(cacheKey)) return footprintProofCache.get(cacheKey);
+  let result;
+  try {
+    const rows = fs.readFileSync(outputPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const meta = rows[0];
+    if (meta?.type !== 'meta' || meta.ts !== intervalMs || meta.market !== file.market) {
+      result = { ok: false, reason: 'footprint-meta-mismatch' };
+    } else if (meta.finalized !== true || meta.coverage !== 1 || meta.source_seconds !== 300) {
+      result = { ok: false, reason: 'footprint-not-finalized' };
+    } else {
+      const cells = rows.slice(1);
+      const tradeCount = cells.reduce((sum, row) =>
+        sum + Number(row.buy_count || 0) + Number(row.sell_count || 0), 0);
+      const notional = cells.reduce((sum, row) => sum + Number(row.total_notional || 0), 0);
+      const expectedCount = Number(meta.source_trade_count);
+      const expectedNotional = Number(meta.source_notional);
+      const tolerance = Math.max(0.01, Math.abs(expectedNotional) * 1e-9);
+      if (!Number.isFinite(expectedCount) || tradeCount !== expectedCount) {
+        result = { ok: false, reason: 'footprint-trade-count-mismatch' };
+      } else if (!Number.isFinite(expectedNotional) || Math.abs(notional - expectedNotional) > tolerance) {
+        result = { ok: false, reason: 'footprint-notional-mismatch' };
+      } else {
+        result = { ok: true };
+      }
+    }
+  } catch (_) {
+    result = { ok: false, reason: 'footprint-missing-or-invalid' };
+  }
+  footprintProofCache.set(cacheKey, result);
+  return result;
+}
+
+function loadRollupManifest(derivedDir, market) {
+  const cacheKey = `${derivedDir}/${market}`;
+  if (rollupManifestCache.has(cacheKey)) return rollupManifestCache.get(cacheKey);
+  const manifestPath = path.join(derivedDir, 'manifests', 'features_30s', `${market}.json`);
+  let manifest = null;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (!manifest || typeof manifest !== 'object' || !manifest.processed_windows) manifest = null;
+  } catch (_) { /* missing/corrupt manifest */ }
+  rollupManifestCache.set(cacheKey, manifest);
+  return manifest;
+}
+
+function verifyFinalizedRollup(derivedDir, file, sourceManifestKey) {
+  const manifest = loadRollupManifest(derivedDir, file.market);
+  if (!manifest) return false;
+  const matches = Object.values(manifest.processed_windows).filter((record) =>
+    record && record.window_start_ms === file.windowMs && record.status === 'committed'
+      && (!record.source_manifest_key || record.source_manifest_key === sourceManifestKey));
+  if (matches.length !== 1) return false;
+  const record = matches[0];
+  if (!record.output_path) return false;
+  const outputPath = path.resolve(record.output_path);
+  if (outputPath !== derivedDir && !outputPath.startsWith(`${derivedDir}${path.sep}`)) return false;
+  if (!fs.existsSync(outputPath)) return false;
+  try {
+    const rows = fs.readFileSync(outputPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const quality = rows[0]?._quality;
+    return rows.length === 1
+      && rows[0].ts === file.windowMs
+      && quality?.source_layer === 'features_1s'
+      && quality?.source_window_count === 30
+      && quality?.coverage === 1
+      && quality?.has_missing_input === false
+      && quality?.finalized === true;
+  } catch (_) { return false; }
+}
+
+/** Verify that exactly one finalized TFP output shard durably represents a raw block. */
+function verifyTfpWindow(derivedDir, file) {
+  const manifest = loadTfpManifest(derivedDir, file.market);
+  if (!manifest) return { ok: false, reason: 'missing-or-corrupt-tfp-manifest' };
+  const records = Object.entries(manifest.processed_blocks).filter(([, record]) =>
+    record && record.block_start_ms === file.windowMs && record.status === 'committed');
+  if (records.length !== 1) return { ok: false, reason: `committed-manifest-records=${records.length}` };
+  const [manifestKey, record] = records[0];
+  if (record.input_path && path.resolve(record.input_path) !== path.resolve(file.fullPath)) {
+    return { ok: false, reason: 'manifest-input-path-mismatch' };
+  }
+  if (record.output_path) {
+    const outputPath = path.resolve(record.output_path);
+    if (outputPath !== derivedDir && !outputPath.startsWith(`${derivedDir}${path.sep}`)) {
+      return { ok: false, reason: 'manifest-output-path-outside-derived' };
+    }
+    if (!fs.existsSync(outputPath)) return { ok: false, reason: 'committed-output-missing' };
+  }
+  const outputPath = record.output_path
+    ? path.resolve(record.output_path)
+    : path.join(derivedDir, 'features_1s', file.market, file.dateDir, `${file.fileBase}.jsonl`);
+  if (!fs.existsSync(outputPath)) return { ok: false, reason: 'features_1s-shard-missing' };
+  let rows;
+  try {
+    rows = fs.readFileSync(outputPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  } catch (_) { return { ok: false, reason: 'features_1s-shard-invalid-json' }; }
+  if (rows.length !== 30) return { ok: false, reason: `features_1s-rows=${rows.length}` };
+  const rowsFinalized = rows.every((row) => row._quality?.finalized === true);
+  if (!rowsFinalized && !verifyFinalizedRollup(derivedDir, file, manifestKey)) {
+    return { ok: false, reason: 'features_1s-not-finalized' };
+  }
+  for (let i = 0; i < 30; i++) {
+    const row = rows[i];
+    if (row.ts !== file.windowMs + i * SEC_MS) return { ok: false, reason: 'features_1s-timestamp-coverage-mismatch' };
+    if (rowsFinalized && row._quality?.finalized !== true) return { ok: false, reason: 'features_1s-not-finalized' };
+  }
+  const footprintProof = verifyFootprintWindow(derivedDir, file);
+  if (!footprintProof.ok) return footprintProof;
+  return { ok: true, bookSeededRows: rows.filter((row) => row._quality?.book_seeded === true).length };
+}
+
+function bookFileContainsSnapshot(filePath) {
+  try {
+    for (const line of fs.readFileSync(filePath, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      if (JSON.parse(line).type === 'snapshot') return true;
+    }
+    return false;
+  } catch (_) {
+    return true;
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────────
 
 async function main() {
   const opts = parseArgs();
   const dataDir = path.resolve(opts.data);
   const featuresDir = path.resolve(opts.features);
+  const derivedDir = path.resolve(opts.derived);
   const safetyMarginMs = opts.safetyMarginSec * 1000;
   const nowMs = Date.now();
   const cutoffMs = nowMs - safetyMarginMs;
@@ -269,6 +425,8 @@ async function main() {
 
   console.log(`Data dir:       ${dataDir}`);
   console.log(`Features dir:   ${featuresDir}`);
+  console.log(`Derived dir:    ${derivedDir}`);
+  console.log(`Cleanup mode:   ${opts.tfpMode ? 'TFP manifest/finalized' : 'legacy timestamps'}`);
   console.log(`Safety margin:  ${opts.safetyMarginSec}s`);
   console.log(`Dry run:        ${opts.dryRun}`);
   console.log(`Verbose:        ${opts.verbose}`);
@@ -287,7 +445,8 @@ async function main() {
   for (const market of markets) {
     const marketStats = { deleted: 0, skipped: 0, ageSkipped: 0, missingFeatures: 0 };
 
-    for (const kind of RAW_KINDS) {
+    const kinds = opts.tfpMode ? ['trades'] : RAW_KINDS;
+    for (const kind of kinds) {
       const files = discoverRawFiles(dataDir, kind, market);
       if (files.length === 0) continue;
 
@@ -309,7 +468,37 @@ async function main() {
           continue;
         }
 
-        // 2. Load feature timestamps for this date+market
+        if (opts.tfpMode) {
+          const proof = verifyTfpWindow(derivedDir, file);
+          if (!proof.ok) {
+            marketStats.missingFeatures++;
+            totalMissingFeatures++;
+            if (opts.verbose) console.log(`  [SKIP] ${file.fullPath} — ${proof.reason}`);
+            continue;
+          }
+          if (kind === 'book_updates') {
+            if (bookFileContainsSnapshot(file.fullPath)) {
+              marketStats.missingFeatures++; totalMissingFeatures++;
+              if (opts.verbose) console.log(`  [SKIP] ${file.fullPath} — snapshot-retained`);
+              continue;
+            }
+            if (proof.bookSeededRows === 0) {
+              marketStats.missingFeatures++; totalMissingFeatures++;
+              if (opts.verbose) console.log(`  [SKIP] ${file.fullPath} — no-seeded-book-output`);
+              continue;
+            }
+          }
+          if (opts.dryRun) {
+            console.log(`  [DELETE] ${file.fullPath} (TFP + Footprint finalized proof)`);
+            marketStats.deleted++; totalDeleted++;
+          } else {
+            try { fs.unlinkSync(file.fullPath); marketStats.deleted++; totalDeleted++; if (opts.verbose) console.log(`  [DELETED] ${file.fullPath}`); }
+            catch (err) { console.error(`  [ERROR] Failed to delete ${file.fullPath}: ${err.message}`); marketStats.skipped++; totalSkipped++; }
+          }
+          continue;
+        }
+
+        // 2. Load feature timestamps for this date+market (legacy mode)
         const featureTs = await getFeatureTimestamps(featuresDir, file.dateDir, market);
 
         // 3. Verify ALL 30 seconds exist in features
