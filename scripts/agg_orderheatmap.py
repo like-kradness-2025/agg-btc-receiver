@@ -441,7 +441,7 @@ def detect_time_gaps(rows, expected_interval_ms=None, multiplier=1.75):
     expected = int(expected_interval_ms or np.median(positive_diffs))
     if expected <= 0:
         return []
-    threshold = max(expected * float(multiplier), expected + 60_000)
+    threshold = expected * float(multiplier)
 
     spans = []
     for previous, current, diff in zip(timestamps, timestamps[1:], diffs):
