@@ -519,7 +519,11 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
             .drop(columns=['bucket', 'has_book'])
             .to_dict('records')
         )
-    gap_spans = detect_time_gaps(rows, expected_interval_ms=15 * 60 * 1000 if downsampled else None)
+    # The source book stage is 30s; after display reduction the contract is
+    # one representative row per 15m bucket. Use explicit cadences so sparse
+    # samples cannot make a large outage look like the normal interval.
+    expected_interval_ms = 15 * 60 * 1000 if downsampled else 30 * 1000
+    gap_spans = detect_time_gaps(rows, expected_interval_ms=expected_interval_ms)
     mid_values = [float(row['mid']) for row in rows if row.get('finalized') and row.get('mid') is not None]
     if not mid_values:
         raise RuntimeError(f'No finalized mid prices for {market}')
