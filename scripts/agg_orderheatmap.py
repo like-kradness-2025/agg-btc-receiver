@@ -462,7 +462,7 @@ def format_gap_duration(start_ms, end_ms):
     return f'{seconds}s'
 
 
-def derive_display_cvd(rows, feature_rows, interval='15min'):
+def derive_display_cvd(rows, feature_rows, interval='15min', gap_spans=None):
     """Return trade-flow CVD aligned to displayed book rows, in BTC."""
     values = np.full(len(rows), np.nan, dtype=float)
     if not rows or not feature_rows:
@@ -483,12 +483,18 @@ def derive_display_cvd(rows, feature_rows, interval='15min'):
     bucket_delta = (buy_values - sell_values).groupby(frame.index.floor(interval)).sum()
     running_cvd = 0.0
     applied_buckets = set()
+    gap_spans = gap_spans or []
     for idx, row in enumerate(rows):
         bucket = pd.Timestamp(row['ts'], unit='ms', tz='UTC').floor(interval)
+        current_ts = int(row['ts'])
+        previous_ts = int(rows[idx - 1]['ts']) if idx else None
+        crosses_gap = previous_ts is not None and any(
+            previous_ts < end_ms <= current_ts for _, end_ms in gap_spans
+        )
         if bucket in bucket_delta.index and bucket not in applied_buckets:
             running_cvd += float(bucket_delta.loc[bucket])
             applied_buckets.add(bucket)
-        if bucket in applied_buckets:
+        if bucket in applied_buckets and not crosses_gap:
             values[idx] = running_cvd
     return values
 
@@ -497,7 +503,8 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     """Render agg data with the server1 production OrderHeatmap composition."""
     feature_rows = feature_rows or []
     raw_rows = list(rows)
-    if len(rows) > 1 and (int(rows[-1]['ts']) - int(rows[0]['ts'])) >= 30 * 60 * 1000:
+    downsampled = len(rows) > 1 and (int(rows[-1]['ts']) - int(rows[0]['ts'])) >= 30 * 60 * 1000
+    if downsampled:
         display = pd.DataFrame(rows)
         display['bucket'] = pd.to_datetime(display['ts'], unit='ms', utc=True).dt.floor('15min')
         display['has_book'] = (
@@ -512,7 +519,7 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
             .drop(columns=['bucket', 'has_book'])
             .to_dict('records')
         )
-    gap_spans = detect_time_gaps(rows)
+    gap_spans = detect_time_gaps(rows, expected_interval_ms=15 * 60 * 1000 if downsampled else None)
     mid_values = [float(row['mid']) for row in rows if row.get('finalized') and row.get('mid') is not None]
     if not mid_values:
         raise RuntimeError(f'No finalized mid prices for {market}')
@@ -846,7 +853,7 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     # CVD is trade-flow cumulative delta in BTC, independent of book depth.
     # Aggregate the canonical 1s feature deltas into the same 15m display
     # buckets, then reset the visible baseline at the start of this chart.
-    cvd_values = derive_display_cvd(rows, feature_rows)
+    cvd_values = derive_display_cvd(rows, feature_rows, gap_spans=gap_spans)
 
     ax_cvd = ax_depth.twinx()
     ax_cvd.set_facecolor('none')
