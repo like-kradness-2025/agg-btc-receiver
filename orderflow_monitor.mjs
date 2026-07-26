@@ -13,6 +13,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
@@ -120,6 +121,10 @@ const replayDoneWorkers = new Set();
 let expectedWorkerCount = 0;
 /** Set to true when a worker exits or errors before ready — triggers fail-closed. */
 let startupFailed = false;
+const MODULE_RESTART_REQUEST = path.join(
+  process.env.XDG_RUNTIME_DIR || `/run/user/${os.userInfo().uid}`,
+  'agg-btc-receiver-module-restart.json',
+);
 
 const STARTUP_STAGGER_MS = 50;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -181,6 +186,14 @@ function createWorker(workerId, groupMarkets) {
             `[main] writer I/O failure detected for ${msg.market}: ${msg.payload.count} error(s), last: ${msg.payload.message}`,
           );
         }
+        break;
+
+      case 'marketRestarted':
+        console.log(`[main] module restart complete: ${msg.market} (worker ${msg.workerId})`);
+        break;
+
+      case 'marketRestartFailed':
+        console.error(`[main] module restart failed: ${msg.market}: ${msg.reason}`);
         break;
 
       default:
@@ -308,6 +321,21 @@ async function main() {
     process.exit(0);
   };
 
+  process.on('SIGUSR2', () => {
+    try {
+      const request = JSON.parse(fs.readFileSync(MODULE_RESTART_REQUEST, 'utf8'));
+      fs.unlinkSync(MODULE_RESTART_REQUEST);
+      const entry = [...workerMarkets.entries()].find(([, markets]) => markets.includes(request.market));
+      if (!entry) throw new Error(`market is not assigned to a live worker: ${request.market}`);
+      const [workerId] = entry;
+      const worker = workers.get(workerId);
+      if (!worker) throw new Error(`worker is not live: ${workerId}`);
+      console.warn(`[main] module restart requested: ${request.market} (worker ${workerId})`);
+      worker.postMessage({ cmd: 'restartMarket', market: request.market, reason: request.reason || 'watchdog' });
+    } catch (error) {
+      console.error(`[main] module restart request failed: ${error.message}`);
+    }
+  });
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 

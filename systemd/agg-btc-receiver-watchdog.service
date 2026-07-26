@@ -1,0 +1,7 @@
+[Unit]
+Description=Guarded agg-btc-receiver health watchdog
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/weed420/Tool/agg-btc-receiver
+ExecStart=/usr/bin/python3 /home/weed420/Tool/agg-btc-receiver/scripts/receiver-auto-restart-watchdog.py
