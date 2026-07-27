@@ -2,13 +2,19 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { BinanceSpotConnector } from '../lib/binance-connector.mjs';
+import { BinancePerpConnector, BinanceSpotConnector } from '../lib/binance-connector.mjs';
 
 /**
  * Create a connector with mocked ringBuf for testing sync logic.
  */
 function createSyncConnector() {
   const conn = new BinanceSpotConnector({});
+  conn._ws = null;
+  return conn;
+}
+
+function createPerpSyncConnector() {
+  const conn = new BinancePerpConnector({});
   conn._ws = null;
   return conn;
 }
@@ -44,14 +50,14 @@ describe('Binance sync logic', () => {
       assert.ok(!conn._validateSync(snapshot));
     });
 
-    it('should pass when lastUpdateId + 1 > all buffered u (snapshot ahead)', () => {
+    it('should fail when lastUpdateId + 1 > all buffered u (snapshot ahead)', () => {
       const conn = createSyncConnector();
       conn._ringBuf = [
         { U: 100, u: 102 },
       ];
       const snapshot = { lastUpdateId: 103 };
-      // lastUpdateId+1=104 > u=102 → diff is stale, snapshot is ahead → still valid
-      assert.ok(conn._validateSync(snapshot));
+      // lastUpdateId+1=104 > u=102 → no bridge exists, so retry sync.
+      assert.ok(!conn._validateSync(snapshot));
     });
 
     it('should fail with empty ring buffer during initial sync', () => {
@@ -73,14 +79,14 @@ describe('Binance sync logic', () => {
       assert.ok(conn._validateSync({ lastUpdateId: 100 }));
     });
 
-    it('should pass when all diffs are stale (snapshot ahead of buffered diffs)', () => {
+    it('should fail when all diffs are stale (snapshot ahead of buffered diffs)', () => {
       const conn = createSyncConnector();
       // All buffered diffs have u <= lastUpdateId → snapshot is ahead of all of them
       conn._ringBuf = [
         { U: 80, u: 90 },
         { U: 91, u: 95 },
       ];
-      assert.ok(conn._validateSync({ lastUpdateId: 100 }));
+      assert.ok(!conn._validateSync({ lastUpdateId: 100 }));
     });
 
     it('should fail when first remaining diff has U > lastUpdateId + 1 (gap)', () => {
@@ -112,8 +118,8 @@ describe('Binance sync logic', () => {
         asks: [['101.0', '2.0']],
       };
       conn._ringBuf = [
-        { U: 98, u: 99, b: [['100.0', '0']], a: [] },  // u <= 100 → skip
-        { U: 100, u: 102, b: [['100.0', '3.0']], a: [] }, // u > 100 → apply
+        { U: 98, u: 99, E: 1700000000000, b: [['100.0', '0']], a: [] },  // u <= 100 → skip
+        { U: 100, u: 102, E: 1700000000001, b: [['100.0', '3.0']], a: [] }, // u > 100 → apply
       ];
 
       conn._applyRingBuf(snapshot);
@@ -131,7 +137,7 @@ describe('Binance sync logic', () => {
         asks: [],
       };
       conn._ringBuf = [
-        { U: 50, u: 51, b: [['100.0', '1.0']], a: [['101.0', '2.0']] },
+        { U: 50, u: 51, E: 1700000000000, b: [['100.0', '1.0']], a: [['101.0', '2.0']] },
       ];
       conn._applyRingBuf(snapshot);
       assert.strictEqual(conn.book.getBestBid(), '100.0');
@@ -146,14 +152,64 @@ describe('Binance sync logic', () => {
         asks: [['101.0', '2.0']],
       };
       conn._ringBuf = [
-        { U: 90, u: 99, b: [['100.0', '0']], a: [] },    // u=99 ≤ 100 → stale, discard
-        { U: 100, u: 100, b: [['100.0', '0']], a: [] },   // u=100 ≤ 100 → stale, discard
-        { U: 101, u: 103, b: [['100.0', '5.0']], a: [] },  // first valid
+        { U: 90, u: 99, E: 1700000000000, b: [['100.0', '0']], a: [] },    // u=99 ≤ 100 → stale, discard
+        { U: 100, u: 100, E: 1700000000001, b: [['100.0', '0']], a: [] },   // u=100 ≤ 100 → stale, discard
+        { U: 101, u: 103, E: 1700000000002, b: [['100.0', '5.0']], a: [] },  // first valid
       ];
       conn._applyRingBuf(snapshot);
       // Stale diffs must NOT have been applied; only the valid diff should apply
       assert.strictEqual(conn.book.bids.get('100.0'), '5.0');
       assert.strictEqual(conn.book.asks.get('101.0'), '2.0');
+    });
+
+    it('should reject a sequence gap after the first bridge diff', () => {
+      const conn = createSyncConnector();
+      const snapshot = { lastUpdateId: 100, bids: [], asks: [] };
+      conn._ringBuf = [
+        { U: 101, u: 101, E: 1700000000000, b: [['100.0', '1.0']], a: [] },
+        { U: 103, u: 103, E: 1700000000001, b: [['100.0', '3.0']], a: [] },
+      ];
+
+      assert.throws(() => conn._applyRingBuf(snapshot), /buffered depth gap/);
+      assert.strictEqual(conn.book._lastSeq, 101);
+      assert.strictEqual(conn.book.bids.get('100.0'), '1.0');
+    });
+
+    it('should reject an invalid buffered timestamp before applying it', () => {
+      const conn = createSyncConnector();
+      conn._ringBuf = [
+        { U: 101, u: 101, E: NaN, b: [['100.0', '1.0']], a: [] },
+      ];
+
+      assert.throws(() => conn._applyRingBuf({ lastUpdateId: 100, bids: [], asks: [] }), /invalid timestamp/);
+      assert.strictEqual(conn.book._lastSeq, 100);
+      assert.strictEqual(conn.book.bids.has('100.0'), false);
+    });
+
+    it('should reject missing or malformed REST depth arrays before applying', () => {
+      const conn = createSyncConnector();
+      assert.throws(() => conn._applyRingBuf({ lastUpdateId: 100 }), /invalid depth levels/);
+      assert.throws(() => conn._applyRingBuf({
+        lastUpdateId: 100,
+        bids: [['not-a-price', '1']],
+        asks: [],
+      }), /invalid depth levels/);
+      assert.strictEqual(conn.book.isEmpty(), true);
+    });
+  });
+
+  describe('perpetual _applyRingBuf', () => {
+    it('should require pu continuity after the first bridge diff', () => {
+      const conn = createPerpSyncConnector();
+      const snapshot = { lastUpdateId: 100, bids: [], asks: [] };
+      conn._ringBuf = [
+        { U: 95, u: 101, pu: 99, E: 1700000000000, b: [['100.0', '1.0']], a: [] },
+        { U: 103, u: 103, pu: 102, E: 1700000000001, b: [['100.0', '3.0']], a: [] },
+      ];
+
+      assert.throws(() => conn._applyRingBuf(snapshot), /buffered depth gap/);
+      assert.strictEqual(conn.book._lastSeq, 101);
+      assert.strictEqual(conn.book.bids.get('100.0'), '1.0');
     });
   });
 

@@ -116,6 +116,29 @@ describe('BinanceConnector parser', () => {
       assert.deepStrictEqual(emitted.asks[0], ['65001.00', '0.8']);
     });
 
+    it('should not mutate the book when depth timestamp is invalid', () => {
+      const conn = createTestConnector();
+      conn.book.applySnapshot([['65000.00', '1.0']], [['65001.00', '1.0']], 100);
+      conn._setState('running');
+
+      let emitted = false;
+      conn.on('depth', () => { emitted = true; });
+      conn._handleDepth({
+        e: 'depthUpdate',
+        E: NaN,
+        U: 105,
+        u: 105,
+        b: [['65000.00', '3.0']],
+        a: [],
+      });
+
+      assert.strictEqual(emitted, false);
+      assert.strictEqual(conn.book.bids.get('65000.00'), '1.0');
+      assert.strictEqual(conn.book._lastSeq, 100);
+      assert.strictEqual(conn._stats.droppedDepthCount, 1);
+      assert.strictEqual(conn.getState(), 'running');
+    });
+
     it('should buffer depth events during syncing state', () => {
       const conn = createTestConnector();
       conn._setState('syncing');
@@ -570,7 +593,7 @@ describe('Perp ring-buf-applied skips bridge (firstRunningDiff=false)', () => {
     // Simulate ring buffer with a diff bridging the snapshot
     conn._ringBuf = [{
       e: 'depthUpdate', E: 1700000001000,
-      U: 101, u: 105, pu: 100,
+      U: 95, u: 105, pu: 99,
       b: [['100', '5']], a: [],
     }];
 
