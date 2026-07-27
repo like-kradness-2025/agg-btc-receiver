@@ -18,9 +18,11 @@ function parseArgs() {
     from: null,
     to: null,
     outputRoot: null,
+    orderflowNamespace: false,
     finalizedThrough: null,      // P0-4: ISO timestamp
     frozenInventory: null,       // P0-4: path to JSON inventory file
     kind: 'trades',              // P0-1: 'trades' or 'book_updates'
+    rawLayout: null,             // 'v3' | 'v4'; auto-detected from data dir
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -30,6 +32,8 @@ function parseArgs() {
       case '--from': opts.from = args[++i]; break;
       case '--to': opts.to = args[++i]; break;
       case '--output-root': opts.outputRoot = args[++i]; break;
+      case '--orderflow': opts.orderflowNamespace = true; break;
+      case '--raw-layout': opts.rawLayout = args[++i]; break;
       case '--finalized-through': opts.finalizedThrough = args[++i]; break;
       case '--frozen-inventory': opts.frozenInventory = args[++i]; break;
       case '--kind': opts.kind = args[++i]; break;
@@ -38,6 +42,8 @@ function parseArgs() {
         console.error(`  --markets <csv>            Comma-separated market names`);
         console.error(`  --data <dir>               Input data dir (default: data/live_v3)`);
         console.error(`  --output-root <dir>        Output root dir (default: data/derived/burst_features_v1)`);
+        console.error(`  --orderflow                Use data/derived/orderflow_features_v1 namespace`);
+        console.error(`  --raw-layout v3|v4         Input raw layout (auto-detected: data/live_v4 -> v4)`);
         console.error(`  --finalized-through <ISO>  P0-4: exclusive 30s-aligned horizon (live EOF authority)`);
         console.error(`  --frozen-inventory <path>  P0-4: path to frozen inventory JSON manifest`);
         console.error(`  --kind <trades|book_updates> P0-1: input kind (default: trades)`);
@@ -53,6 +59,15 @@ function parseArgs() {
   // Validate kind
   if (!VALID_INPUT_KINDS.has(opts.kind)) {
     console.error(`ERROR: --kind must be one of: ${[...VALID_INPUT_KINDS].join(', ')} (got: ${opts.kind})`);
+    process.exit(1);
+  }
+
+  // Auto-detect raw layout from data dir if not explicitly provided
+  if (!opts.rawLayout) {
+    opts.rawLayout = detectRawLayout(opts.data, opts.kind);
+  }
+  if (opts.rawLayout !== 'v3' && opts.rawLayout !== 'v4') {
+    console.error(`ERROR: --raw-layout must be 'v3' or 'v4' (got: ${opts.rawLayout})`);
     process.exit(1);
   }
 
@@ -77,6 +92,20 @@ function detectMarkets(dataDir, kind = 'trades') {
   return readdirSync(kindDir, { withFileTypes: true })
     .filter(d => d.isDirectory())
     .map(d => d.name);
+}
+
+function detectRawLayout(dataDir, kind = 'trades') {
+  const kindDir = resolve(dataDir, kind);
+  if (!existsSync(kindDir)) return 'v3';
+  for (const market of readdirSync(kindDir, { withFileTypes: true })) {
+    if (!market.isDirectory()) continue;
+    for (const date of readdirSync(join(kindDir, market.name), { withFileTypes: true })) {
+      if (!date.isDirectory()) continue;
+      const names = readdirSync(join(kindDir, market.name, date.name));
+      if (names.some((name) => /^\d{2}-\d{2}\.jsonl(?:\.active)?$/.test(name))) return 'v4';
+    }
+  }
+  return 'v3';
 }
 
 /**
@@ -379,7 +408,13 @@ async function main() {
   const fromMs = isoToMs(opts.from);
   const toMs = isoToMs(opts.to);
   const runId = `run-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-  const outputRoot = opts.outputRoot || 'data/derived/burst_features_v1';
+  if (opts.orderflowNamespace && opts.outputRoot) {
+    console.error('ERROR: --orderflow and --output-root are mutually exclusive');
+    process.exit(1);
+  }
+  const outputRoot = opts.outputRoot || (opts.orderflowNamespace
+    ? 'data/derived/orderflow_features_v1'
+    : 'data/derived/burst_features_v1');
 
   // P0-4: Parse finalized-through
   let finalizedThroughMs = null;
@@ -448,6 +483,7 @@ async function main() {
         finalizedThroughMs,
         frozenInventory,
         kind: opts.kind,
+        rawLayout: opts.rawLayout,
       });
 
       totalProcessed += result.processed;

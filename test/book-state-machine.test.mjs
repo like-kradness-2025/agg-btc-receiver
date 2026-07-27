@@ -232,6 +232,30 @@ describe('BookStateMachine (B2 focused)', () => {
     assert.equal(sm.gap_detected, true);
   });
 
+  it('accepts Binance overlap range after a REST snapshot', () => {
+    const sm = new BookStateMachine();
+    sm.apply(snap({ market: 'binance_spot', seq: 100 }));
+    const result = sm.apply({
+      market: 'binance_spot', type: 'update', event_ts_ms: 200,
+      seq: 120, prev_seq: 95, seq_start: 96, seq_end: 120,
+      bids: [], asks: [], path: 'binance.jsonl', line_no: 2,
+    });
+    assert.equal(result.applied, true);
+    assert.equal(sm.last_seq, 120);
+  });
+
+  it('accepts OKX monotonic sequence IDs bridged by prev_seq', () => {
+    const sm = new BookStateMachine();
+    sm.apply(snap({ market: 'okx_spot', seq: 100 }));
+    const result = sm.apply({
+      market: 'okx_spot', type: 'update', event_ts_ms: 200,
+      seq: 137, prev_seq: 100,
+      bids: [], asks: [], path: 'okx.jsonl', line_no: 2,
+    });
+    assert.equal(result.applied, true);
+    assert.equal(sm.last_seq, 137);
+  });
+
   // ── 14. processBlock with null/undefined/{} ──
   it('processBlock returns blocked unknown-input for null/undefined/{}', () => {
     for (const bad of [null, undefined]) {

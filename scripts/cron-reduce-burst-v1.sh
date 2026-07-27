@@ -13,7 +13,7 @@ MARKETS=(
   okx_perp okx_spot
 )
 
-ALL_OUTPUT_ROOT="data/derived/burst_features_v1"
+ALL_OUTPUT_ROOT="data/derived/burst_features_v2"
 TODAY=$(TZ=UTC date +%Y-%m-%d)
 NOW_TS=$(TZ=UTC date +%s)
 

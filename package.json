@@ -6,7 +6,7 @@
   "description": "BTC orderbook & trade receiver v3.00",
   "scripts": {
     "test": "node --test 'test/**/*.test.mjs'",
-    "check": "node --check lib/*.mjs orderflow_monitor.mjs aux_data_collector.mjs fairprice_monitor.mjs scripts/cleanup-raw.mjs",
+    "check": "node --check lib/*.mjs lib/downstream/incremental-cursor.mjs lib/downstream/derived-commit.mjs orderflow_monitor.mjs aux_data_collector.mjs fairprice_monitor.mjs scripts/cleanup-raw.mjs scripts/archive-raw-v4.mjs scripts/migrate-duckdb-to-sqlite.mjs scripts/materialize-book-snapshots.mjs scripts/materialize-orderheatmap.mjs",
     "smoke": "node orderflow_monitor.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_v3_smoke",
     "fairprice": "node fairprice_monitor.mjs --config config.v3.json",
     "smoke:fairprice": "node fairprice_monitor.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_fairprice_smoke",
@@ -14,7 +14,11 @@
     "smoke:aux": "node aux_data_collector.mjs --config config.v3.json --seconds 5 --markets binance_spot,binance_perp --output data/live_v3_aux_smoke",
     "cleanup:raw:dry-run": "node scripts/cleanup-raw.mjs --dry-run",
     "cleanup:raw": "node scripts/cleanup-raw.mjs",
-    "tfp": "node scripts/tfp.mjs"
+    "tfp": "node scripts/tfp.mjs",
+    "book-snapshots": "node scripts/materialize-book-snapshots.mjs",
+    "orderheatmap": "node scripts/materialize-orderheatmap.mjs",
+    "archive:raw": "bash scripts/run-archive-raw-v4.sh",
+    "archive:raw:dry-run": "bash scripts/run-archive-raw-v4.sh --dry-run"
   },
   "dependencies": {
     "duckdb": "^1.4.4",

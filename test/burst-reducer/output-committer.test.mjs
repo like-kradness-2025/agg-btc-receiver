@@ -21,7 +21,6 @@ function makeTestRows(blockStartMs) {
       trade_count_this_second: 0,
       warmup: blockStartMs === 0,
       input_block_ids: [String(blockStartMs)],
-      finalized: true,
     }));
   }
   // Set some features for verifiability
@@ -85,6 +84,7 @@ describe('OutputCommitter', () => {
     const outputContent = readFileSync(result.output_path, 'utf8');
     const lines = outputContent.trim().split('\n');
     assert.equal(lines.length, 30, 'should be 30 rows');
+    assert.equal(JSON.parse(lines[0])._quality.finalized, true, 'durable 1s rows must be finalized');
 
     // Check manifest
     const manifest = loadManifest(MARKET);

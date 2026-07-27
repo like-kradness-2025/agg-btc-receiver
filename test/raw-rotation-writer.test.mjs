@@ -234,6 +234,41 @@ describe('RawRotationWriter basic flow', () => {
     assert.ok(fs.existsSync(jsonl2), `expected ${jsonl2}`);
   });
 
+  it('writes a batch in order without one queue task per event', async () => {
+    const writer = new RawRotationWriter(dir, 'batch_flow', 'trades');
+    const ts = Date.now();
+    const events = Array.from({ length: 100 }, (_, i) => [{ i }, ts]);
+
+    await writer.writeBatch(events);
+    await writer.finalize();
+
+    const { dateDir, fileBase } = windowStartToDateStr(windowStartMs(ts));
+    const file = path.join(dir, 'trades', 'batch_flow', dateDir, `${fileBase}.jsonl`);
+    const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 100);
+    assert.deepEqual(rows.map((row) => row.i), [...Array(100).keys()]);
+  });
+
+  it('flushes active windows without finalizing them', async () => {
+    const writer = new RawRotationWriter(dir, 'flush_probe', 'trades');
+    const ts = Date.now();
+    const { dateDir, fileBase } = windowStartToDateStr(windowStartMs(ts));
+    const openPath = path.join(
+      dir, 'trades', 'flush_probe', dateDir, `${fileBase}.jsonl.open`,
+    );
+
+    await writer.write({ probe: true }, ts);
+    assert.ok(!fs.existsSync(openPath), 'line should still be buffered before flush');
+
+    await writer.flush();
+
+    assert.ok(fs.existsSync(openPath), 'flush should create the active .open file');
+    assert.equal(fs.readFileSync(openPath, 'utf8'), '{"probe":true}\n');
+    assert.equal(writer.getWatermark(), null, 'flush must not finalize the window');
+
+    await writer.finalize();
+  });
+
   it('drops events with window <= watermark', async () => {
     const writer = new RawRotationWriter(dir, 'binance_spot', 'trades', {
       flushIntervalMs: 50,
@@ -296,6 +331,28 @@ describe('Startup recovery', () => {
     await writer.startupRecovery(Date.now());
     assert.strictEqual(writer.getWatermark(), 30000);
     await writer.finalize();
+  });
+
+  it('reopens finalized active windows after restart', async () => {
+    const nowMs = Date.now();
+    const currentWindow = windowStartMs(nowMs);
+    const { dateDir, fileBase } = windowStartToDateStr(currentWindow);
+    const d = path.join(dir, 'trades', 'restart_append', dateDir);
+    fs.mkdirSync(d, { recursive: true });
+    const finalPath = path.join(d, `${fileBase}.jsonl`);
+    fs.writeFileSync(finalPath, '{"before_restart":true}\n');
+
+    const writer = new RawRotationWriter(dir, 'restart_append', 'trades');
+    await writer.startupRecovery(nowMs);
+    assert.strictEqual(writer.getWatermark(), null);
+    await writer.write({ after_restart: true }, nowMs);
+    await writer.finalize();
+
+    const rows = fs.readFileSync(finalPath, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepStrictEqual(rows, [
+      { before_restart: true },
+      { after_restart: true },
+    ]);
   });
 
   it('retains .open within keepable range (current + previous)', async () => {

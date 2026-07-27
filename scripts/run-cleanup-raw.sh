@@ -6,11 +6,18 @@ set -euo pipefail
 
 cd /home/weed420/Tool/agg-btc-receiver
 
-# Preserve the price-level TFP footprint before deleting its raw input.
-/home/weed420/Tool/tv-footprint-agg-btc/scripts/materialize-tfp-footprint.sh
+DATA_ROOT=data/live_v4
+DERIVED_ROOT=data/derived/burst_features_v2
+
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "data root not found; nothing to clean"
+  exit 0
+fi
 
 node scripts/cleanup-raw.mjs \
-  --data data/live_v3 \
-  --derived data/derived/burst_features_v1 \
-  --safety-margin 300 \
+  --data "$DATA_ROOT" \
+  --raw-layout v4 \
+  --derived "$DERIVED_ROOT" \
+  --consumer-cursors "$DERIVED_ROOT" \
+  --consumer-manifests "$DERIVED_ROOT" \
   "$@"

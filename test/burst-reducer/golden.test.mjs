@@ -168,7 +168,7 @@ describe('Golden fixtures', () => {
     assert.equal(row1.total_burst_notional_1s, 100);
   });
 
-  it('all rows have 38 physical keys (#1-#22 + B1-B9 book + B4 board_* + ts + market + _quality)', () => {
+  it('all rows have 86 physical keys including OHLCV and interaction fields', () => {
     const tradesRaw = [JSON.stringify({ ts: 500, side: 'buy', price: 100, qty: 1 })].join('\\n');
     const { trades } = validateAndParseTrades(tradesRaw, 0);
 
@@ -186,7 +186,7 @@ describe('Golden fixtures', () => {
     });
 
     for (const row of rows) {
-      assert.equal(Object.keys(row).length, 38, `ts ${row.ts}: expected 38 keys, got ${Object.keys(row).length}`);
+      assert.equal(Object.keys(row).length, 86, `ts ${row.ts}: expected 86 keys, got ${Object.keys(row).length}`);
     }
   });
 

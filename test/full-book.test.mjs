@@ -108,6 +108,28 @@ describe('FullBook', () => {
       assert.strictEqual(book.getBestBid(), '100');
       assert.strictEqual(book.bids.get('100'), '5');
     });
+
+    it('should update batch best prices without scanning on every level', () => {
+      const book = new FullBook('test');
+      book.applySnapshot([['100', '1'], ['99', '1']], [['101', '1'], ['102', '1']]);
+
+      book.applyDiffs('bid', [['98', '1'], ['103', '1']]);
+      book.applyDiffs('ask', [['104', '1'], ['100.5', '1']]);
+
+      assert.strictEqual(book.getBestBid(), '103');
+      assert.strictEqual(book.getBestAsk(), '100.5');
+    });
+
+    it('should recalculate correctly when a batch deletes the best level', () => {
+      const book = new FullBook('test');
+      book.applySnapshot([['102', '1'], ['101', '1']], [['103', '1'], ['104', '1']]);
+
+      book.applyDiffs('bid', [['102', '0'], ['100', '1']]);
+      book.applyDiffs('ask', [['103', ''], ['105', '1']]);
+
+      assert.strictEqual(book.getBestBid(), '101');
+      assert.strictEqual(book.getBestAsk(), '104');
+    });
   });
 
   describe('imbalance and depth queries', () => {

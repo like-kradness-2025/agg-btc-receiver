@@ -8,18 +8,18 @@
 #
 # Usage (source this file):
 #   source scripts/lock-helper.sh
-#   acquire_market_lock "binance_perp" "data/derived/burst_features_v1" || exit 0
+#   acquire_market_lock "binance_perp" "data/derived/burst_features_v2" || exit 0
 #   # ... do work ...
 #   release_market_lock  # optional; exit/process death also releases
 
 LOCK_FD=""
 
 # Acquire exclusive non-blocking flock for a market.
-# Args: $1 = market name, $2 = output root dir (default: data/derived/burst_features_v1)
+# Args: $1 = market name, $2 = output root dir (default: data/derived/burst_features_v2)
 # Returns: 0 on success (lock acquired), 1 on contention (skip)
 acquire_market_lock() {
   local market="$1"
-  local output_root="${2:-data/derived/burst_features_v1}"
+  local output_root="${2:-data/derived/burst_features_v2}"
   local lock_dir="${output_root}/locks"
   local lock_file="${lock_dir}/${market}.lock"
 
