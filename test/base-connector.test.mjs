@@ -183,6 +183,64 @@ describe('BaseConnector connect() settle-once', () => {
   });
 });
 
+describe('BaseConnector periodic raw snapshots', () => {
+  it('emits a full book snapshot while running', async () => {
+    const conn = createTestConnector();
+    conn.config.raw_snapshot_interval_ms = 5;
+    conn.book = {
+      isEmpty: () => false,
+      toSnapshot: (ts) => ({ ts, seq: 42, bids: [['1', '2']], asks: [['2', '3']] }),
+    };
+    const snapshots = [];
+    conn.on('depth', (event) => snapshots.push(event));
+    conn._setState('running');
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    conn._clearTimers();
+    assert.ok(snapshots.length >= 1);
+    assert.equal(snapshots[0].type, 'snapshot');
+    assert.equal(snapshots[0].snapshot_origin, 'periodic_book');
+    assert.equal(snapshots[0].seq, 42);
+    assert.deepEqual(snapshots[0].bids, [['1', '2']]);
+  });
+});
+
+describe('BaseConnector depth metadata and connection identity', () => {
+  it('preserves depth metadata and assigns a new id per websocket', async () => {
+    const conn = createTestConnector();
+    const firstConnect = conn.connect();
+    setImmediate(() => {
+      conn._ws.readyState = 1;
+      conn._ws.emit('open');
+    });
+    await firstConnect;
+    const firstId = conn._connectionId;
+    const depth = [];
+    const raw = [];
+    conn.on('depth', (event) => depth.push(event));
+    conn.on('rawDepth', (event) => raw.push(event));
+    conn._emitDepth('snapshot', [], [], 1700000000000, 7, {
+      snapshot_origin: 'rest_sync',
+      provenance: 'test',
+    });
+    conn._emitRawDepth([], [], 1700000000000, 7, { seq_start: 7, seq_end: 7 });
+
+    conn._ws = null;
+    const secondConnect = conn.connect();
+    setImmediate(() => {
+      conn._ws.readyState = 1;
+      conn._ws.emit('open');
+    });
+    await secondConnect;
+
+    assert.ok(firstId);
+    assert.notStrictEqual(conn._connectionId, firstId);
+    assert.strictEqual(depth[0].snapshot_origin, 'rest_sync');
+    assert.strictEqual(depth[0].provenance, 'test');
+    assert.strictEqual(raw[0].connection_id, firstId);
+    conn._clearTimers();
+  });
+});
+
 describe('BaseConnector _emitTrade side validation', function () {
   it('should emit trade with valid side "buy"', () => {
     const conn = new BaseConnector(
@@ -494,5 +552,36 @@ describe('BaseConnector _emitTrade ts validation', function () {
     conn._emitTrade(65000, 1.0, 'sell', 1700000000000, 't13');
     assert.strictEqual(emitted.length, 1);
     assert.strictEqual(emitted[0].ts, 1700000000000);
+  });
+
+  it('should drop non-finite or non-positive price and quantity', () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    conn._emitTrade(NaN, 1, 'buy', 1700000000000, 'bad-price');
+    conn._emitTrade(65000, Infinity, 'sell', 1700000000000, 'bad-qty');
+    conn._emitTrade(0, 1, 'buy', 1700000000000, 'zero-price');
+    conn._emitTrade(65000, -1, 'sell', 1700000000000, 'negative-qty');
+
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(conn._stats.droppedTradeCount, 4);
+  });
+});
+
+describe('BaseConnector _emitLiquidation validation', function () {
+  it('should reject malformed liquidation values', () => {
+    const conn = new BaseConnector(
+      {},
+      { market: 'test_market', wsUrl: 'ws://localhost:9999', restUrl: '' },
+    );
+    const emitted = [];
+    conn.on('liquidation', (ev) => emitted.push(ev));
+
+    conn._emitLiquidation({ side: 'buy', price: NaN, qty: 1 });
+    conn._emitLiquidation({ side: 'buy', price: 65000, qty: 1, source_ts: NaN });
+
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(conn._stats.droppedLiquidationCount, 2);
   });
 });
