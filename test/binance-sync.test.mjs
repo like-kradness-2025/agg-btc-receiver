@@ -3,6 +3,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { BinancePerpConnector, BinanceSpotConnector } from '../lib/binance-connector.mjs';
+import { BinanceSpotUsdcConnector } from '../lib/binance-usdc-connector.mjs';
 
 /**
  * Create a connector with mocked ringBuf for testing sync logic.
@@ -15,6 +16,12 @@ function createSyncConnector() {
 
 function createPerpSyncConnector() {
   const conn = new BinancePerpConnector({});
+  conn._ws = null;
+  return conn;
+}
+
+function createUsdcSyncConnector() {
+  const conn = new BinanceSpotUsdcConnector({});
   conn._ws = null;
   return conn;
 }
@@ -165,14 +172,17 @@ describe('Binance sync logic', () => {
     it('should reject a sequence gap after the first bridge diff', () => {
       const conn = createSyncConnector();
       const snapshot = { lastUpdateId: 100, bids: [], asks: [] };
+      const emitted = [];
+      conn.on('depth', (event) => emitted.push(event));
       conn._ringBuf = [
         { U: 101, u: 101, E: 1700000000000, b: [['100.0', '1.0']], a: [] },
         { U: 103, u: 103, E: 1700000000001, b: [['100.0', '3.0']], a: [] },
       ];
 
       assert.throws(() => conn._applyRingBuf(snapshot), /buffered depth gap/);
-      assert.strictEqual(conn.book._lastSeq, 101);
-      assert.strictEqual(conn.book.bids.get('100.0'), '1.0');
+      assert.deepStrictEqual(emitted, []);
+      assert.strictEqual(conn.book._lastSeq, null);
+      assert.strictEqual(conn.book.bids.has('100.0'), false);
     });
 
     it('should reject an invalid buffered timestamp before applying it', () => {
@@ -182,7 +192,7 @@ describe('Binance sync logic', () => {
       ];
 
       assert.throws(() => conn._applyRingBuf({ lastUpdateId: 100, bids: [], asks: [] }), /invalid timestamp/);
-      assert.strictEqual(conn.book._lastSeq, 100);
+      assert.strictEqual(conn.book._lastSeq, null);
       assert.strictEqual(conn.book.bids.has('100.0'), false);
     });
 
@@ -208,12 +218,159 @@ describe('Binance sync logic', () => {
       ];
 
       assert.throws(() => conn._applyRingBuf(snapshot), /buffered depth gap/);
-      assert.strictEqual(conn.book._lastSeq, 101);
-      assert.strictEqual(conn.book.bids.get('100.0'), '1.0');
+      assert.strictEqual(conn.book._lastSeq, null);
+      assert.strictEqual(conn.book.bids.has('100.0'), false);
     });
   });
 
   describe('full sync flow (no network)', () => {
+    it('should wait for a delayed WS event to bridge the REST snapshot', async () => {
+      const conn = createSyncConnector();
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        return { lastUpdateId: 100, bids: [], asks: [] };
+      };
+      setTimeout(() => conn._bufferMsg({
+        U: 101, u: 102, E: 1700000000000, b: [['100', '1']], a: [],
+      }), 25);
+
+      await conn._syncBook();
+
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(fetchCount, 1);
+      assert.strictEqual(conn.book._lastSeq, 102);
+    });
+
+    it('should preserve a late event across a failed bridge attempt', async () => {
+      const conn = createSyncConnector();
+      conn._syncBridgeWaitMs = 20;
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        return { lastUpdateId: 100, bids: [], asks: [] };
+      };
+      setTimeout(() => conn._bufferMsg({
+        U: 101, u: 102, E: 1700000000000, b: [['100', '1']], a: [],
+      }), 30);
+
+      await conn._syncBook();
+
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(fetchCount, 2);
+      assert.strictEqual(conn.book._lastSeq, 102);
+    });
+
+    it('should preserve delayed perp events while retrying the bridge', async () => {
+      const conn = createPerpSyncConnector();
+      conn._syncBridgeWaitMs = 20;
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        return { lastUpdateId: 100, bids: [], asks: [] };
+      };
+      setTimeout(() => conn._bufferMsg({
+        U: 95, u: 101, pu: 99, E: 1700000000000, b: [['100', '1']], a: [],
+      }), 30);
+
+      await conn._syncBook();
+
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(fetchCount, 2);
+      assert.strictEqual(conn.book._lastSeq, 101);
+    });
+
+    it('should preserve delayed USDC events while retrying the bridge', async () => {
+      const conn = createUsdcSyncConnector();
+      conn._syncBridgeWaitMs = 20;
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        return { lastUpdateId: 100, bids: [], asks: [] };
+      };
+      setTimeout(() => conn._bufferMsg({
+        U: 101, u: 102, E: 1700000000000, b: [['100', '1']], a: [],
+      }), 30);
+
+      await conn._syncBook();
+
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(fetchCount, 2);
+      assert.strictEqual(conn.book._lastSeq, 102);
+    });
+
+    it('should not emit partial replay state before a failed retry attempt', async () => {
+      const conn = createSyncConnector();
+      conn._syncBridgeWaitMs = 0;
+      conn.on('error', () => {});
+      const emitted = [];
+      conn.on('depth', (event) => emitted.push(event));
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        if (fetchCount === 1) {
+          conn._ringBuf = [
+            { U: 101, u: 101, E: 1700000000000, b: [['100', '1']], a: [] },
+            { U: 103, u: 103, E: 1700000000001, b: [['100', '3']], a: [] },
+          ];
+          return { lastUpdateId: 100, bids: [], asks: [] };
+        }
+        conn._ringBuf.push({
+          U: 104, u: 104, E: 1700000000002, b: [['100', '4']], a: [],
+        });
+        return { lastUpdateId: 103, bids: [], asks: [] };
+      };
+
+      await conn._syncBook();
+
+      assert.strictEqual(fetchCount, 2);
+      assert.deepStrictEqual(emitted.map(({ type, seq }) => [type, seq]), [
+        ['snapshot', 103], ['update', 104], ['snapshot', 104],
+      ]);
+    });
+
+    it('should share one in-flight sync promise between concurrent callers', async () => {
+      const conn = createSyncConnector();
+      conn._syncBridgeWaitMs = 50;
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        return { lastUpdateId: 100, bids: [], asks: [] };
+      };
+      const first = conn._syncBook();
+      const second = conn._syncBook();
+      setTimeout(() => conn._bufferMsg({
+        U: 101, u: 102, E: 1700000000000, b: [['100', '1']], a: [],
+      }), 10);
+
+      assert.strictEqual(first, second);
+      await Promise.all([first, second]);
+      assert.strictEqual(fetchCount, 1);
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(conn.book._lastSeq, 102);
+    });
+
+    it('should reject a regressing REST snapshot across retries', async () => {
+      const conn = createSyncConnector();
+      conn._syncBridgeWaitMs = 0;
+      conn.on('error', () => {});
+      const emitted = [];
+      conn.on('depth', (event) => emitted.push(event));
+      let fetchCount = 0;
+      conn._fetchSnapshot = async () => {
+        fetchCount++;
+        if (fetchCount === 1) return { lastUpdateId: 100, bids: [], asks: [] };
+        conn._ringBuf = [
+          { U: 100, u: 101, E: 1700000000000, b: [['100', '1']], a: [] },
+        ];
+        return { lastUpdateId: 99, bids: [], asks: [] };
+      };
+
+      await assert.rejects(() => conn._syncBook(), /init sync failed/);
+      assert.strictEqual(fetchCount, 3);
+      assert.deepStrictEqual(emitted, []);
+    });
+
     it('should attempt _fetchSnapshot and handle failure gracefully', async () => {
       const conn = createSyncConnector();
       conn._fetchSnapshot = async () => { throw new Error('network error'); };
