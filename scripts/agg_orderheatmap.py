@@ -55,7 +55,12 @@ RING_HALF_HEIGHTS = [0.5, 0.5, 1.5, 10, 37.5]  # half the height of each ring
 
 
 def load_ring_data(market, hours=8):
-    """Fetch ring depth + mid price from agg parquet via DuckDB (Node.js)."""
+    """[LEGACY — no callers] Fetch ring depth + mid price from agg parquet via DuckDB (Node.js).
+
+    This function reads ``data/agg/{market}.parquet`` (which no longer exists).
+    The production chart path uses ``load_snapshot_heatmap()`` + ``chart_snapshot_heatmap()``
+    instead.  This function is retained only as a diagnostic reference.
+    """
     cutoff_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000) - hours * 3600 * 1000
     tmp_path = os.path.join(BASE_DIR, 'tmp_heatmap_export.json')
 
@@ -122,9 +127,10 @@ def load_ring_data(market, hours=8):
 
 
 def make_heatmap(df, ax, ring_col, label, cmap='RdYlGn_r', vmax=None):
-    """Draw bid/ask heatmap for one side.
+    """[LEGACY — no callers] Draw bid/ask heatmap for one side.
 
-    Y axis = bps distance from mid (bid side inverted to show below mid).
+    Only called by ``chart_single()`` (also LEGACY).  The production heatmap
+    rendering lives in ``chart_snapshot_heatmap()``.
     """
     times = df['ts'].values
     n = len(times)
@@ -249,7 +255,11 @@ def make_heatmap(df, ax, ring_col, label, cmap='RdYlGn_r', vmax=None):
 
 
 def chart_single(df, market, out_path, hours):
-    """Generate single-market order heatmap."""
+    """[LEGACY — no callers] Generate single-market order heatmap.
+
+    This function uses the old ring-depth parquet path via ``make_heatmap()``.
+    Production rendering goes through ``chart_snapshot_heatmap()``.
+    """
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(16, 7),
         gridspec_kw={'height_ratios': [1, 4]},
