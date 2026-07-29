@@ -6,6 +6,7 @@
       "wsUrl": "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@depth@100ms",
       "restUrl": "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000",
       "depthLimit": 0,
+      "raw_snapshot_interval_ms": 0,
       "marketData": {
         "ohlcv": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1",
         "ticker": "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
@@ -17,6 +18,7 @@
       "wsUrl": "wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@depth@100ms/btcusdt@forceOrder",
       "restUrl": "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000",
       "depthLimit": 0,
+      "raw_snapshot_interval_ms": 0,
       "marketData": {
         "ohlcv": "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=1",
         "ticker": "https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT",
@@ -87,6 +89,7 @@
       "wsUrl": "wss://fstream.binance.com/stream?streams=btcusdc@trade/btcusdc@depth@100ms/btcusdc@forceOrder",
       "restUrl": "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDC&limit=1000",
       "depthLimit": 0,
+      "raw_snapshot_interval_ms": 0,
       "marketData": {
         "ohlcv": "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDC&interval=1m&limit=1",
         "ticker": "https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDC"
@@ -96,8 +99,9 @@
       "enabled": true,
       "symbol": "BTCUSDC",
       "wsUrl": "wss://stream.binance.com:9443/stream?streams=btcusdc@trade/btcusdc@depth@100ms",
-      "restUrl": "https://api.binance.com/api/v3/depth?symbol=BTCUSDC&limit=5000",
+      "restUrl": "https://api.binance.com/api/v3/depth?symbol=BTCUSDC&limit=1000",
       "depthLimit": 0,
+      "raw_snapshot_interval_ms": 0,
       "marketData": {
         "ohlcv": "https://api.binance.com/api/v3/klines?symbol=BTCUSDC&interval=1m&limit=1",
         "ticker": "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDC"
@@ -182,6 +186,7 @@
   },
   "output": {
     "base_path": "data/live_v3",
+    "raw_storage": "sqlite",
     "flush_trades_ms": 200,
     "flush_book_ms": 1000,
     "flush_health_ms": 1000,

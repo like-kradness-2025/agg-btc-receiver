@@ -61,4 +61,38 @@ describe('BitstampConnector parser', () => {
 
     assert.strictEqual(emitted, false);
   });
+
+  it('seeds a complete book from REST and replays buffered WS diffs', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        bids: [['65000', '1.0']],
+        asks: [['65001', '2.0']],
+      }),
+    });
+    try {
+      const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
+      conn._setState('connected');
+      const emitted = [];
+      conn.on('depth', (event) => emitted.push(event));
+
+      const sync = conn._syncBook();
+      conn._onMessage({
+        event: 'data',
+        channel: 'diff_order_book_btcusd',
+        data: { bids: [['65000', '1.5']], asks: [['65001', '0']], microtimestamp: '1700000000' },
+      });
+      await sync;
+
+      assert.strictEqual(emitted[0].type, 'snapshot');
+      assert.strictEqual(emitted[0].snapshot_origin, 'rest_sync');
+      assert.strictEqual(emitted[1].type, 'update');
+      assert.strictEqual(conn.book.bids.get('65000'), '1.5');
+      assert.strictEqual(conn.book.asks.has('65001'), false);
+      assert.strictEqual(conn.getState(), 'running');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

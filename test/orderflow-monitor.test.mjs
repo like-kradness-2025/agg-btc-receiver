@@ -6,7 +6,7 @@
 //   (3) Worker exits before ready → fail-closed
 //   (4) All workers already ready → instant return
 //
-// Section 2: P0-1 regression — worker init connect reject → no ready
+// Section 2: P0-1 regression — one market connect reject → degraded + ready
 //
 // Section 3: Subprocess entrypoint tests — invokes real orderflow_monitor.mjs
 //   via spawnSync for --help, missing config, malformed JSON, output isolation,
@@ -176,7 +176,7 @@ describe('OrderflowMonitor fail-closed startup', () => {
 
   // ── Section 2: P0-1 regression ─────────────────────────────────────────
 
-  describe('P0-1 regression: worker init connect reject → no ready', () => {
+  describe('P0-1 regression: worker init connect reject is market-local', () => {
 
     it('startupFailed triggered by IPC message', () => {
       // Simulate what main() does when worker sends startupFailed IPC
@@ -193,34 +193,34 @@ describe('OrderflowMonitor fail-closed startup', () => {
       assert.strictEqual(readyWorkers.has('A'), false);
     });
 
-    it('startupFailed exits non-zero and does NOT send ready when connect rejects', () => {
-      // This verifies the contract: when connectMarket throws,
-      //   - startupFailed IPC is sent (msg.type === 'startupFailed')
-      //   - process.exit(1) is called (non-zero)
-      //   - 'ready' is NOT sent
+    it('one failed market emits degraded, schedules retry, and still sends ready', () => {
       const messages = [];
+      const markets = ['healthy_market', 'binance_perp'];
+      const connectResults = new Map([
+        ['healthy_market', 'connected'],
+        ['binance_perp', new Error('init sync failed after 3 retries')],
+      ]);
 
-      // Simulate connectMarket throwing
-      const connectFailed = true;
-
-      // Simulate what doInit does on failure
-      if (connectFailed) {
-        messages.push({ type: 'startupFailed', workerId: 'test-worker', market: 'test_market', reason: 'connect ECONNREFUSED' });
-        // process.exit(1) — simulated as non-zero flag
-        const exitCode = 1;
-        assert.strictEqual(exitCode, 1);
-      } else {
-        messages.push({ type: 'ready', workerId: 'test-worker' });
+      // Simulate the worker's market-local connect loop. A connect/sync
+      // failure is not a worker startup failure; it is retried in background.
+      for (const market of markets) {
+        const result = connectResults.get(market);
+        if (result instanceof Error) {
+          messages.push({
+            type: 'marketDegraded',
+            workerId: 'test-worker',
+            market,
+            reason: result.message,
+            retryDelayMs: 5 * 60 * 1000,
+          });
+        }
       }
+      messages.push({ type: 'ready', workerId: 'test-worker' });
 
-      // Assert: ready was NOT sent
-      const readyMsgs = messages.filter(m => m.type === 'ready');
-      assert.strictEqual(readyMsgs.length, 0, 'ready should NOT be sent on connect failure');
-
-      // Assert: startupFailed WAS sent
-      const failMsgs = messages.filter(m => m.type === 'startupFailed');
-      assert.strictEqual(failMsgs.length, 1, 'startupFailed should be sent');
-      assert.strictEqual(failMsgs[0].workerId, 'test-worker');
+      assert.equal(messages.filter(m => m.type === 'marketDegraded').length, 1);
+      assert.equal(messages.find(m => m.type === 'marketDegraded').market, 'binance_perp');
+      assert.equal(messages.filter(m => m.type === 'startupFailed').length, 0);
+      assert.equal(messages.filter(m => m.type === 'ready').length, 1);
     });
 
     it('all markets connect successfully → ready sent, no startupFailed', () => {
@@ -361,16 +361,17 @@ describe('orderflow_monitor entrypoint subprocess', () => {
     assert.strictEqual(stdout, '', 'stdout should be empty when config is invalid');
   });
 
-  it('valid config + --seconds 1 + no matching markets → exit 1 (no workers spawned)', () => {
-    // With --seconds 1 and --markets does_not_exist, no workers match any group.
-    // The monitor logs the condition and exits 1 (intentional).
+  it('valid config + unknown --markets value → exit 1 before worker spawn', () => {
+    // Unknown markets are rejected before group filtering so a typo cannot
+    // silently produce a ready receiver with no corresponding feed.
     const realConfig = path.join(PROJECT_ROOT, 'config.v3.json');
     assert.ok(fs.existsSync(realConfig), 'config.v3.json must exist');
+    const tmpOutput = path.join(os.tmpdir(), `btc-test-unknown-market-${process.pid}-${Date.now()}`);
 
-    const result = runMonitor(['--config', realConfig, '--seconds', '1', '--markets', 'does_not_exist']);
+    const result = runMonitor(['--config', realConfig, '--output', tmpOutput, '--seconds', '1', '--markets', 'does_not_exist']);
     const stderr = result.stderr.toString();
-    assert.ok(stderr.includes('no workers spawned'),
-      'stderr should mention no workers were spawned');
+    assert.ok(stderr.includes('unknown enabled market'),
+      'stderr should mention the unknown enabled market');
     assert.ok(!stderr.includes('Failed to load config'),
       'stderr should NOT contain config load error');
     assert.strictEqual(result.status, 1,
@@ -386,8 +387,9 @@ describe('orderflow_monitor entrypoint subprocess', () => {
     //   (b) stderr does NOT contain "Failed to load config" — proving load worked
     const realConfig = path.join(PROJECT_ROOT, 'config.v3.json');
     assert.ok(fs.existsSync(realConfig), 'config.v3.json must exist');
+    const tmpOutput = path.join(os.tmpdir(), `btc-test-load-step-${process.pid}-${Date.now()}`);
 
-    const result = runMonitor(['--config', realConfig, '--seconds', '0', '--markets', 'does_not_exist']);
+    const result = runMonitor(['--config', realConfig, '--output', tmpOutput, '--seconds', '0', '--markets', 'does_not_exist']);
     // Exit 1 is expected because no markets match any group -> no workers spawned
     const stderr = result.stderr.toString();
     assert.ok(!stderr.includes('Failed to load config'),

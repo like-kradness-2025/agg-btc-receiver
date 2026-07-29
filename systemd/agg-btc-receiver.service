@@ -1,0 +1,18 @@
+[Unit]
+Description=agg-btc-receiver raw market data receiver (SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/weed420/Tool/agg-btc-receiver
+ExecStart=/usr/bin/node /home/weed420/Tool/agg-btc-receiver/orderflow_monitor.mjs --config /home/weed420/Tool/agg-btc-receiver/config.v3.json --storage sqlite --database-dir /home/weed420/Tool/agg-btc-receiver/data/sqlite --output /home/weed420/Tool/agg-btc-receiver/data/live_sqlite --retention-days 90 --optional-markets kraken_spot,binance_spot,binance_spot_usdc --seconds 0
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Environment=NODE_ENV=production
+Nice=0
+
+[Install]
+WantedBy=default.target

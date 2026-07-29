@@ -221,6 +221,37 @@ describe('BybitConnector parser', () => {
 // ====== Kraken ======
 
 describe('KrakenSpotConnector parser', () => {
+  it('calculates the documented v1 checksum token normalization', () => {
+    const conn = new KrakenSpotConnectorAlias({});
+    const asks = [
+      ['0.05005', '0.00000500'], ['0.05010', '0.00000500'],
+      ['0.05015', '0.00000500'], ['0.05020', '0.00000500'],
+      ['0.05025', '0.00000500'], ['0.05030', '0.00000500'],
+      ['0.05035', '0.00000500'], ['0.05040', '0.00000500'],
+      ['0.05045', '0.00000500'], ['0.05050', '0.00000500'],
+    ];
+    const bids = [
+      ['0.05000', '0.00000500'], ['0.04995', '0.00000500'],
+      ['0.04990', '0.00000500'], ['0.04980', '0.00000500'],
+      ['0.04975', '0.00000500'], ['0.04970', '0.00000500'],
+      ['0.04965', '0.00000500'], ['0.04960', '0.00000500'],
+      ['0.04955', '0.00000500'], ['0.04950', '0.00000500'],
+    ];
+    conn.book.applySnapshot(bids, asks);
+    assert.strictEqual(calculateKrakenChecksum(conn.book), 974947235);
+  });
+
+  it('maintains the subscribed depth when an insert pushes the outer level out', () => {
+    const conn = new KrakenSpotConnectorAlias({ depthLimit: 2 });
+    conn.book.applySnapshot(
+      [['65000.0', '1.0'], ['64999.0', '1.0']],
+      [['65001.0', '1.0'], ['65002.0', '1.0']],
+    );
+    conn.book.applyDiff('ask', '65000.5', '1.0');
+    assert.deepStrictEqual(conn.book.getTop(3).asks, [['65000.5', '1.0'], ['65001.0', '1.0']]);
+    assert.strictEqual(conn.book.asks.has('65002.0'), false);
+  });
+
   it('should parse book snapshot, trade updates, and route messages', () => {
     const conn = new KrakenSpotConnectorAlias({});
     conn._ws = null;
@@ -244,6 +275,37 @@ describe('KrakenSpotConnector parser', () => {
 
     conn._onMessage([42, [['65010.0', '0.1', '1700000002.0', 'b', 'l', '']], 'trade', 'XBT/USD']);
     assert.strictEqual(tradeCount, 1);
+  });
+
+  it('should merge split a/b update objects and retain the trailing checksum', () => {
+    const conn = new KrakenSpotConnectorAlias({});
+    conn._ws = null;
+    conn._setState('running');
+    const bids = [];
+    const asks = [];
+    for (let i = 0; i < 10; i += 1) {
+      bids.push([String(65000 - i) + '.0', '1.0', '1700000000.0']);
+      asks.push([String(65001 + i) + '.0', '1.0', '1700000000.0']);
+    }
+    let updates = 0;
+    conn.on('depth', (event) => { if (event.type === 'update') updates += 1; });
+    conn._onMessage([42, { as: asks, bs: bids }, 'book-1000', 'XBT/USD']);
+    const expected = calculateKrakenChecksum(conn.book);
+    const after = new KrakenSpotConnectorAlias({});
+    after.book.applySnapshot(conn.book.toSnapshot().bids, conn.book.toSnapshot().asks);
+    after.book.applyDiffs('ask', [['65001.0', '2.0']]);
+    after.book.applyDiffs('bid', [['65000.0', '2.0']]);
+    conn._onMessage([
+      42,
+      { a: [['65001.0', '2.0', '1700000001.0']] },
+      { b: [['65000.0', '2.0', '1700000001.0']], c: String(calculateKrakenChecksum(after.book)) },
+      'book-1000',
+      'XBT/USD',
+    ]);
+    assert.notStrictEqual(expected, calculateKrakenChecksum(after.book));
+    assert.strictEqual(updates, 1);
+    assert.strictEqual(conn.book.bids.get('65000.0'), '2.0');
+    assert.strictEqual(conn.book.asks.get('65001.0'), '2.0');
   });
 
   it('should convert Kraken trade timestamps from seconds to ms', () => {
@@ -343,6 +405,24 @@ describe('KrakenSpotConnector parser', () => {
     assert.strictEqual(conn.book.isEmpty(), false); // book intact
   });
 
+  it('should reject malformed checksum values instead of ignoring them', () => {
+    const conn = new KrakenSpotConnectorAlias({});
+    conn._ws = { close: () => {} };
+    conn._scheduleReconnect = () => {};
+    let error = null;
+    conn.on('error', (ev) => { error = ev; });
+    const tenBids = [];
+    const tenAsks = [];
+    for (let i = 0; i < 10; i++) {
+      tenBids.push([String(65000 - i * 10) + '.0', '1.0', '1700000000.0']);
+      tenAsks.push([String(65001 + i * 10) + '.0', '1.0', '1700000000.0']);
+    }
+    conn._onMessage([42, { as: tenAsks, bs: tenBids }, 'book-10', 'XBT/USD']);
+    conn._onMessage([42, { a: [['65001.0', '2.0']], c: 'not-a-crc' }, 'book-10', 'XBT/USD']);
+    assert.match(error.message, /invalid checksum value/);
+    assert.strictEqual(conn.book.isEmpty(), true);
+  });
+
   // Persistent mismatches should NOT cause infinite reconnect loop
   it('should not infinite-reconnect on persistent checksum mismatch', () => {
     const conn = new KrakenSpotConnectorAlias({});
@@ -374,7 +454,7 @@ describe('KrakenSpotConnector parser', () => {
     assert.strictEqual(conn.book.isEmpty(), true); // book cleared on resync
   });
 
-  it('should NOT reset checksum cooldown on snapshot — prevents reconnect storm', () => {
+  it('should resync every checksum mismatch and never emit invalid depth', () => {
     const conn = new KrakenSpotConnectorAlias({});
     conn._ws = { close: () => {} };
     let reconnectCount = 0;
@@ -396,13 +476,12 @@ describe('KrakenSpotConnector parser', () => {
     assert.strictEqual(reconnectCount, 1);
     assert.strictEqual(errorCount, 1);
 
-    // A fresh snapshot must NOT reset the mismatch cooldown — otherwise every
-    // reconnect would bypass the 30s suppression window and cause a reconnect storm.
+    // A fresh snapshot starts a new valid book; a later mismatch is still
+    // fail-closed and must trigger another resync.
     conn._handleBookSnapshot({ as: tenAsks, bs: tenBids });
     conn._onMessage([42, { a: [['65001.0', '3.0']], c: '2' }, 'book-10', 'XBT/USD']);
-    // Cooldown still active → mismatch suppressed → no additional reconnect
-    assert.strictEqual(reconnectCount, 1);
-    assert.strictEqual(errorCount, 1);
+    assert.strictEqual(reconnectCount, 2);
+    assert.strictEqual(errorCount, 2);
   });
 
   it('should fall back to the first REST depth key when pair key is missing', async () => {
@@ -729,6 +808,30 @@ describe('CoinbaseConnector parser', () => {
       assert.strictEqual(conn.book.getBestBid(), '65000.00');
       assert.strictEqual(conn.book.getBestAsk(), '65001.00');
       assert.strictEqual(conn.book.asks.size, 1);
+    });
+
+    it('should not use the REST fallback sequence as the WS cursor', async () => {
+      const conn = createCoinbaseConn();
+      conn._waitForWsSnapshot = async () => {
+        const error = new Error('timeout');
+        error.code = 'WS_SNAPSHOT_TIMEOUT';
+        throw error;
+      };
+      conn._fetchSnapshot = async () => ({
+        bids: [['65000.0', '1.5', 1]],
+        asks: [['65001.0', '0.8', 1]],
+        sequence: 133094683132,
+      });
+      conn._notifyWsSnapshotReceived = () => {};
+      conn._finalizeWsSnapshotSync = () => {};
+      const emitted = [];
+      conn.on('depth', (event) => emitted.push(event));
+
+      await conn._syncBook();
+
+      assert.equal(emitted[0].snapshot_origin, 'rest_fallback');
+      assert.equal(emitted[0].seq, null);
+      assert.equal(conn.book._lastSeq, null);
     });
   });
 
