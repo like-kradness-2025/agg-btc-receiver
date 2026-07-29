@@ -32,6 +32,11 @@ verify_*.py
 # Backups
 *.bak
 
+# Local runtime logs and agent artifacts
+logs/
+.hermes/
+.codex/
+
 # Environment
 .venv/
 __pycache__/
