@@ -118,6 +118,16 @@ describe('toCanonicalBookEnvelope', () => {
     assert.deepEqual(env.envelope.asks, []);
   });
 
+  it('normalizes empty quantity strings to zero level deletions', () => {
+    const raw = validUpdateEvent();
+    raw.bids = [['50005', '']];
+    raw.asks = [['50015', '']];
+    const env = toCanonicalBookEnvelope(raw);
+    assert.equal(env.valid, true);
+    assert.deepEqual(env.envelope.bids, [['50005', '0']]);
+    assert.deepEqual(env.envelope.asks, [['50015', '0']]);
+  });
+
   // ── Fail-closed: type validation ──
 
   it('rejects null input', () => {

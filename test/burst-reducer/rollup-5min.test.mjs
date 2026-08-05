@@ -26,6 +26,24 @@ function makeRows({ start = START, market = MARKET, empty = false } = {}) {
     max_burst_notional_mean_30s: empty ? 0 : i + 0.5,
     max_burst_prints_max_30s: empty ? 0 : (i % 3) + 1,
     max_burst_duration_max_30s: empty ? 0 : (i === 7 ? 999 : i * 50),
+    trade_open_30s: empty ? null : 10_000 + i,
+    trade_high_30s: empty ? null : 10_000 + i + 0.5,
+    trade_low_30s: empty ? null : 9_999.5 + i,
+    trade_close_30s: empty ? null : 10_000 + i + 0.25,
+    trade_count_30s: empty ? 0 : (i + 1) * 30,
+    buy_trade_count_30s: empty ? 0 : i * 30,
+    sell_trade_count_30s: empty ? 0 : 30,
+    traded_qty_30s: empty ? 0 : (i + 1) * 60,
+    traded_notional_30s: empty ? 0 : (i + 1) * 300,
+    buy_qty_30s: empty ? 0 : (i + 1) * 30,
+    sell_qty_30s: empty ? 0 : (i + 1) * 30,
+    buy_notional_30s: empty ? 0 : (i + 1) * 180,
+    sell_notional_30s: empty ? 0 : (i + 1) * 120,
+    signed_volume_30s: empty ? 0 : 0,
+    signed_notional_30s: empty ? 0 : (i + 1) * 60,
+    max_trade_notional_30s: empty ? 0 : (i + 1) * 10,
+    large_trade_count_30s: empty ? 0 : i % 2,
+    large_trade_notional_30s: empty ? 0 : (i % 2) * (i + 1) * 20,
     _quality: {
       source_layer: 'features_30s',
       input_block_ids: [SOURCE_BLOCK],
@@ -60,6 +78,31 @@ describe('P3-C1 pure 5min summary', () => {
       max_burst_notional_mean_5min: 'mean',
       max_burst_prints_max_5min: 'max',
       max_burst_duration_max_5min: 'max',
+      trade_count_5min: 'sum',
+      buy_trade_count_5min: 'sum',
+      sell_trade_count_5min: 'sum',
+      traded_qty_5min: 'sum',
+      traded_notional_5min: 'sum',
+      buy_qty_5min: 'sum',
+      sell_qty_5min: 'sum',
+      buy_notional_5min: 'sum',
+      sell_notional_5min: 'sum',
+      signed_volume_5min: 'sum',
+      signed_notional_5min: 'sum',
+      max_trade_notional_5min: 'max',
+      large_trade_count_5min: 'sum',
+      large_trade_notional_5min: 'sum',
+      trade_imbalance_qty_5min: 'recompute',
+      trade_imbalance_notional_5min: 'recompute',
+      mean_trade_notional_5min: 'recompute',
+      large_trade_notional_share_5min: 'recompute',
+      trade_open_5min: 'first',
+      trade_high_5min: 'max',
+      trade_low_5min: 'min',
+      trade_close_5min: 'last',
+      ofi_5min: 'sum', bid_add_qty_5min: 'sum', bid_cancel_qty_5min: 'sum',
+      ask_add_qty_5min: 'sum', ask_cancel_qty_5min: 'sum',
+      replenishment_qty_5min: 'sum', pulling_qty_5min: 'sum',
     });
     assert.deepEqual(FIVEMIN_FIELDS, Object.keys(FIVEMIN_FIELD_OPERATORS));
   });
@@ -88,6 +131,10 @@ describe('P3-C1 pure 5min summary', () => {
     assert.equal(result.max_burst_prints_max_5min, 3);
     // max_burst_duration_max_30s: 0,50,100,150,200,250,300,999,400,450 → max=999
     assert.equal(result.max_burst_duration_max_5min, 999);
+    assert.equal(result.trade_open_5min, 10_000);
+    assert.equal(result.trade_high_5min, 10_009.5);
+    assert.equal(result.trade_low_5min, 9_999.5);
+    assert.equal(result.trade_close_5min, 10_009.25);
   });
 
   it('keeps overlap exposure explicitly separate and emits no direct/recompute masquerade', () => {
@@ -216,6 +263,7 @@ describe('P3-C1 pure 5min summary', () => {
     assert.equal(output.length, 1);
     assert.deepEqual(Object.keys(output[0]).sort(), [
       '_quality',
+      'ask_add_qty_5min', 'ask_cancel_qty_5min', 'bid_add_qty_5min', 'bid_cancel_qty_5min',
       'burst_count_max_5min',
       'burst_count_mean_5min',
       'burst_notional_overlap_max_5min',
@@ -225,6 +273,29 @@ describe('P3-C1 pure 5min summary', () => {
       'max_burst_notional_max_5min',
       'max_burst_notional_mean_5min',
       'max_burst_prints_max_5min',
+      'trade_count_5min',
+      'buy_trade_count_5min',
+      'sell_trade_count_5min',
+      'traded_qty_5min',
+      'traded_notional_5min',
+      'buy_qty_5min',
+      'sell_qty_5min',
+      'buy_notional_5min',
+      'sell_notional_5min',
+      'signed_volume_5min',
+      'signed_notional_5min',
+      'max_trade_notional_5min',
+      'large_trade_count_5min',
+      'large_trade_notional_5min',
+      'trade_imbalance_qty_5min',
+      'trade_imbalance_notional_5min',
+      'mean_trade_notional_5min',
+      'large_trade_notional_share_5min',
+      'trade_open_5min',
+      'trade_high_5min',
+      'trade_low_5min',
+      'trade_close_5min',
+      'ofi_5min', 'pulling_qty_5min', 'replenishment_qty_5min',
       'market',
       'ts',
     ].sort());

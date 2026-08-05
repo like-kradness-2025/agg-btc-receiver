@@ -1,0 +1,25 @@
+# Staged opt-in unit. This file is intentionally not installed or enabled by
+# repository changes; use it only after reviewing the host's active timers.
+[Unit]
+Description=agg-btc-receiver guarded raw cleanup
+After=agg-btc-receiver.service
+RequiresMountsFor=/home/weed420/Tool/agg-btc-receiver
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/weed420/Tool/agg-btc-receiver
+Environment=MAINTENANCE_LOCK_FILE=/home/weed420/Tool/agg-btc-receiver/data/live_v4/state/maintenance.lock
+ExecStart=/home/weed420/Tool/agg-btc-receiver/scripts/with-maintenance-lock.sh -- /home/weed420/Tool/agg-btc-receiver/scripts/run-cleanup-raw.sh
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryAccounting=true
+MemoryHigh=1536M
+MemoryMax=2G
+TasksAccounting=true
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+OOMScoreAdjust=500

@@ -134,7 +134,7 @@
       "depthLimit": 0
     },
     "crypto_com_spot": {
-      "enabled": true,
+      "enabled": false,
       "symbol": "BTC_USD",
       "wsUrl": "wss://stream.crypto.com/exchange/v1/market",
       "restUrl": "",

@@ -8,6 +8,9 @@ import {
   FEATURE_1S_FIELDS,
   ROW_ENVELOPE_FIELDS,
   createBaseRow,
+  P0_TRADE_FLOW_FIELDS,
+  P1_BOOK_FLOW_FIELDS,
+  P2_TRADE_BOOK_FIELDS,
   PHASE1_FIELDS,
   BOOK_DEPENDENT_FIELDS,
   RESEARCH_FIELDS,
@@ -27,22 +30,27 @@ describe('Schema / contract', () => {
     assert.equal(MAX_BURST_DURATION_MS, 5000);
   });
 
-  it('FEATURE_1S_FIELDS has exactly 35 logical feature columns (#1-#22 + B1-B9 book + B4 board_* fields)', () => {
-    assert.equal(FEATURE_1S_FIELDS.length, 35);
+  it('FEATURE_1S_FIELDS includes the 29 Phase 0 raw-trade fields', () => {
+    assert.equal(FEATURE_1S_FIELDS.length, 83);
+    const p0Start = FEATURE_1S_FIELDS.indexOf(P0_TRADE_FLOW_FIELDS[0]);
+    assert.deepEqual(FEATURE_1S_FIELDS.slice(p0Start, p0Start + P0_TRADE_FLOW_FIELDS.length), P0_TRADE_FLOW_FIELDS);
+    const p1Start = FEATURE_1S_FIELDS.indexOf(P1_BOOK_FLOW_FIELDS[0]);
+    assert.deepEqual(FEATURE_1S_FIELDS.slice(p1Start, p1Start + P1_BOOK_FLOW_FIELDS.length), P1_BOOK_FLOW_FIELDS);
+    assert.deepEqual(FEATURE_1S_FIELDS.slice(-P2_TRADE_BOOK_FIELDS.length), P2_TRADE_BOOK_FIELDS);
   });
 
   it('ROW_ENVELOPE_FIELDS are ts, market, _quality', () => {
     assert.deepEqual(ROW_ENVELOPE_FIELDS, ['ts', 'market', '_quality']);
   });
 
-  it('createBaseRow produces 38 physical JSON top-level keys', () => {
+  it('createBaseRow produces 86 physical JSON top-level keys', () => {
     const row = createBaseRow(1000, 'test', {
       book_seeded: false,
       trade_count_this_second: 0,
       warmup: true,
       input_block_ids: [],
     });
-    assert.equal(Object.keys(row).length, 38);
+    assert.equal(Object.keys(row).length, 86);
   });
 
   it('createBaseRow has correct P1 contract values', () => {

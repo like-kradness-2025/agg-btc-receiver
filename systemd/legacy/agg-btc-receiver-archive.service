@@ -1,0 +1,19 @@
+[Unit]
+Description=agg-btc-receiver daily raw-v4 Parquet archive
+After=agg-btc-receiver.service
+RequiresMountsFor=/home/weed420/Tool/agg-btc-receiver
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/weed420/Tool/agg-btc-receiver
+ExecStart=/home/weed420/Tool/agg-btc-receiver/scripts/run-archive-raw-v4.sh
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryAccounting=true
+MemoryHigh=1536M
+MemoryMax=2G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+TimeoutStartSec=0

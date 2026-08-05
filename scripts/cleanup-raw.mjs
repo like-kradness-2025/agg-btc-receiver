@@ -25,6 +25,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -33,8 +35,12 @@ const FOOTPRINT_MS = 300000; // 5-minute window
 const SEC_MS = 1000;
 const DEFAULT_DATA_DIR = 'data/live_v3';
 const DEFAULT_FEATURES_DIR = 'data/1s_features';
-const DEFAULT_DERIVED_DIR = 'data/derived/burst_features_v1';
+const DEFAULT_DERIVED_DIR = 'data/derived/burst_features_v2';
 const DEFAULT_SAFETY_MARGIN_SEC = 300;
+const V4_SAFETY_MARGIN_SEC = 24 * 60 * 60;
+const SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const V4_SEGMENT_RE = /^\d{2}-\d+\.jsonl(?:\.active)?$/;
+const HASH_CHUNK_BYTES = 64 * 1024; // fixed-size chunk for SHA-256 streaming
 
 const RAW_KINDS = ['trades', 'book_updates'];
 
@@ -46,10 +52,15 @@ function parseArgs() {
     data: DEFAULT_DATA_DIR,
     features: DEFAULT_FEATURES_DIR,
     safetyMarginSec: DEFAULT_SAFETY_MARGIN_SEC,
+    safetyMarginExplicit: false,
     dryRun: false,
     verbose: false,
     derived: DEFAULT_DERIVED_DIR,
     tfpMode: true,
+    rawLayout: 'auto',
+    rawLayoutExplicit: false,
+    consumerCursors: null,
+    consumerManifests: null,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -63,6 +74,7 @@ function parseArgs() {
       case '--features':
         opts.features = next;
         opts.tfpMode = false;
+        if (!opts.rawLayoutExplicit) opts.rawLayout = 'v3';
         i++;
         break;
       case '--derived':
@@ -71,9 +83,36 @@ function parseArgs() {
         break;
       case '--legacy-features':
         opts.tfpMode = false;
+        if (!opts.rawLayoutExplicit) opts.rawLayout = 'v3';
+        break;
+      case '--raw-layout':
+        if (!['auto', 'v3', 'v4'].includes(next)) {
+          console.error(`Invalid --raw-layout: ${next} (expected auto, v3, or v4)`);
+          process.exit(1);
+        }
+        opts.rawLayout = next;
+        opts.rawLayoutExplicit = true;
+        i++;
+        break;
+      case '--v3':
+        opts.rawLayout = 'v3';
+        opts.rawLayoutExplicit = true;
+        break;
+      case '--v4':
+        opts.rawLayout = 'v4';
+        opts.rawLayoutExplicit = true;
+        break;
+      case '--consumer-cursors':
+        opts.consumerCursors = next;
+        i++;
+        break;
+      case '--consumer-manifests':
+        opts.consumerManifests = next;
+        i++;
         break;
       case '--safety-margin':
         opts.safetyMarginSec = parseInt(next, 10);
+        opts.safetyMarginExplicit = true;
         i++;
         break;
       case '--dry-run':
@@ -92,10 +131,13 @@ Usage:
 
 Options:
   --data <path>          Raw data directory (default: ${DEFAULT_DATA_DIR})
+  --raw-layout <mode>    Raw layout: auto, v3, or v4 (v4 is opt-in; auto detects segments)
   --features <path>      1s features directory (legacy mode, default: ${DEFAULT_FEATURES_DIR})
   --derived <path>       TFP derived root (default: ${DEFAULT_DERIVED_DIR})
   --legacy-features      Use legacy timestamp-only verification
-  --safety-margin <s>    Seconds before a file is eligible for deletion (default: ${DEFAULT_SAFETY_MARGIN_SEC})
+  --consumer-cursors <path>    v4 consumer cursor proof root
+  --consumer-manifests <path>  v4 consumer manifest proof root
+  --safety-margin <s>    Seconds before a file is eligible for deletion (default: ${DEFAULT_SAFETY_MARGIN_SEC}; v4 default: ${V4_SAFETY_MARGIN_SEC})
   --dry-run              Show what would be deleted without actually deleting
   --verbose              Print per-file skip/delete decisions
   --help                 Show this help
@@ -267,6 +309,277 @@ function discoverMarkets(dataDir) {
   return Array.from(markets).sort();
 }
 
+function isV4SegmentName(name) {
+  return V4_SEGMENT_RE.test(name);
+}
+
+/** Detect v4 without changing the v3 default when no v4 segment exists. */
+export function detectRawLayout(dataDir) {
+  for (const kind of RAW_KINDS) {
+    const kindDir = path.join(dataDir, kind);
+    if (!fs.existsSync(kindDir)) continue;
+    const markets = fs.readdirSync(kindDir, { withFileTypes: true });
+    for (const marketEntry of markets) {
+      if (!marketEntry.isDirectory()) continue;
+      const marketDir = path.join(kindDir, marketEntry.name);
+      for (const dateEntry of fs.readdirSync(marketDir, { withFileTypes: true })) {
+        if (!dateEntry.isDirectory()) continue;
+        if (fs.readdirSync(path.join(marketDir, dateEntry.name)).some(isV4SegmentName)) return 'v4';
+      }
+    }
+  }
+  return 'v3';
+}
+
+/** Discover immutable and active v4 segments; callers must never delete active ones. */
+export function discoverV4Segments(dataDir) {
+  const results = [];
+  for (const kind of RAW_KINDS) {
+    const kindDir = path.join(dataDir, kind);
+    if (!fs.existsSync(kindDir)) continue;
+    for (const marketEntry of fs.readdirSync(kindDir, { withFileTypes: true })) {
+      if (!marketEntry.isDirectory()) continue;
+      const marketDir = path.join(kindDir, marketEntry.name);
+      for (const dateEntry of fs.readdirSync(marketDir, { withFileTypes: true })) {
+        if (!dateEntry.isDirectory() || !/^\d{4}-\d{2}-\d{2}$/.test(dateEntry.name)) continue;
+        const dateDir = path.join(marketDir, dateEntry.name);
+        for (const name of fs.readdirSync(dateDir)) {
+          if (!isV4SegmentName(name)) continue;
+          results.push({
+            fullPath: path.join(dateDir, name),
+            market: marketEntry.name,
+            kind,
+            dateDir: dateEntry.name,
+            segmentName: name,
+            active: name.endsWith('.active'),
+          });
+        }
+      }
+    }
+  }
+  return results.sort((a, b) => a.fullPath.localeCompare(b.fullPath));
+}
+
+function proofRoots(value) {
+  return (Array.isArray(value) ? value : [value]).filter(Boolean).map((root) => path.resolve(root));
+}
+
+function sha256File(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.alloc(HASH_CHUNK_BYTES);
+    let bytesRead;
+    while ((bytesRead = fs.readSync(fd, buffer, 0, HASH_CHUNK_BYTES, null)) > 0) {
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    return hash.digest('hex');
+  } catch (_) {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
+function sha256FilePrefix(filePath, prefixSize) {
+  if (!Number.isSafeInteger(prefixSize) || prefixSize < 0) return null;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.alloc(HASH_CHUNK_BYTES);
+    let offset = 0;
+    while (offset < prefixSize) {
+      const bytesRead = fs.readSync(fd, buffer, 0, Math.min(HASH_CHUNK_BYTES, prefixSize - offset), offset);
+      if (bytesRead === 0) return null;
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    return hash.digest('hex');
+  } catch (_) {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
+function proofFiles(roots) {
+  const files = [];
+  const walk = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else if (/\.json(?:l)?$/.test(entry.name)) files.push(file);
+    }
+  };
+  for (const root of proofRoots(roots)) {
+    if (fs.existsSync(root) && fs.statSync(root).isDirectory()) walk(root);
+    else if (fs.existsSync(root)) files.push(root);
+  }
+  return files;
+}
+
+function parseProofFile(filePath) {
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return [{ value, filePath }];
+  } catch (_) {
+    return [];
+  }
+}
+
+function sourcePathMatches(value, segment) {
+  const expected = path.resolve(segment.fullPath).replaceAll(path.sep, '/');
+  const suffix = `/${segment.kind}/${segment.market}/${segment.dateDir}/${segment.segmentName}`;
+  if (typeof value !== 'string') return false;
+  const normalized = value.replaceAll('\\', '/');
+  const stripActive = (name) => name.endsWith('.active') ? name.slice(0, -'.active'.length) : name;
+  const normalizedComparable = stripActive(normalized);
+  const expectedComparable = stripActive(expected);
+  if (normalizedComparable === expectedComparable) return true;
+  const logicalSuffix = stripActive(suffix).replace(/^\//, '');
+  return normalizedComparable === logicalSuffix || normalizedComparable.endsWith(`/${logicalSuffix}`);
+}
+
+function objectHasSource(value, segment, inheritedKey = '') {
+  if (!value || typeof value !== 'object') return sourcePathMatches(inheritedKey, segment);
+  if (Array.isArray(value)) return value.some((item) => objectHasSource(item, segment, inheritedKey));
+  for (const [key, child] of Object.entries(value)) {
+    if (/source|input|segment|file|path/i.test(key) && typeof child === 'string' && sourcePathMatches(child, segment)) return true;
+    if (objectHasSource(child, segment, key)) return true;
+  }
+  return sourcePathMatches(inheritedKey, segment);
+}
+
+function valuesForKeys(value, pattern, out = []) {
+  if (!value || typeof value !== 'object') return out;
+  if (Array.isArray(value)) {
+    for (const item of value) valuesForKeys(item, pattern, out);
+    return out;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (pattern.test(key)) out.push(child);
+    valuesForKeys(child, pattern, out);
+  }
+  return out;
+}
+
+function proofRecords(roots) {
+  return proofFiles(roots).flatMap((filePath) => parseProofFile(filePath));
+}
+
+function hashValues(record) {
+  return valuesForKeys(record.value, /^(?:source|input|raw|content)?_?sha256$|^(?:source|content|file)_hash$/i)
+    .filter((value) => typeof value === 'string' && value.length > 0);
+}
+
+function prefixProofs(value, out = []) {
+  if (!value || typeof value !== 'object') return out;
+  if (Array.isArray(value)) {
+    for (const item of value) prefixProofs(item, out);
+    return out;
+  }
+  const size = Object.entries(value).find(([key]) => /^source_?prefix_?(?:size|bytes)$/i.test(key))?.[1];
+  const hash = Object.entries(value).find(([key]) => /^source_?prefix_?(?:sha256|hash)$/i.test(key))?.[1];
+  const end = Object.entries(value).find(([key]) => /^(?:byte_?)?offset_?end$/i.test(key))?.[1];
+  if (size !== undefined && typeof hash === 'string') out.push({ size: Number(size), hash, end: Number(end) });
+  for (const child of Object.values(value)) prefixProofs(child, out);
+  return out;
+}
+
+function cursorRecordCoversSegment(record, segment, byteLength, fileHash) {
+  if (!objectHasSource(record.value, segment, path.basename(record.filePath))) return false;
+  const offsets = valuesForKeys(record.value, /^(?:byte_)?offset$|^(?:consumed|end|last_byte)_offset$|^(?:consumed|processed)_bytes$/i)
+    .map(Number).filter(Number.isSafeInteger);
+  if (!offsets.some((offset) => offset >= byteLength)) return false;
+  const partials = valuesForKeys(record.value, /^partial_line(?:_base64)?$/i);
+  if (!partials.every((partial) => partial === '' || partial === null || partial === undefined)) return false;
+  const hashes = hashValues(record);
+  if (hashes.length > 0 && !hashes.some((hash) => hash.toLowerCase() === fileHash)) {
+    const prefixVerified = prefixProofs(record.value).some(({ size, hash, end }) => (
+      Number.isSafeInteger(size)
+        && Number.isSafeInteger(end)
+        && size === end
+        && size >= 0
+        && size <= byteLength
+        && typeof hash === 'string'
+        && sha256FilePrefix(segment.fullPath, size) === hash.toLowerCase()
+    ));
+    if (!prefixVerified) return false;
+  }
+  return true;
+}
+
+function manifestRecordCommitsSegment(record, segment, byteLength, fileHash) {
+  if (!objectHasSource(record.value, segment, path.basename(record.filePath))) return false;
+  const statuses = valuesForKeys(record.value, /^status$/i).map((value) => String(value).toLowerCase());
+  const verified = valuesForKeys(record.value, /^(?:verified|committed|consumer_committed)$/i);
+  if (statuses.some((status) => ['intent', 'pending', 'failed', 'quarantined'].includes(status))) return false;
+  if (!statuses.some((status) => ['committed', 'complete', 'completed', 'verified'].includes(status))
+      && !verified.some((value) => value === true)) return false;
+  if (verified.some((value) => value === false)) return false;
+  const sizes = valuesForKeys(record.value, /^(?:source|input|raw)?_?(?:byte_)?(?:length|size|bytes)$/i)
+    .map(Number).filter(Number.isSafeInteger);
+  const hashes = hashValues(record);
+  if (sizes.every((size) => size === byteLength)
+      && hashes.length > 0
+      && hashes.some((hash) => hash.toLowerCase() === fileHash)) return true;
+
+  return prefixProofs(record.value).some(({ size, hash, end }) => (
+    Number.isSafeInteger(size)
+      && Number.isSafeInteger(end)
+      && size === end
+      && size >= 0
+      && size <= byteLength
+      && typeof hash === 'string'
+      && sha256FilePrefix(segment.fullPath, size) === hash.toLowerCase()
+  ));
+}
+
+/**
+ * Verify the v4 deletion evidence without mutating the segment.
+ * Both proofs are mandatory: every consumer cursor at EOF and a committed manifest.
+ */
+export function verifyV4ClosedSegment(segment, { cursorRoots = [], manifestRoots = [], quarantineCheckpointRoots = [] } = {}) {
+  const name = segment.segmentName || path.basename(segment.fullPath || '');
+  if (!segment.fullPath || name.endsWith('.active')) return { ok: false, reason: 'active-segment' };
+  if (!isV4SegmentName(name)) return { ok: false, reason: 'not-a-v4-segment' };
+  let stat;
+  try { stat = fs.statSync(segment.fullPath); } catch (_) { return { ok: false, reason: 'segment-missing' }; }
+  const fileHash = sha256File(segment.fullPath);
+  if (!fileHash) return { ok: false, reason: 'segment-hash-unavailable' };
+
+  const cursorRecords = proofRecords(cursorRoots);
+  const targetCursors = cursorRecords.filter((record) => objectHasSource(record.value, segment, path.basename(record.filePath)));
+  if (targetCursors.length === 0) return { ok: false, reason: 'missing-consumer-cursor-proof' };
+  if (!targetCursors.every((record) => cursorRecordCoversSegment(record, segment, stat.size, fileHash))) {
+    return { ok: false, reason: 'incomplete-consumer-cursor-proof' };
+  }
+
+  const manifestRecords = proofRecords(manifestRoots);
+  const targetManifests = manifestRecords.filter((record) => objectHasSource(record.value, segment, path.basename(record.filePath)));
+  if (targetManifests.length === 0) return { ok: false, reason: 'missing-consumer-manifest-proof' };
+  if (!targetManifests.some((record) => manifestRecordCommitsSegment(record, segment, stat.size, fileHash))) {
+    return { ok: false, reason: 'missing-consumer-manifest-proof' };
+  }
+
+  const qcRecords = proofRecords(quarantineCheckpointRoots);
+  const targetQc = qcRecords.filter((record) => objectHasSource(record.value, segment, path.basename(record.filePath)));
+  if (targetQc.length > 0) {
+    return { ok: false, reason: 'quarantine-or-checkpoint-reference' };
+  }
+
+  return { ok: true, cursor: true, manifest: true, byteLength: stat.size };
+}
+
 function loadTfpManifest(derivedDir, market) {
   const manifestPath = path.join(derivedDir, 'manifests', `${market}.json`);
   try {
@@ -407,6 +720,112 @@ function bookFileContainsSnapshot(filePath) {
   }
 }
 
+function cleanupSeedSnapshots(dataDir, nowMs, dryRun, verbose) {
+  const root = path.join(dataDir, 'snapshots');
+  if (!fs.existsSync(root)) return 0;
+  const cutoff = nowMs - SNAPSHOT_RETENTION_MS;
+  let deleted = 0;
+  for (const marketEntry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!marketEntry.isDirectory()) continue;
+    const marketDir = path.join(root, marketEntry.name);
+    for (const dateEntry of fs.readdirSync(marketDir, { withFileTypes: true })) {
+      if (!dateEntry.isDirectory()) continue;
+      const dateDir = path.join(marketDir, dateEntry.name);
+      for (const name of fs.readdirSync(dateDir)) {
+        if (!name.endsWith('.jsonl')) continue;
+        const file = path.join(dateDir, name);
+        let stat;
+        try { stat = fs.statSync(file); } catch { continue; }
+        if (stat.mtimeMs >= cutoff) continue;
+        if (dryRun) {
+          if (verbose) console.log(`  [DELETE] ${file} (seed snapshot retention)`);
+        } else {
+          try { fs.unlinkSync(file); } catch { continue; }
+        }
+        deleted++;
+      }
+      if (!dryRun && fs.readdirSync(dateDir).length === 0) fs.rmdirSync(dateDir);
+    }
+    if (!dryRun && fs.readdirSync(marketDir).length === 0) fs.rmdirSync(marketDir);
+  }
+  return deleted;
+}
+
+function resolvedProofRoots(opts, dataDir, derivedDir) {
+  const cursors = opts.consumerCursors
+    ? [path.resolve(opts.consumerCursors)]
+    : [path.join(dataDir, 'consumer-cursors'), path.join(dataDir, 'consumers', 'cursors'), path.join(derivedDir, 'consumer-cursors')];
+  const manifests = opts.consumerManifests
+    ? [path.resolve(opts.consumerManifests)]
+    : [path.join(dataDir, 'consumer-manifests'), path.join(dataDir, 'consumers', 'manifests'), path.join(derivedDir, 'consumer-manifests')];
+  const quarantineCheckpoint = [
+    path.join(dataDir, 'quarantine'),
+    path.join(dataDir, 'checkpoints'),
+    path.join(derivedDir, 'quarantine'),
+    path.join(derivedDir, 'manifests', 'checkpoints'),
+  ];
+  return { cursors, manifests, quarantineCheckpoint };
+}
+
+function resolveRawLayout(opts, dataDir) {
+  return opts.rawLayout === 'auto' ? detectRawLayout(dataDir) : opts.rawLayout;
+}
+
+function cleanupV4(dataDir, derivedDir, opts) {
+  const { cursors, manifests, quarantineCheckpoint } = resolvedProofRoots(opts, dataDir, derivedDir);
+  const safetyMarginSec = opts.safetyMarginExplicit ? opts.safetyMarginSec : V4_SAFETY_MARGIN_SEC;
+  const cutoffMs = Date.now() - safetyMarginSec * 1000;
+  const segments = discoverV4Segments(dataDir);
+  const stats = { deleted: 0, skipped: 0, active: 0, ageSkipped: 0, missingProof: 0 };
+
+  console.log(`Data dir:             ${dataDir}`);
+  console.log('Raw layout:           v4');
+  console.log(`Consumer cursors:     ${cursors.join(', ')}`);
+  console.log(`Consumer manifests:   ${manifests.join(', ')}`);
+  console.log(`Quarantine/checkpoint roots: ${quarantineCheckpoint.join(', ')}`);
+  console.log(`Safety margin:        ${safetyMarginSec}s`);
+  console.log(`Dry run:              ${opts.dryRun}`);
+  console.log(`Segments found:       ${segments.length}`);
+  console.log('');
+
+  for (const segment of segments) {
+    if (segment.active) {
+      stats.active++;
+      if (opts.verbose) console.log(`  [SKIP] ${segment.fullPath} — active-segment`);
+      continue;
+    }
+    let stat;
+    try { stat = fs.statSync(segment.fullPath); } catch (_) { stats.skipped++; continue; }
+    if (stat.mtimeMs > cutoffMs) {
+      stats.ageSkipped++;
+      if (opts.verbose) console.log(`  [SKIP] ${segment.fullPath} — safety-margin`);
+      continue;
+    }
+    const proof = verifyV4ClosedSegment(segment, { cursorRoots: cursors, manifestRoots: manifests, quarantineCheckpointRoots: quarantineCheckpoint });
+    if (!proof.ok) {
+      stats.missingProof++;
+      if (opts.verbose) console.log(`  [SKIP] ${segment.fullPath} — ${proof.reason}`);
+      continue;
+    }
+    if (opts.dryRun) {
+      console.log(`  [DELETE] ${segment.fullPath} (v4 closed + cursor EOF + manifest committed)`);
+      stats.deleted++;
+      continue;
+    }
+    try {
+      fs.unlinkSync(segment.fullPath);
+      stats.deleted++;
+      if (opts.verbose) console.log(`  [DELETED] ${segment.fullPath}`);
+    } catch (err) {
+      stats.skipped++;
+      console.error(`  [ERROR] Failed to delete ${segment.fullPath}: ${err.message}`);
+    }
+  }
+
+  console.log(`Summary: deleted=${stats.deleted}, active=${stats.active}, skipped(age)=${stats.ageSkipped}, skipped(proof)=${stats.missingProof}, skipped(err)=${stats.skipped}`);
+  return stats;
+}
+
 // ── Main ───────────────────────────────────────────────────────────────
 
 async function main() {
@@ -421,6 +840,11 @@ async function main() {
   if (!fs.existsSync(dataDir)) {
     console.error(`Data directory not found: ${dataDir}`);
     process.exit(1);
+  }
+
+  if (resolveRawLayout(opts, dataDir) === 'v4') {
+    cleanupV4(dataDir, derivedDir, opts);
+    return;
   }
 
   console.log(`Data dir:       ${dataDir}`);
@@ -552,6 +976,11 @@ async function main() {
     }
   }
 
+  const deletedSnapshots = cleanupSeedSnapshots(dataDir, nowMs, opts.dryRun, opts.verbose);
+  if (deletedSnapshots > 0) {
+    console.log(`Seed snapshots ${opts.dryRun ? 'eligible' : 'deleted'}: ${deletedSnapshots} (retention=${SNAPSHOT_RETENTION_MS / 86400000}d)`);
+  }
+
   // 5. Clean up empty directories
   if (!opts.dryRun && totalDeleted > 0) {
     let dirsRemoved = 0;
@@ -600,7 +1029,9 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1])) {
+  main().catch(err => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
+}

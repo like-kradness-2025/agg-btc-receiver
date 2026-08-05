@@ -1,5 +1,12 @@
 # Receiver Raw-Only Implementation Plan
 
+> **実装反映（2026-07-19）**
+>
+> 本計画のraw-only境界は現行実装へ反映済み。現在のworkerには派生writer用の
+> `doFlushCycle()`は存在しないが、raw writerのactive `.open`を保護するための
+> 定期flush timerは存在する。以下の「flush timerを削除」は旧派生処理用timerを
+> 指し、raw 3 writerのflushを削除する意味ではない。
+
 > **For Hermes:** PDDでタスク単位に specialist へ委譲し、各タスク後に親が実ファイルを再読する。実装レビューは本質のみ、95点未満は次へ進めない。
 
 **Goal:** Receiverを「取引所イベントの受信・標準化・raw 30秒ブロック保存・受信品質監視」だけに限定し、1秒集計・ローカル板snapshot・REST補助収集を別責務へ移す。
@@ -50,7 +57,7 @@ exchange connector
   └─ liquidation → orderflow-worker → RawRotationWriter(liquidations)
 ```
 
-### Receiver内に混入した派生経路
+### Receiver内に混入していた派生経路（migration前）
 
 ```text
 trade → TradeAggregator → 1秒OHLCV → RawRotationWriter(agg_trades)
@@ -59,9 +66,9 @@ book state → book.toSnapshot(now) → RawRotationWriter(snapshots)
 main thread → REST polling → derivatives/ohlcv/ticker/lsratio/takervol/premium
 ```
 
-### 重要な依存
+### migration前の重要な依存
 
-`lib/burst-reducer/pipeline.mjs` は現在 `agg_trades` を読み、特徴量 #12 `burst_notional_vs_30s_traded_notional` の分母を作る。Receiverから先に`agg_trades`を消すとE007停止するため、**下流移行を先に行う**。
+当時の`lib/burst-reducer/pipeline.mjs`は`agg_trades`を読み、特徴量 #12の分母を作っていた。現在はraw trades直計算へ移行済みであり、receiverから`agg_trades`を生成する必要はない。
 
 ## 2. 非対象
 
@@ -198,9 +205,9 @@ main側もfail-closedに揃える。`orderflow_monitor.mjs`のready待機が60�
 - `bookWriters` (`book_snapshots`)
 - `bookSnapshotMs` / `lastBookSnapshot`
 - `aggregator.addTrade()`
-- `doFlushCycle()`とflush timer
+- `doFlushCycle()`と派生writer用flush timer
 - derived writerのstartupRecovery/checkStale/finalize
-- shutdown時`flushNow()`
+- shutdown時の派生writer用`flushNow()`
 
 **Keep:**
 - books（connector同期・depth処理に必要）

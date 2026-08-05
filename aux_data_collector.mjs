@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
 import { MarketDataCollector } from './lib/market-data-collector.mjs';
+import { OI_CAPABILITIES, getOICapability } from './lib/oi-schema.mjs';
 
 // ====== Heartbeat ======
 
@@ -99,10 +100,14 @@ const enabledMarkets = marketsArg
 
 // ====== Initialize auxiliary data collectors ======
 
-const PERP_MARKETS = ['binance_perp', 'binance_coinm_perp', 'binance_perp_btcusdc', 'bybit_perp', 'okx_perp', 'hyperliquid_perp'];
+// OI is deliberately restricted to the six schema capabilities. The COIN-M
+// perp remains a perp for generic market-data classification, but has no OI
+// capability and is not registered with DerivativesHelper.
+const OI_MARKETS = Object.keys(OI_CAPABILITIES);
+const PERP_MARKETS = new Set([...OI_MARKETS, 'binance_coinm_perp']);
 
 const derivativesHelper = new DerivativesHelper(outputBase, {
-  intervalMs: 5000,
+  intervalMs: 10000,
 });
 
 const marketDataCollector = new MarketDataCollector(outputBase, {
@@ -118,8 +123,8 @@ async function main() {
 
   // Register perp markets for derivatives collection
   for (const market of enabledMarkets) {
-    if (PERP_MARKETS.includes(market)) {
-      derivativesHelper.registerMarket(market, {});
+    if (getOICapability(market)) {
+      derivativesHelper.registerMarket(market, config.markets[market]?.derivatives ?? {});
     }
   }
 
@@ -128,7 +133,7 @@ async function main() {
   for (const market of enabledMarkets) {
     const md = config.markets[market]?.marketData;
     if (!md) continue;
-    const type = PERP_MARKETS.includes(market) ? 'perp' : 'spot';
+    const type = PERP_MARKETS.has(market) ? 'perp' : 'spot';
     const collect = {};
     if (md.lsratio) collect.lsratio = true;
     if (md.takervol) collect.takervol = true;

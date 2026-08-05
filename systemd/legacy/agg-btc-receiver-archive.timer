@@ -1,0 +1,10 @@
+[Unit]
+Description=Run agg-btc-receiver raw archive daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+Unit=agg-btc-receiver-archive.service
+
+[Install]
+WantedBy=timers.target

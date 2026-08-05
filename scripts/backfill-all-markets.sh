@@ -11,7 +11,7 @@ MARKETS=(
   okx_perp okx_spot
 )
 
-OUTPUT_ROOT="data/derived/burst_features_v1"
+OUTPUT_ROOT="data/derived/burst_features_v2"
 TO_TS=$(TZ=UTC date +%s)
 TO_ISO=$(TZ=UTC date -d "@$TO_TS" +%Y-%m-%dT%H:%M:%S+00:00)
 

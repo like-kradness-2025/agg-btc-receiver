@@ -82,6 +82,58 @@ describe('FeatureComputer 1s', () => {
     }
   });
 
+  it('uses full replayed book levels for multi-level dollar depth', () => {
+    const bd = new BurstDetector('test');
+    const rows = computeFeatures1s({
+      detector: bd,
+      blockStartMs: 0,
+      tradeTsList: [],
+      warmup: false,
+      inputBlockIds: ['0'],
+      lookupTradedNotional30s: zeroLookup,
+      bookSnapshot: {
+        available: true,
+        book_seeded: true,
+        state: {
+          seeded: true,
+          best_bid: 100,
+          best_bid_qty: 2,
+          best_ask: 101,
+          best_ask_qty: 3,
+          mid: 100.5,
+          bids: [[100, 2], [99.5, 4], [0, 999]],
+          asks: [[101, 3], [101.5, 5], [2000, 999]],
+        },
+      },
+    });
+
+    // All normal levels are inside both windows; invalidly distant levels are not.
+    assert.equal(rows[0].book_bid_depth_100, 100 * 2 + 99.5 * 4);
+    assert.equal(rows[0].book_ask_depth_100, 101 * 3 + 101.5 * 5);
+    assert.equal(rows[0].book_bid_depth_1000, rows[0].book_bid_depth_100);
+    assert.equal(rows[0].book_ask_depth_1000, rows[0].book_ask_depth_100);
+  });
+
+  it('uses the strict pre-second book state without lookahead', () => {
+    const bd = new BurstDetector('test');
+    const statesBySecond = new Map([
+      [0, { seeded: true, best_bid: 100, best_bid_qty: 1, best_ask: 101, best_ask_qty: 1 }],
+      [1000, { seeded: true, best_bid: 102, best_bid_qty: 1, best_ask: 103, best_ask_qty: 1 }],
+    ]);
+    const rows = computeFeatures1s({
+      detector: bd,
+      blockStartMs: 0,
+      tradeTsList: [],
+      warmup: false,
+      inputBlockIds: ['0'],
+      lookupTradedNotional30s: zeroLookup,
+      bookSnapshot: { available: true, book_seeded: true, statesBySecond },
+    });
+    assert.equal(rows[0].book_mid_price, 100.5);
+    assert.equal(rows[1].book_mid_price, 102.5);
+    assert.equal(rows[2].book_mid_price, null);
+  });
+
   it('invariants hold', () => {
     const bd = new BurstDetector('test');
     bd.feedTrades([
@@ -178,5 +230,63 @@ describe('FeatureComputer 1s', () => {
         lookupTradedNotional30s: incompleteLookup,
       });
     }, /E007/);
+  });
+
+  it('computes Phase 0 raw-trade flow and strict-past RV features', () => {
+    const trades = [
+      { ts: 500, side: 'buy', price: 100, qty: 1 },
+      { ts: 700, side: 'sell', price: 101, qty: 2 },
+      { ts: 900, side: 'buy', price: 100, qty: 3 },
+    ];
+    const bd = new BurstDetector('test');
+    bd.feedTrades(trades);
+    bd.flushAll();
+
+    const rows = computeFeatures1s({
+      detector: bd,
+      blockStartMs: 0,
+      tradeTsList: trades.map((trade) => trade.ts),
+      tradeRecords: trades,
+      tradeHistory: trades,
+      warmup: false,
+      inputBlockIds: ['p0'],
+      lookupTradedNotional30s: zeroLookup,
+      largeTradeNotionalThreshold: 200,
+      largeTradeThresholdVersion: 'test-200-v1',
+    });
+
+    const row0 = rows[0];
+    assert.equal(row0.trade_open_1s, 100);
+    assert.equal(row0.trade_high_1s, 101);
+    assert.equal(row0.trade_low_1s, 100);
+    assert.equal(row0.trade_close_1s, 100);
+    assert.equal(row0.trade_count_1s, 3);
+    assert.equal(row0.buy_trade_count_1s, 2);
+    assert.equal(row0.sell_trade_count_1s, 1);
+    assert.equal(row0.traded_qty_1s, 6);
+    assert.equal(row0.traded_notional_1s, 602);
+    assert.equal(row0.signed_volume_1s, 2);
+    assert.equal(row0.trade_imbalance_qty_1s, 1 / 3);
+    assert.equal(row0.large_trade_count_1s, 2);
+    assert.equal(row0.large_trade_notional_1s, 502);
+    assert.equal(row0.large_trade_notional_share_1s, 502 / 602);
+    assert.equal(row0.mean_interarrival_ms_1s, 200);
+    assert.equal(row0.median_interarrival_ms_1s, 200);
+    assert.equal(row0.p95_interarrival_ms_1s, 200);
+    assert.equal(row0.side_flip_count_1s, 2);
+    assert.equal(row0.realized_vol_10s, null);
+    assert.equal(row0.realized_vol_60s, null);
+    assert.equal(row0._quality.trade_feature_source, 'raw_trades');
+    assert.equal(row0._quality.large_trade_threshold_version, 'test-200-v1');
+
+    const row1 = rows[1];
+    assert.ok(Number.isFinite(row1.realized_vol_10s));
+    assert.ok(Number.isFinite(row1.realized_vol_60s));
+    assert.equal(row1.trade_count_1s, 0);
+    assert.equal(row1.trade_open_1s, null);
+    assert.equal(row1.trade_high_1s, null);
+    assert.equal(row1.trade_low_1s, null);
+    assert.equal(row1.trade_close_1s, null);
+    assert.equal(row1.traded_notional_1s, 0);
   });
 });
