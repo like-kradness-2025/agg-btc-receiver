@@ -56,3 +56,43 @@ test('RawSqliteWriter prunes by receive time without deleting other market data'
   await writer.close();
   await fs.rm(root, { recursive: true, force: true });
 });
+
+test('RawSqliteWriter stores batch rows in event_ts_ms order', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-order-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  const base = envelope('order_test', 'trades', 10_000);
+  const missingTs = envelope('order_test', 'trades', 6000);
+  delete missingTs.event_ts_ms;
+  await writer.append([
+    { ...base, event_ts_ms: 3000, recv_ts_ms: 5000 },
+    { ...base, event_ts_ms: 1000, recv_ts_ms: 3000 },
+    { ...base, event_ts_ms: 2000, recv_ts_ms: 4000 },
+    missingTs,
+  ]);
+  await writer.close();
+
+  const row = query(path.join(root, 'order_test.sqlite'),
+    'SELECT raw_gzip, row_count, first_event_ts_ms, last_event_ts_ms FROM raw_batches')[0];
+  assert.equal(Number(row.row_count), 4);
+  assert.equal(Number(row.first_event_ts_ms), 1000);
+  assert.equal(Number(row.last_event_ts_ms), 3000);
+  const lines = gunzipSync(row.raw_gzip).toString('utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => line.event_ts_ms), [1000, 2000, 3000, undefined]);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter keeps ingest_seq order for equal event_ts_ms', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-tie-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    { ...envelope('tie_test', 'trades', 2000), event_ts_ms: 1000, ingest_seq: '5' },
+    { ...envelope('tie_test', 'trades', 2000), event_ts_ms: 1000, ingest_seq: '2' },
+    { ...envelope('tie_test', 'trades', 3000), event_ts_ms: 1000, ingest_seq: '9' },
+  ]);
+  await writer.close();
+
+  const row = query(path.join(root, 'tie_test.sqlite'), 'SELECT raw_gzip FROM raw_batches')[0];
+  const lines = gunzipSync(row.raw_gzip).toString('utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => line.ingest_seq), ['2', '5', '9']);
+  await fs.rm(root, { recursive: true, force: true });
+});
