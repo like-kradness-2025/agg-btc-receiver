@@ -591,3 +591,125 @@ describe('I/O failure propagation', () => {
     );
   });
 });
+
+// ─── Late-event sidecar (.jsonl.late) ───────────────────────────────────────
+
+describe('Late-event sidecar', () => {
+  let dir;
+
+  before(() => { dir = tmpDir('late-sidecar'); });
+  after(async () => { await rmDir(dir); });
+
+  function sidecarPathFor(writer, wMs) {
+    const { dateDir, fileBase } = windowStartToDateStr(wMs);
+    return path.join(
+      dir, writer._kind, writer._market, dateDir, `${fileBase}.jsonl.late`,
+    );
+  }
+
+  async function writeWindowThenFinalize(market, ts) {
+    // Build a finalized watermark well below the reopenable window band
+    // (recovery reopens current ± 1 window) using a throwaway writer.
+    const setup = new RawRotationWriter(dir, market, 'trades', {
+      flushIntervalMs: 20,
+    });
+    await setup.write({ seed: true }, ts);
+    await setup.finalize();
+  }
+
+  it('records behind-watermark events in a .jsonl.late sidecar instead of dropping them', async () => {
+    const market = 'sidecar_basic';
+    const now = Date.now();
+    const currentWs = windowStartMs(now);
+    // Seed a finalized window well outside the reopenable band (current ± 1
+    // window) so recovery restores a watermark instead of reopening the file.
+    const seedWs = currentWs - 300_000;
+    const oldWs = seedWs - 60_000; // strictly behind the restored watermark
+
+    await writeWindowThenFinalize(market, seedWs);
+
+    const writer = new RawRotationWriter(dir, market, 'trades', {
+      flushIntervalMs: 20,
+    });
+    await writer.startupRecovery(Date.now());
+    assert.equal(writer.getWatermark(), seedWs,
+      'watermark should be restored from the finalized seed window');
+
+    await writer.write({ late: 1 }, oldWs + 1000);
+    await writer.write({ late: 2 }, oldWs + 2000);
+    await writer.finalize();
+
+    const sidecar = sidecarPathFor(writer, oldWs);
+    assert.ok(fs.existsSync(sidecar), `expected sidecar ${sidecar}`);
+
+    const lines = fs.readFileSync(sidecar, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(lines.length, 2);
+    for (const line of lines) {
+      assert.equal(line.reason, 'behind_watermark');
+      assert.ok(Number.isFinite(line.ts));
+      assert.ok(Number.isFinite(line.recv_ts));
+      assert.ok(line.obj && (line.obj.late === 1 || line.obj.late === 2));
+    }
+    assert.deepEqual(lines.map((l) => l.obj.late), [1, 2], 'append order preserved');
+
+    // The finalized seed window file itself must remain untouched
+    const seedParts = windowStartToDateStr(seedWs);
+    const seedFinalPath = path.join(
+      dir, 'trades', market, seedParts.dateDir, `${seedParts.fileBase}.jsonl`,
+    );
+    const seedLines = fs.readFileSync(seedFinalPath, 'utf8');
+    assert.ok(!seedLines.includes('late'), 'finalized seed window must not contain the late events');
+
+    const stats = writer.getLateEventStats();
+    assert.equal(stats.count, 2);
+    assert.equal(stats.last.windowMs, oldWs);
+    assert.equal(stats.last.reason, 'behind_watermark');
+  });
+
+  it('keeps invalid and future-timestamp drops unchanged', async () => {
+    const market = 'sidecar_invalid';
+    const now = Date.now();
+    await writeWindowThenFinalize(market, now);
+
+    const writer = new RawRotationWriter(dir, market, 'trades', {
+      flushIntervalMs: 20,
+    });
+    await writer.startupRecovery(Date.now());
+
+    await writer.write({ bad: true }, NaN);
+    await writer.write({ bad: true }, 'not-a-number');
+    await writer.write({ future: true }, now + 300_000);
+    await writer.finalize();
+
+    assert.equal(writer.getLateEventStats().count, 0,
+      'invalid/future drops are data errors, not late events — no sidecar');
+
+    const files = [];
+    (function walk(d) {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (p.endsWith('.late')) files.push(p);
+      }
+    })(dir);
+    assert.equal(
+      files.filter((f) => f.includes(market)).length, 0,
+      `no .jsonl.late files expected under ${market}`,
+    );
+  });
+
+  it('does not count normal current/previous-window writes as late', async () => {
+    const market = 'sidecar_normal';
+    const writer = new RawRotationWriter(dir, market, 'trades', {
+      flushIntervalMs: 20,
+    });
+
+    const ts = Date.now();
+    const ws = windowStartMs(ts);
+    await writer.write({ a: 1 }, ws);
+    await writer.write({ b: 2 }, ws - 30_000); // previous-window late but still writable
+    await writer.finalize();
+
+    assert.equal(writer.getLateEventStats().count, 0);
+  });
+});

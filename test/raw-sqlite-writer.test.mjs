@@ -96,3 +96,110 @@ test('RawSqliteWriter keeps ingest_seq order for equal event_ts_ms', async () =>
   assert.deepEqual(lines.map((line) => line.ingest_seq), ['2', '5', '9']);
   await fs.rm(root, { recursive: true, force: true });
 });
+
+// ---- Late-event backfill ----------------------------------------------------
+
+function lateEnvelope(market, stream, eventTs, recvTs, payload) {
+  return {
+    schema: 'raw_v6_sqlite',
+    market,
+    stream,
+    event_ts_ms: eventTs,
+    recv_ts_ms: recvTs,
+    writer_session_id: 'test:sqlite',
+    payload,
+  };
+}
+
+test('RawSqliteWriter merges late events into the batch covering their time range', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-merge-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('late_merge', 'trades', 1000, 5000, { i: 1 }),
+    lateEnvelope('late_merge', 'trades', 2000, 5100, { i: 2 }),
+    lateEnvelope('late_merge', 'trades', 3000, 5200, { i: 3 }),
+  ]);
+  // Late arrival inside the existing [1000, 3000] range
+  await writer.append([lateEnvelope('late_merge', 'trades', 2500, 9000, { late: true })]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'late_merge.sqlite'),
+    'SELECT batch_id, row_count, first_event_ts_ms, last_event_ts_ms, first_recv_ts_ms, last_recv_ts_ms, raw_gzip FROM raw_batches');
+  assert.equal(rows.length, 1, 'late event must be merged into the existing batch, not appended');
+  const row = rows[0];
+  assert.equal(Number(row.row_count), 4);
+  assert.equal(Number(row.first_event_ts_ms), 1000);
+  assert.equal(Number(row.last_event_ts_ms), 3000);
+  assert.equal(Number(row.first_recv_ts_ms), 5000);
+  assert.equal(Number(row.last_recv_ts_ms), 9000);
+  const lines = gunzipSync(row.raw_gzip).toString('utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => line.event_ts_ms), [1000, 2000, 2500, 3000],
+    'merged line must sit at its event-time position');
+  assert.equal(lines[2].payload.late, true);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter creates a mini-batch for late events outside every batch range', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-gap-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([lateEnvelope('gap_test', 'trades', 10_000, 10_050, { i: 1 })]);
+  // Falls into the time gap before the only batch — no insertion target exists
+  await writer.append([lateEnvelope('gap_test', 'trades', 5_000, 20_000, { gap: true })]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'gap_test.sqlite'),
+    'SELECT batch_id, row_count, first_event_ts_ms, last_event_ts_ms FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 2, 'gap event must become its own mini-batch');
+  assert.equal(Number(rows[0].row_count), 1);
+  assert.equal(Number(rows[0].first_event_ts_ms), 10_000, 'original batch metadata must stay intact');
+  assert.equal(Number(rows[1].row_count), 1);
+  assert.equal(Number(rows[1].first_event_ts_ms), 5_000);
+  assert.equal(Number(rows[1].last_event_ts_ms), 5_000);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter splits a mixed append into late backfill plus fresh batch', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-mixed-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('mixed_test', 'trades', 1000, 5000, { i: 1 }),
+    lateEnvelope('mixed_test', 'trades', 3000, 5200, { i: 3 }),
+  ]);
+  await writer.append([
+    lateEnvelope('mixed_test', 'trades', 1500, 9000, { late: true }), // inside [1000,3000]
+    lateEnvelope('mixed_test', 'trades', 3500, 9010, { fresh: true }), // ahead of watermark
+  ]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'mixed_test.sqlite'),
+    'SELECT batch_id, row_count, first_event_ts_ms, last_event_ts_ms, raw_gzip FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 2);
+  const merged = rows[0];
+  assert.equal(Number(merged.row_count), 3);
+  assert.equal(Number(merged.first_event_ts_ms), 1000);
+  assert.equal(Number(merged.last_event_ts_ms), 3000);
+  const mergedLines = gunzipSync(merged.raw_gzip).toString('utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(mergedLines.map((l) => l.event_ts_ms), [1000, 1500, 3000]);
+  const fresh = rows[1];
+  assert.equal(Number(fresh.row_count), 1);
+  assert.equal(Number(fresh.first_event_ts_ms), 3500);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter exposes late-event statistics', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-stats-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('stats_test', 'trades', 10_000, 10_050, { i: 1 }),
+    lateEnvelope('stats_test', 'trades', 11_000, 10_150, { i: 2 }),
+    lateEnvelope('stats_test', 'trades', 12_000, 10_250, { i: 3 }),
+  ]);
+  await writer.append([
+    lateEnvelope('stats_test', 'trades', 8_000, 20_000, { gap: true }),   // no target → mini-batch
+    lateEnvelope('stats_test', 'trades', 11_500, 20_010, { merge: true }), // inside [10000,12000]
+  ]);
+  const summary = writer.lateEventSummary();
+  assert.deepEqual(summary['stats_test.trades'], { merged: 1, mergedRows: 1, minibatches: 1 });
+  await writer.close();
+  await fs.rm(root, { recursive: true, force: true });
+});
