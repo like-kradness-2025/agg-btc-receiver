@@ -143,18 +143,23 @@ test('RawSqliteWriter creates a mini-batch for late events outside every batch r
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-gap-'));
   const writer = await new RawSqliteWriter({ databaseDir: root }).open();
   await writer.append([lateEnvelope('gap_test', 'trades', 10_000, 10_050, { i: 1 })]);
-  // Falls into the time gap before the only batch — no insertion target exists
-  await writer.append([lateEnvelope('gap_test', 'trades', 5_000, 20_000, { gap: true })]);
+  // Both fall into the time gap before the only batch — one combined mini-batch
+  await writer.append([
+    lateEnvelope('gap_test', 'trades', 5_000, 20_000, { gap: true }),
+    lateEnvelope('gap_test', 'trades', 7_000, 20_010, { gap2: true }),
+  ]);
   await writer.close();
 
   const rows = query(path.join(root, 'gap_test.sqlite'),
-    'SELECT batch_id, row_count, first_event_ts_ms, last_event_ts_ms FROM raw_batches ORDER BY batch_id');
-  assert.equal(rows.length, 2, 'gap event must become its own mini-batch');
+    'SELECT batch_id, row_count, first_event_ts_ms, last_event_ts_ms, raw_gzip FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 2, 'gap events must share a single mini-batch');
   assert.equal(Number(rows[0].row_count), 1);
   assert.equal(Number(rows[0].first_event_ts_ms), 10_000, 'original batch metadata must stay intact');
-  assert.equal(Number(rows[1].row_count), 1);
+  assert.equal(Number(rows[1].row_count), 2);
   assert.equal(Number(rows[1].first_event_ts_ms), 5_000);
-  assert.equal(Number(rows[1].last_event_ts_ms), 5_000);
+  assert.equal(Number(rows[1].last_event_ts_ms), 7_000);
+  const gapLines = gunzipSync(rows[1].raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(gapLines.map((l) => l.event_ts_ms), [5_000, 7_000]);
   await fs.rm(root, { recursive: true, force: true });
 });
 
