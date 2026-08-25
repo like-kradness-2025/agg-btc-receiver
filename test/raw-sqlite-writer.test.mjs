@@ -204,8 +204,45 @@ test('RawSqliteWriter exposes late-event statistics', async () => {
     lateEnvelope('stats_test', 'trades', 11_500, 20_010, { merge: true }),
   ]);
   const summary = writer.lateEventSummary();
-  assert.deepEqual(summary['stats_test.trades'], { merged: 1, mergedRows: 1, minibatches: 1 });
+  assert.deepEqual(summary['stats_test.trades'],
+    { merged: 1, mergedRows: 1, minibatches: 1, overlaps: 0 });
   await writer.close();
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter resolves overlapping legacy batch ranges deterministically', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-overlap-'));
+  // Seed two non-overlapping batches through the normal writer path...
+  {
+    const seed = await new RawSqliteWriter({ databaseDir: root }).open();
+    await seed.append([envelope('overlap_m', 'trades', 6_000, { i: 'a' })]);
+    await seed.append([envelope('overlap_m', 'trades', 6_200, { i: 'b' })]);
+    await seed.close();
+  }
+  // ...then rewrite batch 2's range so both cover the same instant, mimicking
+  // the overlap bands left behind by the legacy independent-append writer.
+  {
+    const raw = new DatabaseSync(path.join(root, 'overlap_m.sqlite'));
+    try {
+      raw.prepare('UPDATE raw_batches SET first_event_ts_ms = ?, last_event_ts_ms = ? WHERE batch_id = ?')
+        .run(5_900, 6_199, 2);
+    } finally { raw.close(); }
+  }
+
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  // event_ts_ms = 5998 falls inside BOTH batch ranges. Must not throw; must
+  // pick the tightest range (batch 1, width 0) deterministically.
+  await writer.append([envelope('overlap_m', 'trades', 6_000, { i: 'late' })]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'overlap_m.sqlite'),
+    'SELECT batch_id, row_count FROM raw_batches ORDER BY batch_id');
+  assert.deepEqual(rows.map((r) => [Number(r.batch_id), Number(r.row_count)]),
+    [[1, 2], [2, 1]]);
+  const pickedRaw = query(path.join(root, 'overlap_m.sqlite'),
+    'SELECT raw_gzip FROM raw_batches WHERE batch_id = 1')[0].raw_gzip;
+  const pickedLines = gunzipSync(pickedRaw).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(pickedLines.map((line) => line.payload.i), ['a', 'late']);
   await fs.rm(root, { recursive: true, force: true });
 });
 
