@@ -211,7 +211,8 @@ test('RawSqliteWriter uses top-level sort keys even when payload fields come fir
     lateEnvelope('key_order', 'trades', 1000, 5000, { i: 1 }),
     lateEnvelope('key_order', 'trades', 3000, 5100, { i: 3 }),
   ]);
-  const incoming = lateEnvelope('key_order', 'trades', 1500, 9000, { event_ts_ms: -999, i: 2 });
+  const incoming = lateEnvelope('key_order', 'trades', 1500, 9000,
+    { event_ts_ms: -999, recv_ts_ms: -999, i: 2 });
   incoming.raw_line = JSON.stringify({
     payload: incoming.payload,
     event_ts_ms: incoming.event_ts_ms,
@@ -226,6 +227,10 @@ test('RawSqliteWriter uses top-level sort keys even when payload fields come fir
   const row = query(path.join(root, 'key_order.sqlite'), 'SELECT raw_gzip FROM raw_batches')[0];
   const lines = gunzipSync(row.raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(lines.map((line) => line.event_ts_ms), [1000, 1500, 3000]);
+  const meta = query(path.join(root, 'key_order.sqlite'),
+    'SELECT first_recv_ts_ms, last_recv_ts_ms FROM raw_batches')[0];
+  assert.equal(Number(meta.first_recv_ts_ms), 5000);
+  assert.equal(Number(meta.last_recv_ts_ms), 9000);
   await fs.rm(root, { recursive: true, force: true });
 });
 
