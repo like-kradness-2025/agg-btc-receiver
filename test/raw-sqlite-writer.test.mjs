@@ -195,11 +195,58 @@ test('RawSqliteWriter exposes late-event statistics', async () => {
     lateEnvelope('stats_test', 'trades', 12_000, 10_250, { i: 3 }),
   ]);
   await writer.append([
-    lateEnvelope('stats_test', 'trades', 8_000, 20_000, { gap: true }),   // no target → mini-batch
-    lateEnvelope('stats_test', 'trades', 11_500, 20_010, { merge: true }), // inside [10000,12000]
+    lateEnvelope('stats_test', 'trades', 8_000, 20_000, { gap: true }),
+    lateEnvelope('stats_test', 'trades', 11_500, 20_010, { merge: true }),
   ]);
   const summary = writer.lateEventSummary();
   assert.deepEqual(summary['stats_test.trades'], { merged: 1, mergedRows: 1, minibatches: 1 });
   await writer.close();
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter uses top-level sort keys even when payload fields come first', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-key-order-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('key_order', 'trades', 1000, 5000, { i: 1 }),
+    lateEnvelope('key_order', 'trades', 3000, 5100, { i: 3 }),
+  ]);
+  const incoming = lateEnvelope('key_order', 'trades', 1500, 9000, { event_ts_ms: -999, i: 2 });
+  incoming.raw_line = JSON.stringify({
+    payload: incoming.payload,
+    event_ts_ms: incoming.event_ts_ms,
+    ingest_seq: incoming.ingest_seq,
+    recv_ts_ms: incoming.recv_ts_ms,
+    market: incoming.market,
+    stream: incoming.stream,
+  });
+  await writer.append([incoming]);
+  await writer.close();
+
+  const row = query(path.join(root, 'key_order.sqlite'), 'SELECT raw_gzip FROM raw_batches')[0];
+  const lines = gunzipSync(row.raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(lines.map((line) => line.event_ts_ms), [1000, 1500, 3000]);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter serializes concurrent append calls before watermark routing', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-concurrent-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('concurrent', 'trades', 1000, 5000, { i: 1 }),
+    lateEnvelope('concurrent', 'trades', 3000, 5100, { i: 3 }),
+  ]);
+  const late = writer.append([lateEnvelope('concurrent', 'trades', 1500, 9000, { late: true })]);
+  const fresh = writer.append([lateEnvelope('concurrent', 'trades', 4000, 9010, { fresh: true })]);
+  await Promise.all([late, fresh]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'concurrent.sqlite'),
+    'SELECT row_count, first_event_ts_ms, last_event_ts_ms, raw_gzip FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 2);
+  const merged = gunzipSync(rows[0].raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(merged.map((line) => line.event_ts_ms), [1000, 1500, 3000]);
+  assert.equal(Number(rows[1].first_event_ts_ms), 4000);
+  assert.equal(Number(rows[1].last_event_ts_ms), 4000);
   await fs.rm(root, { recursive: true, force: true });
 });
