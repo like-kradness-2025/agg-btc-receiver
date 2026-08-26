@@ -475,3 +475,110 @@ describe('DerivativesHelper OKX timestamp and unit regression', () => {
     }
   });
 });
+
+describe('DerivativesHelper finite()/responseTimestamp() null handling (event_ts_ms=0 regression)', () => {
+  it('treats null/empty/missing numbers as null instead of 0', async () => {
+    const origFetch = global.fetch;
+    try {
+      const now = 1_700_000_000_000;
+      global.fetch = async (url) => {
+        const urlStr = String(url);
+        if (urlStr.includes('premiumIndex')) {
+          return {
+            ok: true,
+            json: async () => ({
+              markPrice: null,          // Number(null) === 0: must stay null
+              lastFundingRate: '',      // Number('') === 0: must stay null
+              nextFundingTime: undefined,
+              time: now,
+            }),
+          };
+        }
+        if (urlStr.includes('openInterest')) {
+          return { ok: true, json: async () => ({ openInterest: '2.5', time: now + 1 }) };
+        }
+        return { ok: false };
+      };
+      const helper = new DerivativesHelper('/tmp/non-existent', { maxRetries: 0 });
+      const row = await helper._fetchBinancePerp(now);
+      assert.strictEqual(row.mark_price, null);
+      assert.strictEqual(row.funding_rate, null);
+      assert.strictEqual(row.next_funding_time, null);
+      assert.strictEqual(row.open_interest, 2.5);
+      assert.strictEqual(row.source_ts, now + 1);
+      assert.strictEqual(row.error, null);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('falls back to collector time when a source timestamp is an empty string', async () => {
+    const origFetch = global.fetch;
+    try {
+      const now = 1_700_000_000_000;
+      global.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+          result: {
+            list: [{
+              markPrice: '65000',
+              fundingRate: '0.0001',
+              openInterest: '100',
+              nextFundingTime: '',
+              time: '',   // Number('') === 0: must fall back to `now`, not become 0
+            }],
+          },
+        }),
+      });
+      const helper = new DerivativesHelper('/tmp/non-existent', { maxRetries: 0 });
+      const row = await helper._fetchBybit(now);
+      assert.strictEqual(row.source_ts, now);
+      assert.strictEqual(row.next_funding_time, null);
+      assert.strictEqual(row.open_interest, 100);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  it('keeps source_ts null on OI REST errors so event_ts_ms falls back to recv time', async () => {
+    const tmpDir = uniqueTmpDir();
+    const origFetch = global.fetch;
+    try {
+      const now = 1_700_000_000_000;
+      let oiCalls = 0;
+      global.fetch = async (url) => {
+        const urlStr = String(url);
+        if (urlStr.includes('premiumIndex')) {
+          return {
+            ok: true,
+            json: async () => ({ markPrice: '65000', lastFundingRate: '0.0001', time: now }),
+          };
+        }
+        if (urlStr.includes('openInterest')) {
+          oiCalls += 1;
+          return { ok: false, status: 503, headers: { get: () => null } };
+        }
+        return { ok: false };
+      };
+      const helper = new DerivativesHelper(tmpDir, { intervalMs: 60000, maxRetries: 0 });
+      helper.registerMarket('binance_perp', {});
+      await helper._fetchMarket('binance_perp', helper._writers.get('binance_perp').writer, now, {});
+      await helper._writers.get('binance_perp').writer.flush();
+      const filePath = path.join(tmpDir, 'derivatives', 'binance_perp.jsonl');
+      const line = JSON.parse(fs.readFileSync(filePath, 'utf-8').trim());
+      assert.strictEqual(oiCalls, 1);
+      assert.strictEqual(line.ts, now);
+      // Core regression: source_ts must be null (not 0) so downstream
+      // `row.source_ts ?? row.ts` (orderflow_monitor) coalescing works.
+      assert.strictEqual(line.source_ts, null);
+      assert.strictEqual((line.source_ts ?? line.ts), now);
+      assert.strictEqual(line.status, 'error');
+      assert.strictEqual(line.error_code, 'source_error');
+      assert.strictEqual(line.as_of_ms, null);
+      await helper.close();
+    } finally {
+      global.fetch = origFetch;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
