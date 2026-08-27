@@ -182,6 +182,18 @@
       "marketData": {
         "ohlcv": "https://api.hyperliquid.xyz/info"
       }
+    },
+    "binance_spot_fdusd": {
+      "enabled": true,
+      "symbol": "BTCFDUSD",
+      "wsUrl": "wss://stream.binance.com:9443/stream?streams=btcfdusd@trade/btcfdusd@depth@100ms",
+      "restUrl": "https://api.binance.com/api/v3/depth?symbol=BTCFDUSD&limit=5000",
+      "depthLimit": 0,
+      "raw_snapshot_interval_ms": 0,
+      "marketData": {
+        "ohlcv": "https://api.binance.com/api/v3/klines?symbol=BTCFDUSD&interval=1m&limit=1",
+        "ticker": "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCFDUSD"
+      }
     }
   },
   "output": {

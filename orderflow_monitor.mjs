@@ -39,7 +39,7 @@ const WORKER_MARKET_GROUPS = {
   F: ['bitstamp_spot', 'gemini_spot'],
   G: ['binance_perp'],
   H: ['binance_coinm_perp', 'binance_perp_btcusdc'],
-  I: ['binance_spot_usdc'],
+  I: ['binance_spot_usdc', 'binance_spot_fdusd'],
 };
 const KNOWN_MARKETS = new Set(Object.values(WORKER_MARKET_GROUPS).flat());
 // Only exchange feeds with an independently verified recovery path may be
@@ -49,6 +49,7 @@ const OPTIONAL_MARKET_ALLOWLIST = new Set([
   'kraken_spot',
   'binance_spot',
   'binance_spot_usdc',
+  'binance_spot_fdusd',
 ]);
 
 // ====== Arg parser ======
