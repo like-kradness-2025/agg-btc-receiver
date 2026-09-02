@@ -29,9 +29,11 @@ _CANDLE_INTERVAL_RE = re.compile(r'^(?P<value>[1-9]\d*)(?P<unit>[mhd])$', re.IGN
 
 
 def parse_candle_interval(value):
-    """Return a candle interval in minutes from ``1m``, ``1h`` or ``1d``."""
+    """Return a candle interval in minutes from ``15``, ``1m``, ``1h`` or ``1d``."""
     if isinstance(value, (int, np.integer)):
         minutes = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        minutes = int(value.strip())
     else:
         match = _CANDLE_INTERVAL_RE.fullmatch(str(value).strip())
         if not match:
@@ -710,11 +712,16 @@ def chart_snapshot_heatmap(
 
     center = float(mid_values[-1])
     price_bin = PRICE_BIN_SIZE
+    x_dt = pd.to_datetime([row['ts'] for row in rows], unit='ms', utc=True)
+    # Use only candles that are actually represented by the displayed snapshot
+    # rows. Feature history may begin earlier than the book snapshot window.
+    displayed_ohlc = ohlc_df
+    if ohlc_df is not None and not ohlc_df.empty:
+        displayed_ohlc = ohlc_df[(ohlc_df.index >= x_dt[0]) & (ohlc_df.index <= x_dt[-1])]
     # Use the actual candle movement plus the configured total margin whenever it exceeds
     # the minimum readable range. Keep the 20-dollar display bin unchanged.
-    price_min, price_max = _auto_price_bounds(rows, center, ohlc_df=ohlc_df)
+    price_min, price_max = _auto_price_bounds(rows, center, ohlc_df=displayed_ohlc)
     price_edges = np.arange(price_min, price_max + price_bin, price_bin)
-    x_dt = pd.to_datetime([row['ts'] for row in rows], unit='ms', utc=True)
     x_num = mdates.date2num(x_dt.to_pydatetime())
     if len(x_num) > 1:
         x_midpoints = (x_num[:-1] + x_num[1:]) / 2.0
