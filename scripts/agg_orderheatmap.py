@@ -10,7 +10,7 @@ Usage:
   python3 scripts/agg_orderheatmap.py --markets  # all markets
 """
 
-import json, os, sys, subprocess, argparse, glob
+import argparse, glob, json, os, re, subprocess, sys
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -25,21 +25,92 @@ from zoneinfo import ZoneInfo
 
 JST = ZoneInfo('Asia/Tokyo')
 
+_CANDLE_INTERVAL_RE = re.compile(r'^(?P<value>[1-9]\d*)(?P<unit>[mhd])$', re.IGNORECASE)
+
+
+def parse_candle_interval(value):
+    """Return a candle interval in minutes from ``15``, ``1m``, ``1h`` or ``1d``."""
+    if isinstance(value, (int, np.integer)):
+        minutes = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        minutes = int(value.strip())
+    else:
+        match = _CANDLE_INTERVAL_RE.fullmatch(str(value).strip())
+        if not match:
+            raise ValueError('candle interval must look like 1m, 15m, 1h, or 1d')
+        multiplier = {'m': 1, 'h': 60, 'd': 1_440}[match.group('unit').lower()]
+        minutes = int(match.group('value')) * multiplier
+    if not 1 <= minutes <= 1_440:
+        raise ValueError('candle interval must be between 1m and 1d')
+    return minutes
+
+
+def format_candle_interval(minutes):
+    """Return a compact, UI-friendly label for an interval in minutes."""
+    minutes = parse_candle_interval(minutes)
+    if minutes % 1_440 == 0:
+        return f'{minutes // 1_440}d'
+    if minutes % 60 == 0:
+        return f'{minutes // 60}h'
+    return f'{minutes}m'
+
+
+def orderbook_colormaps():
+    """Return the legacy bid/ask depth colormaps used by OrderHeatmap."""
+    return plt.get_cmap(ORDERBOOK_BID_COLORMAP), plt.get_cmap(ORDERBOOK_ASK_COLORMAP)
+
+
+def parse_period(value):
+    """Return lookback hours and a stable label from ``30m``, ``24h`` or ``3d``."""
+    match = _CANDLE_INTERVAL_RE.fullmatch(str(value).strip())
+    if not match:
+        raise ValueError('period must look like 30m, 24h, or 3d')
+    multiplier = {'m': 1 / 60, 'h': 1, 'd': 24}[match.group('unit').lower()]
+    hours = int(match.group('value')) * multiplier
+    if hours > 30 * 24:
+        raise ValueError('period must be no longer than 30d')
+    return hours, str(value).strip().lower()
+
+# TradingView-inspired dark palette. Keep the data semantics independent from
+# these presentation choices so the chart remains useful across venues.
+TV_BG = '#131722'
+TV_EDGE = '#2a2e39'
+TV_TEXT = '#d1d4dc'
+TV_MUTED = '#787b86'
+TV_BID = '#26a69a'
+TV_ASK = '#ef5350'
+TV_ACCENT = '#2962ff'
+TV_WARNING = '#f2c94c'
+TV_CVD = '#f0b90b'
+
+# Keep the original OrderHeatmap depth colors.  The TradingView layout is
+# independent from the data colormap: bids stay blue and asks stay orange/red.
+ORDERBOOK_BID_COLORMAP = 'Blues_r'
+ORDERBOOK_ASK_COLORMAP = 'OrRd_r'
+
+# The price axis keeps a readable minimum, then expands to the observed
+# movement plus a forced total margin when that is larger.
+MIN_DISPLAY_PRICE_RANGE = 2_000.0
+PRICE_BIN_SIZE = 20.0
+PRICE_RANGE_MARGIN_RATIO = 0.20
+PRICE_AXIS_TICK_COUNT = 8
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AGG_DIR = os.path.join(BASE_DIR, 'data', 'agg')
 
 # ── Style ──
 plt.rcParams.update({
-    'font.size': 8,
-    'axes.facecolor': '#0b1628',
-    'figure.facecolor': '#0b1628',
-    'text.color': '#c8d6e5',
-    'axes.edgecolor': '#1e3a5f',
-    'axes.labelcolor': '#c8d6e5',
+    'font.size': 8.5,
+    'font.family': 'DejaVu Sans',
+    'axes.facecolor': TV_BG,
+    'figure.facecolor': TV_BG,
+    'text.color': TV_TEXT,
+    'axes.edgecolor': TV_EDGE,
+    'axes.labelcolor': TV_TEXT,
     'axes.grid': False,
-    'legend.facecolor': '#0b1628',
-    'legend.edgecolor': '#1e3a5f',
-    'legend.labelcolor': '#c8d6e5',
+    'legend.facecolor': TV_BG,
+    'legend.edgecolor': TV_EDGE,
+    'legend.labelcolor': TV_TEXT,
 })
 
 BPS_RINGS = [
@@ -509,14 +580,115 @@ def derive_display_cvd(rows, feature_rows, interval='15min', gap_spans=None):
     return values
 
 
-def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=None, ohlc_df=None):
+def _finite_price(value):
+    """Return a finite numeric price or ``None`` for malformed values."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _auto_price_bounds(
+    rows,
+    center,
+    ohlc_df=None,
+    minimum_range=MIN_DISPLAY_PRICE_RANGE,
+    price_bin=PRICE_BIN_SIZE,
+    margin_ratio=PRICE_RANGE_MARGIN_RATIO,
+):
+    """Calculate aligned price-axis bounds from movement plus a forced margin.
+
+    OHLC low/high defines the actual movement when available. The requested
+    minimum width is used for quiet windows; otherwise the axis expands to at
+    least ``movement_span * (1 + margin_ratio)``. Deep book levels do not
+    widen the movement-focused axis and remain subject to the renderer's
+    existing clipped-level accounting.
+    """
+    minimum_range = float(minimum_range)
+    price_bin = float(price_bin)
+    margin_ratio = float(margin_ratio)
+    if not np.isfinite(minimum_range) or minimum_range <= 0:
+        raise ValueError('minimum_range must be positive and finite')
+    if not np.isfinite(price_bin) or price_bin <= 0:
+        raise ValueError('price_bin must be positive and finite')
+    if not np.isfinite(margin_ratio) or margin_ratio < 0:
+        raise ValueError('margin_ratio must be finite and non-negative')
+
+    center = _finite_price(center)
+    if center is None:
+        raise ValueError('center must be a finite price')
+
+    observed = [center]
+    movement = [center]
+    for row in rows or []:
+        for key in ('mid', 'best_bid', 'best_ask'):
+            value = _finite_price(row.get(key))
+            if value is not None:
+                observed.append(value)
+        for key in ('bid_prices', 'ask_prices'):
+            for value in row.get(key, []) or []:
+                value = _finite_price(value)
+                if value is not None:
+                    observed.append(value)
+
+    has_ohlc_movement = False
+    if ohlc_df is not None and not ohlc_df.empty:
+        for column in ('low', 'high'):
+            if column not in ohlc_df:
+                continue
+            values = np.asarray(
+                pd.to_numeric(ohlc_df[column], errors='coerce'), dtype=float,
+            ).reshape(-1)
+            for value in values:
+                value = _finite_price(value)
+                if value is not None:
+                    movement.append(value)
+                    has_ohlc_movement = True
+
+    # OHLC low/high is the actual movement for the requested draw period.
+    # Without candles, fall back to the displayed book/mid observations.
+    if not has_ohlc_movement:
+        movement = observed
+    movement_low = min(movement)
+    movement_high = max(movement)
+    movement_span = movement_high - movement_low
+    if movement_span * (1.0 + margin_ratio) < minimum_range:
+        lower = center - minimum_range / 2.0
+        upper = center + minimum_range / 2.0
+    else:
+        margin = movement_span * margin_ratio / 2.0
+        lower = movement_low - margin
+        upper = movement_high + margin
+
+    price_min = np.floor(lower / price_bin) * price_bin
+    price_max = np.ceil(upper / price_bin) * price_bin
+    # pcolormesh's upper edge is exclusive for the row-index calculation;
+    # keep an extra bin when a value lands exactly on that boundary.
+    if price_max <= upper:
+        price_max += price_bin
+    while price_max - price_min < minimum_range:
+        price_max += price_bin
+    while price_min > movement_low:
+        price_min -= price_bin
+    while price_max <= movement_high:
+        price_max += price_bin
+    return float(price_min), float(price_max)
+
+
+def chart_snapshot_heatmap(
+    rows, market, out_path, period_label, feature_rows=None, ohlc_df=None,
+    candle_interval_minutes=15, candle_interval_label=None,
+):
     """Render agg data with the server1 production OrderHeatmap composition."""
+    candle_interval_minutes = parse_candle_interval(candle_interval_minutes)
+    candle_interval_label = candle_interval_label or format_candle_interval(candle_interval_minutes)
     feature_rows = feature_rows or []
     raw_rows = list(rows)
     downsampled = len(rows) > 1 and (int(rows[-1]['ts']) - int(rows[0]['ts'])) >= 30 * 60 * 1000
     if downsampled:
         display = pd.DataFrame(rows)
-        display['bucket'] = pd.to_datetime(display['ts'], unit='ms', utc=True).dt.floor('15min')
+        display['bucket'] = pd.to_datetime(display['ts'], unit='ms', utc=True).dt.floor(f'{candle_interval_minutes}min')
         display['has_book'] = (
             display['finalized'].fillna(False)
             & display['mid'].notna()
@@ -530,23 +702,26 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
             .to_dict('records')
         )
     # The source book stage is 30s; after display reduction the contract is
-    # one representative row per 15m bucket. Use explicit cadences so sparse
-    # samples cannot make a large outage look like the normal interval.
-    expected_interval_ms = 15 * 60 * 1000 if downsampled else 30 * 1000
+    # one representative row per requested candle bucket. Use explicit
+    # cadences so sparse samples cannot make a large outage look normal.
+    expected_interval_ms = candle_interval_minutes * 60 * 1000 if downsampled else 30 * 1000
     gap_spans = detect_time_gaps(rows, expected_interval_ms=expected_interval_ms)
     mid_values = [float(row['mid']) for row in rows if row.get('finalized') and row.get('mid') is not None]
     if not mid_values:
         raise RuntimeError(f'No finalized mid prices for {market}')
 
     center = float(mid_values[-1])
-    price_bin = 20.0
-    # Keep the active price action readable. A fixed +/-$4,000 range made
-    # normal 15m candle bodies disappear inside a mostly empty heatmap.
-    display_half_range = 1500.0
-    price_min = np.floor((center - display_half_range) / price_bin) * price_bin
-    price_max = np.ceil((center + display_half_range) / price_bin) * price_bin
-    price_edges = np.arange(price_min, price_max + price_bin, price_bin)
+    price_bin = PRICE_BIN_SIZE
     x_dt = pd.to_datetime([row['ts'] for row in rows], unit='ms', utc=True)
+    # Use only candles that are actually represented by the displayed snapshot
+    # rows. Feature history may begin earlier than the book snapshot window.
+    displayed_ohlc = ohlc_df
+    if ohlc_df is not None and not ohlc_df.empty:
+        displayed_ohlc = ohlc_df[(ohlc_df.index >= x_dt[0]) & (ohlc_df.index <= x_dt[-1])]
+    # Use the actual candle movement plus the configured total margin whenever it exceeds
+    # the minimum readable range. Keep the 20-dollar display bin unchanged.
+    price_min, price_max = _auto_price_bounds(rows, center, ohlc_df=displayed_ohlc)
+    price_edges = np.arange(price_min, price_max + price_bin, price_bin)
     x_num = mdates.date2num(x_dt.to_pydatetime())
     if len(x_num) > 1:
         x_midpoints = (x_num[:-1] + x_num[1:]) / 2.0
@@ -602,10 +777,10 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     ask_img = np.where(np.isfinite(ask_grid) & (ask_grid >= qty_vmin), ask_grid, np.nan)
 
     market_type = 'Futures' if 'perp' in market else 'Spot'
-    fig = plt.figure(figsize=(12.8, 8.0), facecolor='#151515')
+    fig = plt.figure(figsize=(12.8, 8.0), facecolor=TV_BG)
     outer = gridspec.GridSpec(
-        2, 1, height_ratios=[6.6, 1.35], hspace=0.06,
-        left=0.055, right=0.955, bottom=0.085, top=0.925,
+        2, 1, height_ratios=[6.6, 1.35], hspace=0.08,
+        left=0.055, right=0.955, bottom=0.09, top=0.915,
     )
     top_outer = gridspec.GridSpecFromSubplotSpec(
         1, 2, subplot_spec=outer[0], width_ratios=[0.08, 4.30], wspace=0.054,
@@ -627,19 +802,22 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     fig.add_subplot(bottom_inner[1]).set_axis_off()
     spacer.set_axis_off()
     for ax in (cbar_anchor, ax_main, ax_profile, ax_depth):
-        ax.set_facecolor('#151515')
+        ax.set_facecolor(TV_BG)
 
     ax_main.set_ylim(price_min, price_max)
     ax_main.set_xlim(x_edges[0], x_edges[-1])
     ax_main.yaxis.tick_right()
     ax_main.yaxis.set_label_position('right')
-    ax_main.yaxis.set_major_locator(mticker.MultipleLocator(500))
+    ax_main.yaxis.set_major_locator(mticker.MaxNLocator(nbins=PRICE_AXIS_TICK_COUNT, steps=[1, 2, 5, 10]))
     ax_main.yaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: f'{value:.0f}'))
-    ax_main.tick_params(axis='y', colors='white', labelsize=9)
+    ax_main.tick_params(axis='y', labelright=False, length=0)
     ax_main.tick_params(axis='x', labelbottom=False)
-    ax_main.grid(True, axis='x', linestyle=':', alpha=0.18, color='gray')
-    bid_cmap = plt.get_cmap('Blues_r')
-    ask_cmap = plt.get_cmap('OrRd_r')
+    ax_main.grid(True, axis='x', linestyle='-', linewidth=0.55, alpha=0.55, color=TV_EDGE)
+    ax_main.grid(True, axis='y', linestyle='-', linewidth=0.45, alpha=0.42, color=TV_EDGE)
+    for spine in ax_main.spines.values():
+        spine.set_color(TV_EDGE)
+        spine.set_alpha(0.8)
+    bid_cmap, ask_cmap = orderbook_colormaps()
     # pcolormesh preserves real elapsed time when snapshots are irregular;
     # imshow would stretch every column to the same width and hide outages.
     bid_im = ax_main.pcolormesh(x_edges, price_edges, bid_img, shading='flat', cmap=bid_cmap, norm=norm, alpha=0.8, zorder=1)
@@ -647,7 +825,7 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
 
     # Mark missing intervals without filling, carrying forward, or visually
     # attributing depth to a period for which no valid snapshot exists.
-    gap_color = '#F6C453'
+    gap_color = TV_WARNING
     for start_ms, end_ms in gap_spans:
         start_num = mdates.date2num(pd.Timestamp(start_ms, unit='ms', tz='UTC').to_pydatetime())
         end_num = mdates.date2num(pd.Timestamp(end_ms, unit='ms', tz='UTC').to_pydatetime())
@@ -667,42 +845,51 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     if ohlc_df is None or ohlc_df.empty:
         raise RuntimeError(f'No transformed TFP OHLCV for {market}')
     ohlc = ohlc_df[(ohlc_df.index >= x_dt[0]) & (ohlc_df.index <= x_dt[-1])]
-    width_days = 15 * 60 / 86400 * 0.72
+    width_days = candle_interval_minutes * 60 / 86400 * 0.72
     # Agg derived features can have a very small 15m body (or a flat VWAP
     # candle). Keep the candle visible over the absolute-price heatmap.
     candle_body_floor = max(price_bin * 0.5, 20.0)
     if not ohlc.empty:
-        for up, color in ((ohlc['close'] >= ohlc['open'], '#3bb2e5'), (ohlc['close'] < ohlc['open'], '#e9546c')):
+        for up, color in ((ohlc['close'] >= ohlc['open'], TV_BID), (ohlc['close'] < ohlc['open'], TV_ASK)):
             part = ohlc[up]
             if part.empty:
                 continue
             idx = mdates.date2num(part.index.to_pydatetime())
             bottoms = np.minimum(part['open'], part['close'])
             heights = np.maximum((part['close'] - part['open']).abs(), candle_body_floor)
-            ax_main.vlines(idx, part['low'], part['high'], color='#050505', linewidth=4.0, zorder=12.0)
-            ax_main.vlines(idx, part['low'], part['high'], color=color, linewidth=2.0, zorder=12.1)
-            ax_main.bar(idx, heights, width_days, bottom=bottoms, color=color, edgecolor='#ffffff', linewidth=1.8, alpha=1.0, zorder=12.2)
+            ax_main.vlines(idx, part['low'], part['high'], color=TV_TEXT, linewidth=1.0, alpha=0.92, zorder=12.0)
+            ax_main.bar(idx, heights, width_days, bottom=bottoms, color=color, edgecolor=TV_TEXT, linewidth=0.8, alpha=0.96, zorder=12.2)
     if not fdf.empty:
         buys = pd.to_numeric(fdf.get('buy_notional_1s', 0), errors='coerce').fillna(0)
         sells = pd.to_numeric(fdf.get('sell_notional_1s', 0), errors='coerce').fillna(0)
-        for values, color, label in ((buys, '#2E8B57', 'Buy Volume'), (sells, '#DC143C', 'Sell Volume')):
+        for values, color, label in ((buys, TV_BID, 'Buy Volume'), (sells, TV_ASK, 'Sell Volume')):
             part = fdf.loc[values.nlargest(12).index]
             if part.empty:
                 continue
             sizes = np.interp(values.loc[part.index], [max(values.min(), 0), max(values.max(), 1)], [25, 420])
             prices = pd.to_numeric(part.get('book_mid_price', np.nan), errors='coerce')
-            ax_main.scatter(mdates.date2num(part.index.to_pydatetime()), prices, s=sizes, color=color, alpha=0.45, edgecolors='white', linewidths=0.2, label=label, zorder=5)
+            ax_main.scatter(mdates.date2num(part.index.to_pydatetime()), prices, s=sizes, color=color, alpha=0.55, edgecolors=TV_TEXT, linewidths=0.25, label=label, zorder=5)
 
     latest_price = float(mids[np.isfinite(mids)][-1])
-    price_color = '#3bb2e5'
-    ax_main.text(0.015, 0.975, f'{latest_price:.2f}', transform=ax_main.transAxes, fontsize=24, fontweight='bold', color=price_color, va='top', ha='left', bbox=dict(boxstyle='round,pad=0.28', fc='black', ec=price_color, lw=1.0, alpha=0.82), zorder=6)
-    range_note = f'View ±${display_half_range:,.0f}'
+    price_color = TV_BID
+    ax_main.axhline(latest_price, color=TV_ACCENT, linestyle=(0, (4, 3)), linewidth=0.8, alpha=0.75, zorder=10)
+    ax_main.text(
+        0.015, 0.965, f'{latest_price:,.2f}', transform=ax_main.transAxes,
+        fontsize=18, fontweight='bold', color=TV_TEXT, va='top', ha='left',
+        bbox=dict(boxstyle='round,pad=0.24', fc=TV_BG, ec=price_color, lw=0.9, alpha=0.94),
+        zorder=20,
+    )
+    range_note = (
+        f'View \\${price_max - price_min:,.0f} span'
+        f'  |  margin {PRICE_RANGE_MARGIN_RATIO * 100:.0f}%'
+        f'  |  minimum \\${MIN_DISPLAY_PRICE_RANGE:,.0f}'
+    )
     if clipped_levels:
         range_note += f'  |  clipped {clipped_levels} levels ({clipped_qty:.2f} BTC)'
     ax_main.text(
         0.015, 0.905, range_note, transform=ax_main.transAxes,
-        fontsize=8, color='#d6d3d1', va='top', ha='left',
-        bbox=dict(boxstyle='round,pad=0.16', fc='#151515', ec='#555555', lw=0.5, alpha=0.78),
+        fontsize=8, color=TV_MUTED, va='top', ha='left',
+        bbox=dict(boxstyle='round,pad=0.16', fc=TV_BG, ec=TV_EDGE, lw=0.5, alpha=0.9),
         zorder=20,
     )
     ax_main.set_ylabel('')
@@ -710,12 +897,12 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     # Current orderbook profile on the right, matching server1's side panel.
     ax_profile.set_ylim(price_min, price_max)
     ax_profile.yaxis.tick_right()
-    ax_profile.yaxis.set_major_locator(mticker.MultipleLocator(500))
+    ax_profile.yaxis.set_major_locator(mticker.MaxNLocator(nbins=PRICE_AXIS_TICK_COUNT, steps=[1, 2, 5, 10]))
     ax_profile.yaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: f'{value:.0f}'))
-    ax_profile.tick_params(axis='y', colors='white', labelsize=9)
+    ax_profile.tick_params(axis='y', colors=TV_TEXT, labelright=True, labelsize=9, length=0, pad=5)
     ax_profile.xaxis.set_ticks_position('top')
     ax_profile.xaxis.set_label_position('top')
-    ax_profile.set_xlabel('Order Book Qty (BTC)', color='white', fontsize=9, labelpad=3)
+    ax_profile.set_xlabel('LIVE BOOK · BTC', color=TV_MUTED, fontsize=8, labelpad=3)
     if latest_book is not None:
         profile_edges = np.arange(price_min, price_max + price_bin, price_bin)
         bid_profile = np.zeros(len(profile_edges) - 1)
@@ -770,7 +957,7 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
                 ax_profile.text(
                     qty + label_pad, centers[idx] + y_offset, format_profile_qty(qty),
                     color=color, fontsize=7.0, ha='left', va='center', clip_on=True,
-                    bbox=dict(boxstyle='round,pad=0.10', fc='#151515', ec=color, lw=0.45, alpha=0.88),
+                    bbox=dict(boxstyle='round,pad=0.10', fc=TV_BG, ec=color, lw=0.45, alpha=0.92),
                     zorder=5,
                 )
         profile_limit = max_qty * 1.72
@@ -780,19 +967,23 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     ax_profile.set_xlim(0, profile_limit)
     ax_profile.xaxis.set_major_locator(mticker.MaxNLocator(3))
     ax_profile.xaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: format_profile_qty(value)))
-    ax_profile.tick_params(axis='x', colors='white', labelsize=8)
-    ax_profile.grid(True, axis='y', linestyle=':', linewidth=0.5, color='gray', alpha=0.18)
-    ax_profile.axhline(latest_price, color='#3bb2e5', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax_profile.tick_params(axis='x', colors=TV_MUTED, labelsize=8, length=0)
+    ax_profile.grid(True, axis='y', linestyle='-', linewidth=0.45, color=TV_EDGE, alpha=0.55)
+    ax_profile.axhline(latest_price, color=TV_ACCENT, linestyle=(0, (4, 3)), linewidth=0.8, alpha=0.75)
+    for spine in ax_profile.spines.values():
+        spine.set_color(TV_EDGE)
+        spine.set_alpha(0.8)
 
     # Two separate left colorbars, exactly like server1.
     cbar_grid = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=cbar_anchor.get_subplotspec(), hspace=0.1)
     cbar_anchor.remove()
     ask_cax = fig.add_subplot(cbar_grid[0])
     bid_cax = fig.add_subplot(cbar_grid[1])
-    for cax, image, label in ((ask_cax, ask_im, 'Ask Quantity'), (bid_cax, bid_im, 'Bid Quantity')):
+    for cax, image, label in ((ask_cax, ask_im, 'ASK · BTC'), (bid_cax, bid_im, 'BID · BTC')):
         cbar = fig.colorbar(image, cax=cax, orientation='vertical')
-        cbar.set_label(label, fontsize=9, color='white')
-        cbar.ax.tick_params(labelsize=8, colors='white')
+        cbar.set_label(label, fontsize=8, color=TV_MUTED)
+        cbar.ax.tick_params(labelsize=7, colors=TV_MUTED, length=0)
+        cbar.outline.set_edgecolor(TV_EDGE)
         cax.yaxis.set_ticks_position('left')
         cax.yaxis.set_label_position('left')
 
@@ -800,9 +991,12 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     # the heatmap above.  A stacked 0-100% view makes the neutral point and
     # the changing side dominance immediately visible; total depth alone does
     # not distinguish which side is applying the pressure.
-    ax_depth.grid(True, linestyle=':', alpha=0.16, color='gray')
-    ax_depth.tick_params(axis='x', colors='white', labelsize=9)
-    ax_depth.tick_params(axis='y', colors='white', labelsize=9)
+    ax_depth.grid(True, linestyle='-', linewidth=0.5, alpha=0.55, color=TV_EDGE)
+    ax_depth.tick_params(axis='x', colors=TV_TEXT, labelsize=9, length=0, pad=4)
+    ax_depth.tick_params(axis='y', colors=TV_MUTED, labelsize=8, length=0)
+    for spine in ax_depth.spines.values():
+        spine.set_color(TV_EDGE)
+        spine.set_alpha(0.8)
     ax_depth.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d\n%H:%M', tz=JST))
     bid_depth = np.zeros(len(rows), dtype=float)
     ask_depth = np.zeros(len(rows), dtype=float)
@@ -842,14 +1036,14 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     else:
         pressure_min, pressure_max = 0.0, 100.0
     pressure_x = x_num
-    bid_pressure_color = '#13B8E6'  # cyan / bid
-    ask_pressure_color = '#F05A5A'  # coral red / ask
+    bid_pressure_color = TV_BID
+    ask_pressure_color = TV_ASK
     ax_depth.fill_between(
-        pressure_x, pressure_min, bid_ratio, color=bid_pressure_color, alpha=0.30,
+        pressure_x, pressure_min, bid_ratio, color=bid_pressure_color, alpha=0.22,
         linewidth=0, label='Bid pressure', step='post', zorder=2,
     )
     ax_depth.fill_between(
-        pressure_x, bid_ratio, pressure_max, color=ask_pressure_color, alpha=0.30,
+        pressure_x, bid_ratio, pressure_max, color=ask_pressure_color, alpha=0.22,
         linewidth=0, label='Ask pressure', step='post', zorder=2,
     )
     for start_ms, end_ms in gap_spans:
@@ -867,13 +1061,15 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     # CVD is trade-flow cumulative delta in BTC, independent of book depth.
     # Aggregate the canonical 1s feature deltas into the same 15m display
     # buckets, then reset the visible baseline at the start of this chart.
-    cvd_values = derive_display_cvd(rows, feature_rows, gap_spans=gap_spans)
+    cvd_values = derive_display_cvd(
+        rows, feature_rows, interval=f'{candle_interval_minutes}min', gap_spans=gap_spans,
+    )
 
     ax_cvd = ax_depth.twinx()
     ax_cvd.set_facecolor('none')
-    ax_cvd.tick_params(axis='y', colors='#F6C453', labelsize=8)
-    ax_cvd.spines['right'].set_color('#F6C453')
-    ax_cvd.set_ylabel('CVD (BTC)', color='#F6C453', fontsize=9)
+    ax_cvd.tick_params(axis='y', colors=TV_CVD, labelsize=8, length=0)
+    ax_cvd.spines['right'].set_color(TV_CVD)
+    ax_cvd.set_ylabel('CVD (BTC)', color=TV_CVD, fontsize=8)
     finite_cvd = cvd_values[np.isfinite(cvd_values)]
     if finite_cvd.size:
         cvd_min = min(0.0, float(finite_cvd.min()))
@@ -881,15 +1077,15 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
         cvd_pad = max((cvd_max - cvd_min) * 0.10, 1e-6)
         ax_cvd.set_ylim(cvd_min - cvd_pad, cvd_max + cvd_pad)
         ax_cvd.plot(
-            pressure_x, cvd_values, color='#F6C453', linewidth=1.35,
+            pressure_x, cvd_values, color=TV_CVD, linewidth=1.25,
             alpha=0.95, label='CVD', zorder=6,
         )
-        ax_cvd.axhline(0.0, color='#F6C453', linewidth=0.6, linestyle=':', alpha=0.45, zorder=5)
+        ax_cvd.axhline(0.0, color=TV_CVD, linewidth=0.6, linestyle=':', alpha=0.45, zorder=5)
         ax_cvd.text(
             0.995, 0.06, f'CVD {float(finite_cvd[-1]):+.2f} BTC',
             transform=ax_cvd.transAxes, ha='right', va='bottom',
-            color='#F6C453', fontsize=9,
-            bbox=dict(boxstyle='round,pad=0.16', fc='#151515', ec='#F6C453', lw=0.65, alpha=0.82),
+            color=TV_CVD, fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.16', fc=TV_BG, ec=TV_CVD, lw=0.65, alpha=0.92),
             zorder=10,
         )
     else:
@@ -897,28 +1093,35 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
     ax_cvd.yaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: f'{value:.2f}'))
     ax_cvd.grid(False)
 
-    ax_depth.axhline(50, color='#d6d3d1', linewidth=0.8, linestyle='--', alpha=0.58, zorder=4)
+    ax_depth.axhline(50, color=TV_TEXT, linewidth=0.8, linestyle='--', alpha=0.58, zorder=4)
     ax_depth.set_ylim(pressure_min, pressure_max)
-    ax_depth.set_ylabel('Bid / Ask %', color='#e5e7eb', fontsize=10)
+    ax_depth.set_ylabel('Bid / Ask %', color=TV_TEXT, fontsize=9)
     ax_depth.yaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: f'{value:.0f}%'))
-    label_box = dict(boxstyle='round,pad=0.16', fc='#151515', alpha=0.82, lw=0.7)
-    ax_depth.text(0.012, 0.86, 'ASK', transform=ax_depth.transAxes, color='#FFFFFF', fontsize=9, fontweight='bold', va='top', bbox={**label_box, 'ec': ask_pressure_color})
-    ax_depth.text(0.012, 0.06, 'BID', transform=ax_depth.transAxes, color='#FFFFFF', fontsize=9, fontweight='bold', va='bottom', bbox={**label_box, 'ec': bid_pressure_color})
+    label_box = dict(boxstyle='round,pad=0.16', fc=TV_BG, alpha=0.92, lw=0.7)
+    ax_depth.text(0.012, 0.86, 'ASK', transform=ax_depth.transAxes, color=TV_TEXT, fontsize=8, fontweight='bold', va='top', bbox={**label_box, 'ec': ask_pressure_color})
+    ax_depth.text(0.012, 0.06, 'BID', transform=ax_depth.transAxes, color=TV_TEXT, fontsize=8, fontweight='bold', va='bottom', bbox={**label_box, 'ec': bid_pressure_color})
     if finite_ratio.size:
         latest_bid = float(finite_ratio[-1])
         latest_ask = 100.0 - latest_bid
         ax_depth.text(
             0.995, 0.90, f'Bid {latest_bid:.0f}%  |  Ask {latest_ask:.0f}%',
             transform=ax_depth.transAxes, ha='right', va='top',
-            color='#e5e7eb', fontsize=10,
-            bbox=dict(boxstyle='round,pad=0.18', fc='#151515', ec='#555555', alpha=0.78),
+            color=TV_TEXT, fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.18', fc=TV_BG, ec=TV_EDGE, alpha=0.92),
         )
 
     handles, labels = ax_main.get_legend_handles_labels()
     if handles:
-        ax_main.legend(handles=handles, labels=labels, fontsize=9, loc='lower left', bbox_to_anchor=(0.005, 0.005), framealpha=0.7, labelcolor='white').get_frame().set_facecolor('black')
+        legend = ax_main.legend(
+            handles=handles, labels=labels, fontsize=8, ncol=2,
+            loc='lower left', bbox_to_anchor=(0.005, 0.005),
+            framealpha=0.92, labelcolor=TV_TEXT, handlelength=1.2,
+            borderpad=0.45, columnspacing=0.8,
+        )
+        legend.get_frame().set_facecolor(TV_BG)
+        legend.get_frame().set_edgecolor(TV_EDGE)
     title_kind = 'Futures' if 'perp' in market else 'Spot'
-    title_interval = '15m'
+    title_interval = candle_interval_label
     quote = 'USDC' if 'usdc' in market else ('USD' if any(name in market for name in ('coinbase', 'kraken', 'bitstamp', 'bitfinex', 'crypto_com')) else 'USDT')
     venue = market.rsplit('_', 1)[0].upper()
     title_time = x_dt[-1].tz_convert('Asia/Tokyo').strftime('%Y-%m-%d %H:%M')
@@ -930,11 +1133,24 @@ def chart_snapshot_heatmap(rows, market, out_path, period_label, feature_rows=No
             0.995, 0.975, f'DATA GAP  {len(gap_spans)}  /  {format_gap_duration(0, total_gap_ms)}',
             transform=ax_main.transAxes, fontsize=9, fontweight='bold',
             color=gap_color, va='top', ha='right',
-            bbox=dict(boxstyle='round,pad=0.20', fc='#151515', ec=gap_color, lw=0.8, alpha=0.88),
+            bbox=dict(boxstyle='round,pad=0.20', fc=TV_BG, ec=gap_color, lw=0.8, alpha=0.92),
             zorder=20,
         )
-    fig.suptitle(f'BTC_{quote} {venue} {title_kind} OrderHeatmap v3.41 | {title_interval} | {title_time} JST{gap_summary}', color='white', fontsize=13, y=0.96)
-    fig.savefig(out_path, dpi=150, facecolor='#151515')
+    fig.suptitle(
+        f'BTC/{quote}  ·  {venue}  ·  {title_kind}  ·  OrderHeatmap',
+        color=TV_TEXT, fontsize=11, fontweight='bold', ha='left', x=0.055, y=0.955,
+    )
+    fig.text(
+        0.955, 0.955,
+        f'{title_interval} candles  ·  {title_time} JST  ·  {period_label}{gap_summary}',
+        color=TV_MUTED, fontsize=8.5, ha='right', va='center',
+    )
+    # Re-apply the calculated bounds after every artist has been added. Some
+    # Matplotlib artists autoscale their axes when created, which could
+    # otherwise override the data-driven lower edge on the final PNG.
+    ax_main.set_ylim(price_min, price_max)
+    ax_profile.set_ylim(price_min, price_max)
+    fig.savefig(out_path, dpi=150, facecolor=TV_BG)
     plt.close(fig)
     return out_path
 
@@ -943,11 +1159,23 @@ def main():
     p = argparse.ArgumentParser(description='Strict absolute-price OrderHeatmap')
     p.add_argument('--market', type=str, default='binance_perp', help='Market name (server1-compatible default)')
     p.add_argument('--markets', action='store_true', help='Render all available markets')
-    p.add_argument('--hours', type=int, default=12, help='Lookback hours')
+    p.add_argument('--hours', type=int, default=None, help='Lookback hours (legacy form)')
+    p.add_argument('--period', type=parse_period, default=None, help='Lookback duration, e.g. 30m, 24h, or 3d')
+    p.add_argument('--candle-interval', '--interval-minutes', dest='candle_interval', type=parse_candle_interval, default=15, help='Candle size, e.g. 1m, 15m, 1h')
     p.add_argument('--from-ms', type=int, default=None, help='Inclusive UTC start timestamp in milliseconds')
     p.add_argument('--to-ms', type=int, default=None, help='Exclusive UTC end timestamp in milliseconds')
     p.add_argument('--out', type=str, default=None, help='Output path')
     args = p.parse_args()
+
+    if args.period is not None and args.hours is not None:
+        p.error('use either --period or --hours, not both')
+    if args.period is None:
+        hours = args.hours if args.hours is not None else 12
+        period_label = f'{hours}h'
+    else:
+        hours, period_label = args.period
+    if hours <= 0:
+        p.error('--period/--hours must be positive')
 
     if args.markets:
         import glob
@@ -970,9 +1198,9 @@ def main():
 
     for mkt in markets:
         try:
-            rows = load_snapshot_heatmap(mkt, args.hours, args.from_ms, args.to_ms)
-            feature_rows = load_feature_rows(mkt, args.hours, args.from_ms, args.to_ms)
-            ohlc_df = derive_ohlcv_from_features(feature_rows)
+            rows = load_snapshot_heatmap(mkt, hours, args.from_ms, args.to_ms)
+            feature_rows = load_feature_rows(mkt, hours, args.from_ms, args.to_ms)
+            ohlc_df = derive_ohlcv_from_features(feature_rows, freq=f'{args.candle_interval}min')
             print(f"  {mkt}: {len(rows)} rows, strict snapshot source, {len(feature_rows)} feature rows, {len(ohlc_df)} candles")
             if ohlc_df.empty:
                 print(f"    skip: no transformed TFP OHLCV rows for {mkt}")
@@ -993,9 +1221,10 @@ def main():
             start = pd.Timestamp(args.from_ms, unit='ms', tz='UTC').strftime('%H:%M:%S') if args.from_ms is not None else 'start'
             end = pd.Timestamp(args.to_ms, unit='ms', tz='UTC').strftime('%H:%M:%S') if args.to_ms is not None else 'now'
             period_label = f'{start}–{end} UTC'
-        else:
-            period_label = f'{args.hours}h'
-        chart_snapshot_heatmap(rows, mkt, out_path, period_label, feature_rows, ohlc_df)
+        chart_snapshot_heatmap(
+            rows, mkt, out_path, period_label, feature_rows, ohlc_df,
+            candle_interval_minutes=args.candle_interval,
+        )
         sz = os.path.getsize(out_path) / 1024
         print(f"    → {out_path} ({sz:.0f} KB)")
 
