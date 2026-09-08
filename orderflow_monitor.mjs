@@ -210,6 +210,11 @@ let rawDbFlushPromise = Promise.resolve();
 let rawDbFailure = null;
 let rawDbFlushTimer = null;
 let rawDbRetentionTimer = null;
+// Canonical raw frames (issues #10/#11) get their own pending queue so the
+// append-only writer is fed independently of the legacy mutable batches.
+const canonicalDbPending = [];
+let canonicalDbFlushPromise = Promise.resolve();
+const CANONICAL_DB_FLUSH_MAX_EVENTS = 16_384;
 const derivativesHelper = rawDbWriter
   ? new DerivativesHelper(outputBase, {
     intervalMs: 30_000,
@@ -262,6 +267,39 @@ function flushRawDbQueue() {
   return rawDbFlushPromise;
 }
 
+// Canonical raw flush (issues #10/#11): append-only sink. Batches are
+// re-queued and the failure is reported fail-closed when the append rejects.
+function flushCanonicalDbQueue() {
+  if (!rawDbWriter || rawDbFailure) return canonicalDbFlushPromise;
+  canonicalDbFlushPromise = canonicalDbFlushPromise.then(async () => {
+    while (canonicalDbPending.length) {
+      const batch = canonicalDbPending.splice(0, CANONICAL_DB_FLUSH_MAX_EVENTS);
+      try {
+        await rawDbWriter.appendCanonical(batch);
+      } catch (error) {
+        canonicalDbPending.unshift(...batch);
+        throw error;
+      }
+    }
+  }).catch((error) => {
+    reportRawDbFailure(error);
+  });
+  return canonicalDbFlushPromise;
+}
+
+function enqueueCanonicalFrames(envelopes) {
+  if (!rawDbWriter || rawDbFailure) return;
+  if (rawDbWriter.appendCanonical === undefined) return; // duckdb path: no canonical table
+  for (const envelope of envelopes ?? []) {
+    if (canonicalDbPending.length >= RAW_DB_PENDING_MAX_EVENTS) {
+      reportRawDbFailure(new Error('canonical raw pending queue limit exceeded'));
+      return;
+    }
+    canonicalDbPending.push(envelope);
+  }
+  if (canonicalDbPending.length >= CANONICAL_DB_FLUSH_MAX_EVENTS) void flushCanonicalDbQueue();
+}
+
 function enqueueRawEnvelopes(envelopes) {
   if (!rawDbWriter) return;
   for (const envelope of envelopes ?? []) {
@@ -283,6 +321,7 @@ async function closeRawDb() {
   rawDbFlushTimer = null;
   rawDbRetentionTimer = null;
   await flushRawDbQueue();
+  await flushCanonicalDbQueue();
   await rawDbWriter.close();
 }
 
@@ -331,6 +370,10 @@ function createWorker(workerId, groupMarkets) {
 
       case 'rawEvents':
         enqueueRawEnvelopes(msg.envelopes);
+        break;
+
+      case 'canonicalFrames':
+        enqueueCanonicalFrames(msg.envelopes);
         break;
 
       case 'rawQueueFailure':
@@ -535,9 +578,14 @@ async function main() {
       }
     }
     derivativesHelper.start();
-    rawDbFlushTimer = setInterval(() => { void flushRawDbQueue(); }, RAW_DB_FLUSH_INTERVAL_MS);
+    rawDbFlushTimer = setInterval(() => {
+      void flushRawDbQueue();
+      void flushCanonicalDbQueue();
+    }, RAW_DB_FLUSH_INTERVAL_MS);
     rawDbRetentionTimer = setInterval(() => {
-      void flushRawDbQueue().then(() => rawDbWriter.pruneExpired()).catch(reportRawDbFailure);
+      void Promise.all([flushRawDbQueue(), flushCanonicalDbQueue()])
+        .then(() => rawDbWriter.pruneExpired())
+        .catch(reportRawDbFailure);
     }, 6 * 60 * 60 * 1000);
     rawDbFlushTimer.unref?.();
     rawDbRetentionTimer.unref?.();
