@@ -19,7 +19,12 @@ import path from 'node:path';
 import os from 'node:os';
 import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
-import { MarketStatusTracker } from './lib/market-status.mjs';
+import {
+  MarketStatusTracker,
+  defaultStatusFilePath,
+  formatMarketStatusV1,
+  writeMarketStatusFile,
+} from './lib/market-status.mjs';
 import { validateConfig } from './lib/config-validator.mjs';
 import { acquireOutputRootLock, releaseOutputRootLock } from './lib/lock.mjs';
 import { RawDbWriter, DEFAULT_RAW_RETENTION_DAYS } from './lib/raw-db-writer.mjs';
@@ -72,6 +77,7 @@ Options:
   --storage <files|duckdb|sqlite> Select raw storage backend
   --database <path>               DuckDB path (default: data/agg-btc-receiver.duckdb)
   --database-dir <dir>            SQLite market DB directory (default: data/sqlite)
+  --status-file <path>            Market-status.json path for downstream (default: <database-dir>/../market-status.json)
   --retention-days <N>            DuckDB raw retention (default: 90)
   --optional-markets <list>       Legacy compatibility option; initial market failures now recover per-market
   --selfTestReconnectAfterMs <N>  Close sockets after N ms for reconnect smoke test
@@ -166,12 +172,19 @@ if (unsupportedOptionalMarkets.length > 0) {
   process.exit(1);
 }
 
-// ====== Issue #16: market data-completeness tracking ======
-// Separates "worker process ready" from "every required market streams with a
-// synced book". expected = all enabled markets; optional (CLI, allowlisted)
-// markets never block data_complete. `ready` messages no longer imply
-// completeness: a degraded market keeps the worker ready while the aggregate
-// reports data_complete=false with the degraded market + reason.
+// ====== Issue #16 + Issue #9 (Done条件#8): market data-completeness ======
+// MarketStatusTracker is the SINGLE source of truth for per-market state. It
+// separates "worker process ready" from "every required market streams with a
+// synced book" (expected = all enabled markets; optional markets never block
+// data_complete) and feeds BOTH projections below:
+//   1. health.jsonl  — refreshHealthCompleteness() pushes the snapshot into
+//      the HealthMonitor (additive expected/running/degraded_markets,
+//      data_complete, change-only completeness_transitions), and
+//   2. market-status.json — publishMarketStatusFile() formats the SAME
+//      snapshot into the downstream receiver-market-status/v1 contract and
+//      atomically writes it (state changes + 2s periodic flush).
+// There is deliberately NO second tracker: every IPC event applies a tracker
+// method and then re-derives both outputs from the snapshot.
 const marketStatus = new MarketStatusTracker({
   expectedMarkets: enabledMarkets,
   optionalMarkets: [...optionalMarkets],
@@ -437,6 +450,7 @@ function createWorker(workerId, groupMarkets) {
         }
         marketStatus.observeState(msg.market, msg.to);
         refreshHealthCompleteness();
+        publishMarketStatusFile();
         break;
 
       case 'marketStatus': {
@@ -455,6 +469,7 @@ function createWorker(workerId, groupMarkets) {
         }
         const snap = refreshHealthCompleteness();
         if (snap.data_complete !== prev) logCompletenessChange(snap, `worker ${msg.workerId} market ${msg.market}`);
+        publishMarketStatusFile();
         break;
       }
 
@@ -466,6 +481,7 @@ function createWorker(workerId, groupMarkets) {
         // Issue #16: an isolated market is not running — data_complete=false.
         marketStatus.markDegraded(msg.market, msg.reason);
         logCompletenessChange(refreshHealthCompleteness(), `market ${msg.market} degraded`);
+        publishMarketStatusFile();
         break;
 
       case 'stats':
@@ -477,6 +493,7 @@ function createWorker(workerId, groupMarkets) {
         // explicit stateChange/marketRestarted recovery event arrives).
         if (msg.payload?.state) marketStatus.observeStatsState(msg.market, msg.payload.state);
         refreshHealthCompleteness();
+        publishMarketStatusFile();
         break;
 
       case 'replayDone':
@@ -491,6 +508,7 @@ function createWorker(workerId, groupMarkets) {
         // the aggregate tracker so health output separates the concepts.
         marketStatus.applyReady(msg.workerId, msg);
         logCompletenessChange(refreshHealthCompleteness(), `worker ${msg.workerId} ready`);
+        publishMarketStatusFile();
         console.log(
           `[main] worker ${msg.workerId} ready ` +
           `(processReady=true, data_complete=${msg.dataComplete === true})`,
@@ -506,6 +524,7 @@ function createWorker(workerId, groupMarkets) {
         console.log(`[main] module restart complete: ${msg.market} (worker ${msg.workerId})`);
         marketStatus.observeState(msg.market, 'running');
         logCompletenessChange(refreshHealthCompleteness(), `market ${msg.market} restarted`);
+        publishMarketStatusFile();
         break;
       case 'marketRestartFailed':
         console.error(`[main] module restart failed: ${msg.market}: ${msg.reason}`);
@@ -518,6 +537,7 @@ function createWorker(workerId, groupMarkets) {
         // explicit recovery event arrives).
         marketStatus.markDegraded(msg.market, `module restart failed: ${msg.reason}`);
         logCompletenessChange(refreshHealthCompleteness(), `market ${msg.market} restart failed`);
+        publishMarketStatusFile();
         break;
 
       case 'writerStatus':
@@ -537,11 +557,16 @@ function createWorker(workerId, groupMarkets) {
 
   worker.on('error', (err) => {
     console.error(`[main] worker ${workerId} error:`, err.message);
+    // Qwen P1-2: the crashed worker's markets stop streaming — degrade them
+    // through the tracker so data_complete=false and market-status.json
+    // reflects the isolation before the fail-closed shutdown below.
+    degradeWorkerMarkets(workerId, `error: ${err.message}`);
     handleUnexpectedWorkerFailure(workerId, `error: ${err.message}`);
   });
 
   worker.on('exit', (code) => {
     console.log(`[main] worker ${workerId} exited with code ${code}`);
+    degradeWorkerMarkets(workerId, `exit code ${code}`);
     handleUnexpectedWorkerFailure(workerId, `exit code ${code}`);
     readyWorkers.delete(workerId);
     workers.delete(workerId);
@@ -560,6 +585,80 @@ function createWorker(workerId, groupMarkets) {
   });
 
   return worker;
+}
+
+// ====== Issue #9 (Done条件#8): receiver-market-status/v1 file emission ======
+// The downstream status file is derived from the SAME MarketStatusTracker
+// snapshot as health.jsonl (see the tracking section above). Contract:
+//   path:   --status-file <path> | defaultStatusFilePath(rawDatabaseDir)
+//           (default: sibling of the receiver SQLite dir, i.e.
+//            dirname(--database-dir)/market-status.json)
+//   schema: receiver-market-status/v1 (docs/current/data-contract.md)
+// Downstream (agg-btc-downstream src/receiver-completeness.mjs) polls this
+// file; a missing/unparsable/stale (>15s) file must never be read as
+// "complete" — fail-visible.
+const marketStatusFilePath = path.resolve(arg('status-file', defaultStatusFilePath(rawDatabaseDir)));
+/** Periodic flush cadence while running (state changes write immediately). */
+const STATUS_REFRESH_INTERVAL_MS = 2000;
+/** Debounce: identical documents are not re-written more often than this. */
+const STATUS_MIN_WRITE_INTERVAL_MS = 1000;
+let statusFileTimer = null;
+let statusWriteChain = Promise.resolve();
+let lastStatusJson = null;
+let lastStatusWriteAtMs = 0;
+
+/** All workers ready and no startup failure — the receiver process is up. */
+function isProcessReady() {
+  return expectedWorkerCount > 0 && readyWorkers.size >= expectedWorkerCount && !startupFailed;
+}
+
+/** Current tracker snapshot formatted as the downstream contract document. */
+function currentStatusDocument() {
+  return formatMarketStatusV1(marketStatus.snapshot(), { processReady: isProcessReady() });
+}
+
+/**
+ * Persist market-status.json atomically (tmp+rename). Called on every
+ * state-changing IPC event (immediate write when the document changed) and by
+ * a 2s periodic timer; an unchanged document is skipped when one was written
+ * within the last second (stats ticks arrive every ~2s — debounce keeps the
+ * file fresh without hammering the disk). Returns the document that was (or
+ * would be) written.
+ */
+function publishMarketStatusFile(force = false) {
+  const doc = currentStatusDocument();
+  const json = JSON.stringify(doc);
+  const changed = json !== lastStatusJson;
+  lastStatusJson = json;
+  const now = Date.now();
+  if (force || changed || now - lastStatusWriteAtMs >= STATUS_MIN_WRITE_INTERVAL_MS) {
+    lastStatusWriteAtMs = now;
+    statusWriteChain = statusWriteChain
+      .catch(() => {})
+      .then(() => writeMarketStatusFile(marketStatusFilePath, doc))
+      .catch((error) => console.error(`[main] market-status file write failed: ${error.message}`));
+  }
+  return doc;
+}
+
+/**
+ * Qwen P1-2: a worker crash (exit/error) means every market that worker owned
+ * is no longer streaming. Degrade them all through the tracker so
+ * data_complete flips false and the status file shows the isolation
+ * immediately; the main process then fail-closes via the existing runtime
+ * failure policy and the shutdown flush persists this last view. Graceful
+ * shutdowns (planned) never degrade — downstream detects those by staleness.
+ */
+function degradeWorkerMarkets(workerId, reason) {
+  if (plannedShutdown || !readyWorkers.has(workerId)) return;
+  const assigned = workerMarkets.get(workerId);
+  if (!assigned || assigned.length === 0) return;
+  for (const market of assigned) {
+    marketStatus.markDegraded(market, `worker ${workerId} lost: ${reason}`);
+  }
+  const snap = refreshHealthCompleteness();
+  logCompletenessChange(snap, `worker ${workerId} crashed`);
+  publishMarketStatusFile(true);
 }
 
 // ====== Main setup ======
@@ -633,6 +732,17 @@ async function main() {
       `expected=${snap.expected_markets.length} running=${snap.running_markets.length} ` +
       `degraded=${Object.keys(snap.degraded_markets).length}`,
     );
+    // Issue #9 (Done条件#8): publish the initial market-status.json and keep
+    // it fresh — every state change writes immediately, and this 2s timer is
+    // the periodic flush (unchanged documents are debounced to ≥1s).
+    const doc = publishMarketStatusFile(true);
+    console.log(
+      `[main] market-status summary: process_ready=${doc.process_ready} data_complete=${doc.data_complete} ` +
+      `expected=${doc.expected_markets.length} running=${doc.running_markets.length} ` +
+      `degraded=${Object.keys(doc.degraded_markets).length}`,
+    );
+    statusFileTimer = setInterval(() => publishMarketStatusFile(), STATUS_REFRESH_INTERVAL_MS);
+    if (statusFileTimer.unref) statusFileTimer.unref();
   }
 
   // Graceful shutdown
@@ -643,6 +753,10 @@ async function main() {
     plannedShutdown = true;
     if (reason) console.error(`[main] ${reason}`);
     console.log('[main] shutting down...');
+    if (statusFileTimer) {
+      clearInterval(statusFileTimer);
+      statusFileTimer = null;
+    }
 
     // Send shutdown to all workers and wait for them
     const workerExitPromises = [];
@@ -661,6 +775,10 @@ async function main() {
     const promises = [];
     promises.push(closeRawDb());
     promises.push(healthMonitor.close());
+    // Last market-status.json write (e.g. the P1-2 crash degradation view) is
+    // flushed before exit so the file never outlives the process claiming a
+    // completeness the receiver no longer guarantees.
+    promises.push(statusWriteChain.catch(() => {}));
     await Promise.allSettled(promises);
 
     console.log(`[main] shutdown complete (exit ${exitCode})`);
