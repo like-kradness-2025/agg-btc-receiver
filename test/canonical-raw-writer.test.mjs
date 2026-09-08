@@ -11,6 +11,9 @@
 //      (Astra P2-2 regression)
 //   8. pre-parse capture: frames that fail JSON.parse are preserved under the
 //      reserved parse_failed classification (Astra P2-3 regression)
+//   9. empty-string frames: '' is DISTINGUISHED from missing/non-string
+//      frame_text — empty parse-failed frames persist byte-exact as frame: ""
+//      (Astra re-audit P2 regression)
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,7 +23,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { RawSqliteWriter } from '../lib/raw-sqlite-writer.mjs';
+import { RawSqliteWriter, normalizeCanonicalEnvelope } from '../lib/raw-sqlite-writer.mjs';
 import { BaseConnector, CANONICAL_UNPARSED_STREAM } from '../lib/base-connector.mjs';
 import { BinanceSpotConnector, BinancePerpConnector } from '../lib/binance-connector.mjs';
 
@@ -405,6 +408,119 @@ test('parse-failed WS frames are captured through the real socket handler before
     assert.deepEqual(rows.map((r) => r.channel), [null, null]);
     assert.deepEqual(rows.map((r) => JSON.parse(r.frame_json).frame), [badFrame1, badFrame2],
       'persisted frame_json.frame must carry the exact failing source text');
+    await fs.rm(root, { recursive: true, force: true });
+  } finally {
+    conn._clearTimers();
+    try { conn.disconnect(); } catch { /* ignore */ }
+  }
+});
+
+// ---- Astra re-audit P2: empty-string frames ('' vs missing/non-string) -------
+
+test('normalizeCanonicalEnvelope: empty-string frame_text normalizes to frame ""; missing/non-string stays rejected (Astra P2)', () => {
+  const base = {
+    schema: 'raw_v7_canonical', market: 'empty-m', stream: CANONICAL_UNPARSED_STREAM,
+    channel: null, connection_id: 'empty-m:1:1', receive_seq: 1, recv_ts_ms: 1000,
+  };
+  // Empty-string frame_text is a string and must normalize byte-exact.
+  const row = normalizeCanonicalEnvelope({ ...base, frame_text: '' }, 9, 'sess', 1);
+  assert.equal(JSON.parse(row.frame_json).frame, '', 'frame must be the byte-exact empty string');
+  assert.equal(row.frame_sha256, sha256(row.frame_json), 'hash must still cover the stored envelope');
+  // Missing / non-string frame_text must keep failing closed (unchanged).
+  const missing = { ...base };
+  delete missing.frame_text;
+  for (const bad of [
+    missing,                                   // absent
+    { ...base, frame_text: null },             // nullish -> falls through -> absent
+    { ...base, frame_text: undefined },        // nullish -> falls through -> absent
+    { ...base, frame_text: 42 },               // non-string
+    { ...base, frame_text: { raw: 'x' } },     // non-string object
+  ]) {
+    assert.throws(() => normalizeCanonicalEnvelope(bad, 9, 'sess', 1), TypeError,
+      'missing/non-string frame_text must be rejected');
+  }
+});
+
+test('empty-string canonical frames append byte-exact next to normal frames (Astra P2)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'canonical-empty-frame-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  const conn = 'binance_perp:1:7';
+  await writer.appendCanonical([
+    canonicalEnvelope('empty-m2', CANONICAL_UNPARSED_STREAM, { connection_id: conn, receive_seq: 1, recv_ts_ms: 100, frame_text: '' }),
+    canonicalEnvelope('empty-m2', 'trades', { connection_id: conn, receive_seq: 2, recv_ts_ms: 200, frame_text: '{"e":"trade","p":"100"}' }),
+    canonicalEnvelope('empty-m2', CANONICAL_UNPARSED_STREAM, { connection_id: conn, receive_seq: 3, recv_ts_ms: 300, frame_text: '' }),
+  ]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'empty-m2.sqlite'),
+    'SELECT stream, receive_seq, frame_json FROM canonical_frames ORDER BY frame_id');
+  assert.equal(rows.length, 3, 'empty-string frames must not be dropped by the writer');
+  assert.deepEqual(rows.map((r) => r.stream), ['parse_failed', 'trades', 'parse_failed']);
+  assert.deepEqual(rows.map((r) => JSON.parse(r.frame_json).frame),
+    ['', '{"e":"trade","p":"100"}', ''],
+    'empty source frames must persist byte-exact as frame: ""');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('empty WS messages are captured pre-parse as parse_failed and persist to canonical_frames (Astra P2)', async () => {
+  // ws-compatible mock (same shape as the parse-failure test above).
+  class MockWebSocket extends EventEmitter {
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = 0; // CONNECTING
+    }
+
+    send() {}
+    close() { this.readyState = 3; }
+    terminate() { this.readyState = 3; }
+  }
+
+  const conn = new BinancePerpConnector({ restUrl: 'http://localhost:1/book' });
+  conn._setWebSocket(MockWebSocket);
+  try {
+    const connectPromise = conn.connect();
+    setImmediate(() => {
+      conn._ws.readyState = 1; // OPEN
+      conn._ws.emit('open');
+    });
+    await connectPromise;
+
+    const frames = [];
+    const errors = [];
+    const order = [];
+    conn.on('canonicalFrame', (frame) => { frames.push(frame); order.push('frame'); });
+    conn.on('error', (ev) => { errors.push(ev); order.push('error'); });
+
+    // Empty socket frame (binary zero-length buffer) and empty text frame.
+    conn._ws.emit('message', Buffer.alloc(0));
+    conn._ws.emit('message', Buffer.from(''));
+
+    assert.equal(frames.length, 2, 'empty frames must be captured pre-parse, not dropped');
+    assert.equal(errors.length, 2, 'JSON.parse("") failure must still surface as an error event');
+    assert.deepEqual(order, ['frame', 'error', 'frame', 'error'],
+      'canonical capture must precede the parse error for empty frames too');
+    assert.deepEqual(frames.map((f) => f.stream), ['parse_failed', 'parse_failed']);
+    assert.deepEqual(frames.map((f) => f.frame_text), ['', ''], 'empty source text must be preserved byte-exact');
+    assert.deepEqual(frames.map((f) => f.receive_seq), [1, 2],
+      'empty frames consume receive_seq like any other socket frame');
+    assert.deepEqual(errors.map((e) => e.raw), ['', '']);
+    assert.ok(errors.every((e) => e.message.startsWith('parse error:')));
+
+    // Full path: the captured empty envelopes persist into canonical_frames.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'canonical-empty-ws-'));
+    const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+    await writer.appendCanonical(frames);
+    await writer.close();
+    const rows = query(path.join(root, 'binance_perp.sqlite'),
+      'SELECT stream, channel, receive_seq, frame_sha256, frame_json FROM canonical_frames ORDER BY frame_id');
+    assert.equal(rows.length, 2, 'empty parse-failed frames must survive the full socket->writer path');
+    assert.deepEqual(rows.map((r) => r.stream), ['parse_failed', 'parse_failed']);
+    assert.deepEqual(rows.map((r) => r.channel), [null, null]);
+    assert.deepEqual(rows.map((r) => JSON.parse(r.frame_json).frame), ['', ''],
+      'persisted frame_json.frame must carry the byte-exact empty source text');
+    assert.ok(rows.every((r) => r.frame_sha256 === sha256(r.frame_json)),
+      'stored hash must match the stored envelope even for empty frames');
     await fs.rm(root, { recursive: true, force: true });
   } finally {
     conn._clearTimers();
