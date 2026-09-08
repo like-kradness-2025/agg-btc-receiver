@@ -12,6 +12,11 @@
 //       timestamps fail-closed and never masquerade as the current time)
 //   (d) buildRawDbEnvelope persists existing ingress metadata verbatim and
 //       never re-stamps recv_ts_ms (missing stays null — no Date.now())
+//   (e) Astra-audit regressions: OKX replay honors emit rejection (fail-closed
+//       resync, no book pollution); Gemini depth socket has its own
+//       connection id / receive_seq; _ingressFields keeps the ingress
+//       snapshot's connection_id across generations; strict timestamp
+//       coercion never fabricates ts=0/-1 from null/''/false.
 //
 // Fixtures are inline (matching existing connector test style); the only
 // fixture dir (test/fixtures/burst-v1) has no raw-frame fixtures to reuse.
@@ -22,6 +27,9 @@ import { EventEmitter } from 'node:events';
 import { BaseConnector } from '../lib/base-connector.mjs';
 import { BitstampConnector } from '../lib/bitstamp-connector.mjs';
 import { CoinbaseConnector } from '../lib/coinbase-connector.mjs';
+import { OkxConnector } from '../lib/okx-connector.mjs';
+import { GeminiConnector } from '../lib/gemini-connector.mjs';
+import { BitfinexConnector } from '../lib/bitfinex-connector.mjs';
 // Import is main-thread safe: the worker only registers its parentPort IPC
 // handler when parentPort is non-null (worker context).
 import { buildRawDbEnvelope } from '../lib/orderflow-worker.mjs';
@@ -440,5 +448,287 @@ describe('buildRawDbEnvelope (d): worker persists ingress metadata verbatim, nev
     assert.ok(!JSON.stringify(envelope.payload).includes('_ingress'));
     assert.strictEqual(envelope.payload.worker_seq, 7);
     assert.strictEqual(envelope.payload.connection_id, null);
+  });
+
+  it('(e) Astra P2-3: ""/false/-1/whitespace junk normalizes to null — never a known 0/-1', () => {
+    // Number('')===0, Number(false)===0 and Number('-1')===-1 would have
+    // fabricated "known" timestamps; strict type-first coercion nulls them.
+    const envelope = buildRawDbEnvelope({
+      ...base,
+      obj: {
+        event_ts_ms: '',          // → null (not 0)
+        ts: false,                // non-numeric type → null
+        recv_ts_ms: '   ',        // whitespace-only string → null
+        recv_mono_ns: -1,         // negative clock → null
+        source_event_ts_ms: '-1', // numeric-string junk → null
+      },
+    });
+    assert.strictEqual(envelope.event_ts_ms, null);
+    assert.strictEqual(envelope.recv_ts_ms, null);
+    assert.strictEqual(envelope.recv_mono_ns, null);
+    assert.strictEqual(envelope.source_event_ts_ms, null);
+    assert.strictEqual(envelope.source_event_time_known, false);
+    assert.strictEqual(envelope.receive_seq, null);
+  });
+
+  it('(e) Astra P2-3: numeric strings and valid numbers still coerce (control)', () => {
+    const envelope = buildRawDbEnvelope({
+      ...base,
+      obj: {
+        event_ts_ms: '1700000000123.9',  // numeric string, truncated to ms
+        recv_ts_ms: 1700000000456,
+        recv_mono_ns: '1234567890',
+        source_event_ts_ms: 1700000000000,
+        source_event_time_known: true,
+      },
+    });
+    assert.strictEqual(envelope.event_ts_ms, 1700000000123);
+    assert.strictEqual(envelope.recv_ts_ms, 1700000000456);
+    assert.strictEqual(envelope.recv_mono_ns, 1234567890);
+    assert.strictEqual(envelope.source_event_ts_ms, 1700000000000);
+    assert.strictEqual(envelope.source_event_time_known, true);
+  });
+});
+
+// ====== Astra P1: OKX replay honors emit rejection (e) ======
+
+describe('OKX replay (Astra P1): rejected replayed diff never touches book/seq', () => {
+  function createOkx() {
+    const conn = new OkxConnector({});
+    conn._setState('connected');
+    conn._ws = { send: () => {}, close: () => {} };
+    conn._ringBuf = [];
+    conn._wsSnapshotReceived = false;
+    // Record the fail-closed resync trigger without arming real reconnect
+    // timers (this test only asserts resync was entered).
+    conn.resyncScheduled = false;
+    conn._scheduleReconnect = () => { conn.resyncScheduled = true; };
+    register(conn);
+    return conn;
+  }
+
+  it('abandons replay and resyncs when the replayed diff is emit-rejected (missing ts)', () => {
+    const conn = createOkx();
+    const errors = [];
+    conn.on('error', (ev) => errors.push(ev));
+    const emitted = [];
+    conn.on('depth', (ev) => emitted.push(ev));
+
+    // Buffered pre-snapshot: a diff with NO exchange ts. On replay its emit is
+    // rejected (fail-closed) — it must not be applied to the book, and the
+    // sequence must not advance past what the downstream stream saw.
+    conn._handleDepth({
+      action: 'update',
+      data: [{ seqId: 11, prevSeqId: 10, bids: [['65000', '1']], asks: [] }],
+    });
+    assert.strictEqual(conn._ringBuf.length, 1);
+
+    conn._handleDepth({
+      action: 'snapshot',
+      data: [{ seqId: 10, ts: '1700000000000', bids: [['65000', '1.5']], asks: [['65001', '2.0']] }],
+    });
+
+    // Downstream saw the snapshot only — the rejected update was never emitted.
+    assert.strictEqual(emitted.length, 1);
+    assert.strictEqual(emitted[0].type, 'snapshot');
+    // Fail-closed: emit rejection routes into the sequence-gap resync instead
+    // of silently applying a diff the persisted stream never received.
+    assert.strictEqual(conn._stats.droppedDepthCount, 1);
+    assert.strictEqual(conn.resyncScheduled, true);
+    assert.ok(errors.length >= 1 && /seq gap: OKX replay emit rejected/.test(errors[0].message));
+    assert.strictEqual(conn._wsSnapshotReceived, false);
+    assert.strictEqual(conn.book.bids.size, 0, 'rejected diff must not pollute the book');
+    assert.strictEqual(conn.book._lastSeq, null, 'sequence must not advance on a rejected frame');
+  });
+
+  it('still applies a VALID replayed diff (control: replay behavior preserved)', () => {
+    const conn = createOkx();
+    const emitted = [];
+    conn.on('depth', (ev) => emitted.push(ev));
+
+    conn._handleDepth({
+      action: 'update',
+      data: [{ seqId: 11, prevSeqId: 10, ts: '1700000000011', bids: [['65000', '1']], asks: [] }],
+    });
+    assert.strictEqual(conn._ringBuf.length, 1);
+
+    conn._handleDepth({
+      action: 'snapshot',
+      data: [{ seqId: 10, ts: '1700000000000', bids: [['65000', '1.5']], asks: [['65001', '2.0']] }],
+    });
+
+    assert.strictEqual(conn.resyncScheduled, false);
+    assert.strictEqual(emitted.length, 2);
+    assert.strictEqual(emitted[1].type, 'update');
+    assert.strictEqual(emitted[1].source_event_ts_ms, 1700000000011);
+    assert.strictEqual(emitted[1].source_event_time_known, true);
+    assert.strictEqual(conn.book.bids.get('65000'), '1'); // diff applied over snapshot
+    assert.strictEqual(conn.book._lastSeq, 11);
+    assert.strictEqual(conn._wsSnapshotReceived, true);
+  });
+});
+
+// ====== Astra P2-1: Gemini depth socket owns its ingress stream (e) ======
+
+describe('Gemini depth socket (Astra P2-1): independent connection id / receive_seq', () => {
+  function feedDepthFrame(conn, obj) {
+    conn._depthWs.emit('message', Buffer.from(JSON.stringify(obj)));
+  }
+
+  async function createGemini() {
+    const conn = new GeminiConnector({});
+    conn._setWebSocket(MockWebSocket);
+    register(conn);
+    await connectConn(conn); // open → subscribe() → _connectDepthWs()
+    const t0 = Date.now();
+    while (!conn._depthWs && Date.now() - t0 < 2000) await sleep(5);
+    assert.ok(conn._depthWs, 'depth WS never created by subscribe()');
+    assert.ok(conn._depthConnectionId, 'depth connection id not assigned');
+    return conn;
+  }
+
+  it('depth frames carry their own connection id and a receive_seq starting at 1', async () => {
+    const conn = await createGemini();
+    const mainId = conn._connectionId;
+    const depthId = conn._depthConnectionId;
+    assert.ok(mainId && depthId);
+    assert.notStrictEqual(depthId, mainId, 'depth socket must be its own generation');
+
+    // Advance the MAIN socket's frame counter first (heartbeats are ignored
+    // payloads but still counted at the ingress boundary).
+    feedFrame(conn, { type: 'heartbeat' });
+    feedFrame(conn, { type: 'heartbeat' });
+    assert.strictEqual(conn._receiveSeq, 2);
+
+    const depthEvents = [];
+    conn.on('depth', (ev) => depthEvents.push(ev));
+    const depthFrame = (changes) => ({ type: 'l2_updates', changes, trades: [] });
+
+    feedDepthFrame(conn, depthFrame([{ side: 'bid', price: '65000', remaining: '1.5' }]));
+    feedDepthFrame(conn, depthFrame([{ side: 'ask', price: '65001', remaining: '2.0' }]));
+
+    assert.strictEqual(depthEvents.length, 2);
+    // Depth stream starts at 1 — it must NOT continue the main counter (3, 4).
+    assert.deepStrictEqual(depthEvents.map((ev) => ev.receive_seq), [1, 2]);
+    // ...and every depth event carries the depth socket's own connection id.
+    assert.ok(depthEvents.every((ev) => ev.connection_id === depthId));
+    assert.ok(depthEvents.every((ev) => ev.connection_id !== mainId));
+    assert.ok(depthEvents.every((ev) => typeof ev.recv_mono_ns === 'number'));
+    // Gemini book frames carry no exchange event time: still explicit.
+    assert.strictEqual(depthEvents[0].source_event_ts_ms, null);
+    assert.strictEqual(depthEvents[0].source_event_time_known, false);
+
+    // Depth traffic never advanced the main socket's counter or identity.
+    assert.strictEqual(conn._receiveSeq, 2);
+    assert.strictEqual(conn._connectionId, mainId);
+    assert.strictEqual(conn._receiveSeq + conn._depthReceiveSeq, 4);
+
+    // Main socket frames after depth traffic still count independently.
+    feedFrame(conn, { type: 'heartbeat' });
+    assert.strictEqual(conn._receiveSeq, 3);
+  });
+});
+
+// ====== Astra P2-2: connection_id follows the ingress snapshot (e) ======
+
+describe('_ingressFields (Astra P2-2): connection_id follows the ingress snapshot', () => {
+  function createConn() {
+    const conn = new BaseConnector({}, { market: 'p22', wsUrl: 'ws://localhost:1', restUrl: '' });
+    conn._setWebSocket(MockWebSocket);
+    conn.subscribe = () => {};
+    register(conn);
+    return conn;
+  }
+
+  it('old-generation replay snapshot keeps its OWN connection_id (no mixed heritage)', () => {
+    const conn = createConn();
+    conn._connectionId = 'gen-2-current';
+    conn._receiveSeq = 5;
+    const emitted = [];
+    conn.on('depth', (ev) => emitted.push(ev));
+
+    // Ingress captured on an OLD socket generation, replayed now: recv_ts_ms,
+    // receive_seq AND connection_id must all stay with the old generation —
+    // never "old recv_ts/receive_seq + new connection_id".
+    conn._emitDepth('update', [['65000', '1']], [], 1700000000000, 9, {}, {
+      recv_ts_ms: 111111, recv_mono_ns: 42, connection_id: 'gen-1-old', receive_seq: 7,
+    });
+
+    assert.strictEqual(emitted.length, 1);
+    assert.strictEqual(emitted[0].connection_id, 'gen-1-old');
+    assert.strictEqual(emitted[0].receive_seq, 7);
+    assert.strictEqual(emitted[0].recv_ts_ms, 111111);
+    assert.strictEqual(emitted[0].recv_mono_ns, 42);
+    assert.strictEqual(emitted[0].source_event_ts_ms, 1700000000000);
+    assert.strictEqual(emitted[0].source_event_time_known, true);
+  });
+
+  it('ingress without connection_id (or none at all) falls back to the current connection id', () => {
+    const conn = createConn();
+    conn._connectionId = 'gen-2-current';
+    const emitted = [];
+    conn.on('depth', (ev) => emitted.push(ev));
+
+    // Legacy-shaped ingress snapshot (no connection_id field) → current gen.
+    conn._emitDepth('update', [['65000', '1']], [], 1700000000000, 1, {},
+      { recv_ts_ms: 222, recv_mono_ns: null, receive_seq: 3 });
+    // No ingress at all (direct emit outside a socket callback) → current gen.
+    conn._emitDepth('update', [['65000', '2']], [], 1700000000001, 2, {});
+
+    assert.strictEqual(emitted[0].connection_id, 'gen-2-current');
+    assert.strictEqual(emitted[0].receive_seq, 3);
+    assert.strictEqual(emitted[0].recv_ts_ms, 222);
+    assert.strictEqual(emitted[1].connection_id, 'gen-2-current');
+    assert.strictEqual(emitted[1].receive_seq, null);
+  });
+});
+
+// ====== Astra P2-3: Bitfinex missing source ts stays null (e) ======
+
+describe('Bitfinex (Astra P2-3): missing source ts is null — never fabricated ts=0', () => {
+  function createConn() {
+    const conn = new BitfinexConnector({});
+    conn._ws = { send: () => {} };
+    conn._setState('running');
+    return conn;
+  }
+
+  it('array trade with null mts is dropped (fail-closed), not emitted as ts=0/known', () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    // [chanId, 'tu', [id, mts, amount, price]] with a missing (null) mts.
+    conn._onMessage([5, 'tu', [123, null, 0.1, '65000']]);
+
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(conn._stats.droppedTradeCount, 1);
+  });
+
+  it("object trade with ''/false mts is dropped — never ts=0/source_event_time_known=true", () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    conn._onMessage({ type: 'trade', data: { id: 124, mts: '', amount: -0.2, price: '65001' } });
+    conn._onMessage({ type: 'trade', data: { id: 125, mts: false, amount: 0.3, price: '65002' } });
+
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(conn._stats.droppedTradeCount, 2);
+  });
+
+  it('valid mts still emits with known source time (control)', () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    conn._onMessage([5, 'tu', [126, 1700000000123, -0.2, '65003']]);
+
+    assert.strictEqual(emitted.length, 1);
+    assert.strictEqual(emitted[0].ts, 1700000000123);
+    assert.strictEqual(emitted[0].source_event_ts_ms, 1700000000123);
+    assert.strictEqual(emitted[0].source_event_time_known, true);
+    assert.strictEqual(emitted[0].side, 'sell');
+    assert.strictEqual(emitted[0].qty, 0.2);
   });
 });
