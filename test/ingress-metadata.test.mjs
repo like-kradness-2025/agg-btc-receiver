@@ -750,10 +750,17 @@ describe('Gemini depth socket (Astra P2-1): independent connection id / receive_
     // Number(false)===0 / Number('')===0 / Number('   ')===0 would fabricate
     // ts:0 with source_event_time_known:true — strict type-first coercion
     // must null them out and drop the trades fail-closed.
+    // Astra R3 (P2 regression): Date.parse('-1') yields a positive 2001 epoch
+    // (978274800000), so a negative numeric string used to slip past the
+    // numeric gate and emit a trade with a FABRICATED known source time.
+    // Finite negatives (number and numeric string) must be rejected in place.
     feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 901, timestamp: false }]));
     feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 902, timestamp: '' }]));
     feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 903, timestamp: '   ' }]));
-    assert.strictEqual(trades.length, 0, 'invalid depth-trade timestamps must not emit ts:0 trades');
+    feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 904, timestamp: '-1' }]));
+    feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 905, timestamp: -1 }]));
+    feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 906, timestamp: '-1000' }]));
+    assert.strictEqual(trades.length, 0, 'invalid depth-trade timestamps must not emit ts:0/known trades');
 
     // Control: a valid timestamp still emits with the known source time.
     feedDepthFrame(conn, depthFrame([], [baseTrade]));
