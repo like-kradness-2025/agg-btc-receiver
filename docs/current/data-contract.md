@@ -229,3 +229,18 @@ source ts を以下の不変条件で分割する。
   メモリ内window（プロセス生存期間）では担保されない。
 - `trade_id`が空のtradeはidentityを証明できないため常にemitする
   （Coinbase実データは常に数値idを持つ）。
+## golden raw fixture conformance（#15・additive）
+
+- `test/fixtures/exchanges/<exchange>.json`（schema `golden-raw-frame-fixture/v1`）は、各取引所ドキュメント記載のwire形状に忠実なframe列をケース単位で保持する。各ケースは `sources[].url`（docs URL）・`capture_date`・`semantics`（ts_field/ts_unit等）・任意の`prep`（book_snapshot_running: seed book）・`frames`（実wire形状）・`expected_events`（手で確定したパース結果）を持つ。
+- conformanceテスト（`test/golden-fixtures.test.mjs`）は実connectorの `_onMessage` にframeを実投下し、①全frameが例外なく消費される(frame完全性)、②emitted eventが `expected_events` とframe順に1:1一致する(受信順序不変)、③pinned fieldが完全一致する(field不変)、④parser出力では `recv_ts_ms`/`receive_seq`/`connection_id` が常に`null`（socket境界でのみworkerが採番。parserでの捏造禁止）を検証する。
+- source時刻を持たないfeedのfixture（Coinbase Advanced Trade l2等）は `source_event_ts_ms:null`・`source_event_time_known:false`・`event_time_source:"local"` をpinし、「source時刻不明をローカル時刻で偽装しない」契約を回帰試験する。
+- 追加取引所fixtureは既存ファイルへadditiveにケース追加する（既存ケースの変更・削除はしない）。
+
+## worker ready と market data_complete の分離（#16・additive）
+
+- **process ready（worker ready）**: workerプロセスが起動し、全connectorの初期接続試行（成功/失敗問わず）が完了した状態。`ready` IPC到達とイコール。marketがdegradedでもreadyは成立する。
+- **market running**: あるmarketのconnectorがストリーム受信＋book同期完了を経て`running`に達した状態。
+- **market degraded**: 初期接続失敗・watchdog再起動等でfeedから隔離され、バックグラウンド再試行中の状態。degraded reason（`degraded_reason`/`degraded_markets`）を常に伴う。
+- **data_complete**: 全**必須**market（enabledからoptionalを除く）が同時にrunningかつ非degradedである状態。optional market・期待集合外marketはdata_completeをfalseにしない。1marketでもdegraded/reconnectingに落ちれば即false（fail-visible。downstreamはdata_complete=falseを「正常aggregateとして提示不可」と扱う）。
+- 状態は `lib/market-status.mjs` の `MarketStatusTracker` が一元管理し、worker（`lib/orderflow-worker.mjs`）・main thread（`orderflow_monitor.mjs`）・health出力の3層で同じ意味論を使う。状態遷移はmarket毎に上限付き（直近20件、aggregateは50件）で履歴保持し、health/IPCに `expected_markets`/`running_markets`/`degraded_markets`/`data_complete` として公開する。
+- readyからcompleteへの昇格・degradedからの復帰は明示的に遷移として記録され、復帰時に`recovered`フラグが立つ。complete ⇔ incomplete の遷移はworkerログに常時出力される（`data_complete=false`時はERROR扱い）。

@@ -19,6 +19,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
+import { MarketStatusTracker } from './lib/market-status.mjs';
 import { validateConfig } from './lib/config-validator.mjs';
 import { acquireOutputRootLock, releaseOutputRootLock } from './lib/lock.mjs';
 import { RawDbWriter, DEFAULT_RAW_RETENTION_DAYS } from './lib/raw-db-writer.mjs';
@@ -163,6 +164,51 @@ if (unknownEnabledMarkets.length > 0) {
 if (unsupportedOptionalMarkets.length > 0) {
   console.error(`[main] optional market is not allowlisted: ${unsupportedOptionalMarkets.join(', ')}`);
   process.exit(1);
+}
+
+// ====== Issue #16: market data-completeness tracking ======
+// Separates "worker process ready" from "every required market streams with a
+// synced book". expected = all enabled markets; optional (CLI, allowlisted)
+// markets never block data_complete. `ready` messages no longer imply
+// completeness: a degraded market keeps the worker ready while the aggregate
+// reports data_complete=false with the degraded market + reason.
+const marketStatus = new MarketStatusTracker({
+  expectedMarkets: enabledMarkets,
+  optionalMarkets: [...optionalMarkets],
+});
+
+/** Push the latest aggregate view into the HealthMonitor's next report. */
+function refreshHealthCompleteness() {
+  const snap = marketStatus.snapshot();
+  healthMonitor.setCompleteness({
+    expected_markets: snap.expected_markets,
+    running_markets: snap.running_markets,
+    degraded_markets: snap.degraded_markets,
+    data_complete: snap.data_complete,
+    transitions: snap.transitions,
+  });
+  return snap;
+}
+
+/** Last completeness value actually logged — log only on transitions. */
+let lastLoggedDataComplete = null;
+
+/** Log a completeness flip with the offending markets; returns dataComplete. */
+function logCompletenessChange(snap, reason = '') {
+  if (lastLoggedDataComplete === snap.data_complete) return snap.data_complete;
+  lastLoggedDataComplete = snap.data_complete;
+  if (snap.data_complete) {
+    console.log(
+      `[main] data_complete=true (${snap.running_markets.length}/${snap.expected_markets.length} markets running)${reason ? ` (${reason})` : ''}`,
+    );
+  } else {
+    const degraded = Object.entries(snap.degraded_markets)
+      .map(([m, r]) => `${m}:${r}`).join('; ');
+    console.error(
+      `[main] data_complete=false — degraded/missing markets must not be presented as complete: ${degraded || '(none reported running)'}`,
+    );
+  }
+  return snap.data_complete;
 }
 
 // ====== Initialize main-thread components ======
@@ -389,17 +435,45 @@ function createWorker(workerId, groupMarkets) {
         if (msg.stats) {
           healthMonitor.updateConnector(msg.market, msg.stats);
         }
+        marketStatus.observeState(msg.market, msg.to);
+        refreshHealthCompleteness();
         break;
+
+      case 'marketStatus': {
+        // Issue #16: per-market state pushed by the worker on every
+        // transition (including degraded→running recovery). `ready` no longer
+        // implies data completeness — this message keeps the aggregate view
+        // current between the 2s stats ticks.
+        const prev = marketStatus.snapshot().data_complete;
+        if (msg.degradedReason) {
+          marketStatus.markDegraded(msg.market, msg.degradedReason);
+        } else if (msg.state) {
+          const result = marketStatus.observeState(msg.market, msg.state);
+          if (result.recovered && result.dataComplete && !prev) {
+            console.log(`[main] market ${msg.market} recovered → running (worker ${msg.workerId})`);
+          }
+        }
+        const snap = refreshHealthCompleteness();
+        if (snap.data_complete !== prev) logCompletenessChange(snap, `worker ${msg.workerId} market ${msg.market}`);
+        break;
+      }
 
       case 'marketDegraded':
         console.error(
           `[main] market ${msg.market} degraded in worker ${msg.workerId}: ${msg.reason}; ` +
           `initial retry in ${Math.round((msg.retryDelayMs ?? 0) / 1000)}s`,
         );
+        // Issue #16: an isolated market is not running — data_complete=false.
+        marketStatus.markDegraded(msg.market, msg.reason);
+        logCompletenessChange(refreshHealthCompleteness(), `market ${msg.market} degraded`);
         break;
 
       case 'stats':
         healthMonitor.updateConnector(msg.market, msg.payload);
+        // Report the connector's current state so a mid-run reconnect/error is
+        // reflected in data_complete without waiting for a stateChange frame.
+        if (msg.payload?.state) marketStatus.observeState(msg.market, msg.payload.state);
+        refreshHealthCompleteness();
         break;
 
       case 'replayDone':
@@ -409,7 +483,15 @@ function createWorker(workerId, groupMarkets) {
 
       case 'ready':
         readyWorkers.add(msg.workerId);
-        console.log(`[main] worker ${msg.workerId} ready`);
+        // Issue #16: the ready report carries per-market state + the worker's
+        // own data_complete. Worker ready ≠ data complete; log both and seed
+        // the aggregate tracker so health output separates the concepts.
+        marketStatus.applyReady(msg.workerId, msg);
+        logCompletenessChange(refreshHealthCompleteness(), `worker ${msg.workerId} ready`);
+        console.log(
+          `[main] worker ${msg.workerId} ready ` +
+          `(processReady=true, data_complete=${msg.dataComplete !== false})`,
+        );
         break;
 
       case 'startupFailed':
@@ -419,6 +501,8 @@ function createWorker(workerId, groupMarkets) {
 
       case 'marketRestarted':
         console.log(`[main] module restart complete: ${msg.market} (worker ${msg.workerId})`);
+        marketStatus.observeState(msg.market, 'running');
+        logCompletenessChange(refreshHealthCompleteness(), `market ${msg.market} restarted`);
         break;
       case 'marketRestartFailed':
         console.error(`[main] module restart failed: ${msg.market}: ${msg.reason}`);
@@ -526,6 +610,18 @@ async function main() {
   }
 
   console.log(`[main] ${readyWorkers.size}/${expectedWorkerCount} workers ready`);
+  {
+    // Issue #16: worker readiness and market data completeness are separate.
+    // A fully ready receiver can still be data_complete=false (e.g. an
+    // isolated degraded market) — publish the aggregate once at startup.
+    const snap = refreshHealthCompleteness();
+    logCompletenessChange(snap);
+    console.log(
+      `[main] readiness summary: process_ready=true data_complete=${snap.data_complete} ` +
+      `expected=${snap.expected_markets.length} running=${snap.running_markets.length} ` +
+      `degraded=${Object.keys(snap.degraded_markets).length}`,
+    );
+  }
 
   // Graceful shutdown
   let shuttingDown = false;
