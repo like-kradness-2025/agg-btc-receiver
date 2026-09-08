@@ -155,7 +155,7 @@
       "depthLimit": 0
     },
     "bitmex_perp": {
-      "enabled": true,
+      "enabled": false,
       "symbol": "XBTUSD",
       "wsUrl": "wss://ws.bitmex.com/realtime?subscribe=trade:XBTUSD,orderBookL2:XBTUSD",
       "restUrl": "https://www.bitmex.com/api/v1/orderBook/L2?symbol=XBTUSD&depth=1000",
