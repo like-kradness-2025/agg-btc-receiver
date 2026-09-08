@@ -1,0 +1,71 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "bitfinex",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for bitfinex_spot (tBTCUSD, Bitfinex v2 public WebSocket). Connector subscribes to channel 'trades' and to the standard (non-raw) order book channel 'book' with prec P0 / freq F0 / len 25. Expected events are pinned by hand from the documented semantics and verified by driving the real BitfinexConnector parser.",
+  "cases": [
+    {
+      "id": "bitfinex_spot.trade",
+      "market": "bitfinex_spot",
+      "connector_class": "BitfinexConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://docs.bitfinex.com/reference/ws-public-trades", "note": "Trade channel messages: subscribe ack {\"event\":\"subscribed\",\"channel\":\"trades\",\"chanId\":19111,...}; snapshot [chanId, [[ID, MTS, AMOUNT, PRICE], ...]]; updates [chanId, 'te'|'tu', [ID, MTS, AMOUNT, PRICE]]. Docs: 'te' is the trade execution (immediate, amount may be revised), 'tu' is the confirmed trade update; MTS is epoch ms; AMOUNT > 0 = buy / < 0 = sell (negative amounts are sells)." }
+      ],
+      "semantics": {
+        "side": "AMOUNT sign is the taker side: positive -> 'buy', negative -> 'sell' (normalized on abs(AMOUNT) as qty)",
+        "price_unit": "quote (USD)",
+        "qty_unit": "base BTC (abs(AMOUNT))",
+        "ts_field": "MTS (epoch ms, floor)",
+        "ts_unit": "ms",
+        "trade_id": "ID (number -> string)",
+        "te_vs_tu": "only 'tu' (confirmed) frames emit; 'te' frames are skipped so the same trade is never double-counted — pinned by this case (the 'te' frame produces no event)"
+      },
+      "frames": [
+        { "event": "subscribed", "channel": "trades", "chanId": 19111, "symbol": "tBTCUSD", "pair": "BTCUSD" },
+        [ 19111, [ [ 401597393, 1700000000000, 0.5, 65000.0 ], [ 401597394, 1700000000100, -0.25, 65001.0 ] ] ],
+        [ 19111, "te", [ 401597395, 1700000000200, 0.005, 65000.0 ] ],
+        [ 19111, "tu", [ 401597395, 1700000000200, 0.005, 65000.0 ] ],
+        [ 19111, "tu", [ 401597396, 1700000000300, -1.25, 65005.5 ] ]
+      ],
+      "expected_events": [
+        { "kind": "trade", "market": "bitfinex_spot", "price": 65000, "qty": 0.5, "side": "buy", "ts": 1700000000000, "tradeId": "401597393", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "kind": "trade", "market": "bitfinex_spot", "price": 65001, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "401597394", "source_event_ts_ms": 1700000000100, "source_event_time_known": true },
+        { "kind": "trade", "market": "bitfinex_spot", "price": 65000, "qty": 0.005, "side": "buy", "ts": 1700000000200, "tradeId": "401597395", "source_event_ts_ms": 1700000000200, "source_event_time_known": true },
+        { "kind": "trade", "market": "bitfinex_spot", "price": 65005.5, "qty": 1.25, "side": "sell", "ts": 1700000000300, "tradeId": "401597396", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "bitfinex_spot.book",
+      "market": "bitfinex_spot",
+      "connector_class": "BitfinexConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://docs.bitfinex.com/reference/ws-public-books", "note": "Book channel messages (standard book, prec P0/freq F0/len 25): subscribe ack {\"event\":\"subscribed\",\"channel\":\"book\",\"chanId\":17082,...}; snapshot [chanId, [[PRICE, COUNT, AMOUNT], ...]]; update [chanId, [PRICE, COUNT, AMOUNT]]. Docs: COUNT = number of orders at the price level, COUNT 0 removes the level; AMOUNT = total size at the level, > 0 for bids / < 0 for asks; heartbeats are [chanId, 'hb']." }
+      ],
+      "semantics": {
+        "side": "AMOUNT sign decides the side: > 0 -> bid row, < 0 -> ask row",
+        "price_unit": "quote (USD)",
+        "qty_unit": "base BTC = abs(AMOUNT)",
+        "ts_field": "none — book frames carry no exchange event time: emitted ts is the local processing time with source_event_ts_ms=null / source_event_time_known=false / event_time_source='local'",
+        "delete_semantics": "COUNT 0 = remove the level: the emitted update row keeps the price with an empty qty '' (applyDiff deletes it from the book)",
+        "single_level_updates": "updates carry exactly one [PRICE, COUNT, AMOUNT] row; the emitted depth event holds only that row (bids or asks, the other side empty)"
+      },
+      "frames": [
+        { "event": "subscribed", "channel": "book", "chanId": 17082, "symbol": "tBTCUSD", "pair": "BTCUSD" },
+        [ 17082, [ [ 65000.0, 2, 1.5 ], [ 64999.0, 1, 2.0 ], [ 65001.0, 3, -0.8 ], [ 65002.0, 1, -1.2 ] ] ],
+        [ 17082, [ 65001.0, 2, -1.0 ] ],
+        [ 17082, [ 65002.0, 0, -1.2 ] ]
+      ],
+      "expected_events": [
+        { "kind": "depth", "type": "snapshot", "market": "bitfinex_spot", "bids": [ [ "65000", "1.5" ], [ "64999", "2" ] ], "asks": [ [ "65001", "0.8" ], [ "65002", "1.2" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "kind": "depth", "type": "update", "market": "bitfinex_spot", "bids": [], "asks": [ [ "65001", "1" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "kind": "depth", "type": "update", "market": "bitfinex_spot", "bids": [], "asks": [ [ "65002", "" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "kraken",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for kraken_spot (XBT/USD). Frames follow the official Kraken WebSocket v1 docs (trade + book channels; connector subscribes to book depth 1000). Expected events are the normalized connector output pinned by hand from the documented semantics below and verified by driving the real KrakenSpotConnector parser.",
+  "cases": [
+    {
+      "id": "kraken_spot.trade",
+      "market": "kraken_spot",
+      "connector_class": "KrakenSpotConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://docs.kraken.com/api/docs/websocket-v1/trade", "note": "Trade message: [channelID, [ [price, volume, time, side, orderType, misc], ... ], 'trade', pair]. Docs example [0, [[\"5541.20000\",\"0.15850568\",\"1534614057.321597\",\"s\",\"l\",\"\"], [\"6060.00000\",\"0.02455000\",\"1534614057.324998\",\"b\",\"l\",\"\"]], \"trade\", \"XBT/USD\"]. time is UNIX epoch in SECONDS; side 'b'=buy / 's'=sell; the v1 trade stream carries no per-trade id." }
+      ],
+      "semantics": {
+        "side": "entry[3] is the trade side: 'b' -> 'buy', 's' -> 'sell' (direct mapping — v1 trade reports the side, not a maker flag)",
+        "price_unit": "quote (USD)",
+        "qty_unit": "base BTC",
+        "ts_field": "entry[2] time (seconds) -> Math.floor(time * 1000) ms (pinned conversion)",
+        "ts_unit": "s on wire, ms emitted",
+        "trade_id": "no exchange trade id in v1: composite '<time>-<price>-<qty>-<orderType>-<misc>' concatenating the raw wire strings, pinned exactly"
+      },
+      "frames": [
+        [ 0, [ [ "65010.00000", "0.10000000", "1700000000.5", "b", "l", "" ], [ "65000.00000", "0.25000000", "1700000001.0", "s", "m", "" ] ], "trade", "XBT/USD" ]
+      ],
+      "expected_events": [
+        { "kind": "trade", "market": "kraken_spot", "price": 65010, "qty": 0.1, "side": "buy", "ts": 1700000000500, "tradeId": "1700000000.5-65010.00000-0.10000000-l-", "source_event_ts_ms": 1700000000500, "source_event_time_known": true },
+        { "kind": "trade", "market": "kraken_spot", "price": 65000, "qty": 0.25, "side": "sell", "ts": 1700000001000, "tradeId": "1700000001.0-65000.00000-0.25000000-m-", "source_event_ts_ms": 1700000001000, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "kraken_spot.book",
+      "market": "kraken_spot",
+      "connector_class": "KrakenSpotConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://docs.kraken.com/api/docs/websocket-v1/book", "note": "Book messages: [channelID, {as/bs} | {a/b/c}, 'book-<depth>', pair]. Docs snapshot example [0, {as:[[price,volume,ts],...], bs:[...]}, 'book-100', 'XBT/USD'] — the docs state 'there is no checksum on the snapshot'. Update docs example [1234, {a:[['5541.30000','2.50700000','1534614248.456738']], c:'974942666'}, 'book-10', 'XBT/USD']. Level rows are [price, volume, timestamp]; volume '0.00000000' deletes the level." }
+      ],
+      "semantics": {
+        "side": "n/a (bs=bid levels, as=ask levels on snapshot; b=bid rows, a=ask rows on update)",
+        "price_unit": "quote (USD)",
+        "qty_unit": "base BTC; volume '0' = delete level",
+        "ts_field": "none — book frames carry no exchange event time (level rows carry a per-level last-change ts, unused); emitted ts is the local processing time with source_event_ts_ms=null / source_event_time_known=false / event_time_source='local'",
+        "checksum": "c field (CRC32 of the top-10 book) is passed through on the emitted event; validation only engages once BOTH sides hold >= 10 levels. Fixture books stay below that threshold so the hand-pinned frames are checksum-neutral and c is pinned as passthrough.",
+        "level_rows": "[price, volume, timestamp] wire rows are reduced to [price, volume] string pairs; the row timestamp is dropped"
+      },
+      "frames": [
+        [ 0, { "as": [ [ "65001.0", "1.20000000", "1700000000.0" ], [ "65002.0", "0.70000000", "1700000000.0" ] ], "bs": [ [ "65000.0", "2.30000000", "1700000000.0" ], [ "64999.0", "1.00000000", "1700000000.0" ] ] }, "book-1000", "XBT/USD" ],
+        [ 42, { "a": [ [ "65001.0", "1.00000000", "1700000001.0" ] ], "b": [ [ "65000.0", "3.00000000", "1700000001.0" ] ], "c": "974942666" }, "book-1000", "XBT/USD" ],
+        [ 42, { "a": [ [ "65002.0", "0.00000000", "1700000002.0" ] ], "b": [ [ "65000.0", "3.50000000", "1700000002.0" ] ], "c": "974942667" }, "book-1000", "XBT/USD" ]
+      ],
+      "expected_events": [
+        { "kind": "depth", "type": "snapshot", "market": "kraken_spot", "bids": [ [ "65000.0", "2.30000000" ], [ "64999.0", "1.00000000" ] ], "asks": [ [ "65001.0", "1.20000000" ], [ "65002.0", "0.70000000" ] ], "checksum": null, "sequence_mode": "checksum", "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "kind": "depth", "type": "update", "market": "kraken_spot", "bids": [ [ "65000.0", "3.00000000" ] ], "asks": [ [ "65001.0", "1.00000000" ] ], "checksum": 974942666, "sequence_mode": "checksum", "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "kind": "depth", "type": "update", "market": "kraken_spot", "bids": [ [ "65000.0", "3.50000000" ] ], "asks": [ [ "65002.0", "0.00000000" ] ], "checksum": 974942667, "sequence_mode": "checksum", "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
+      ]
+    }
+  ]
+}

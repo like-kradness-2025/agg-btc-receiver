@@ -48,6 +48,9 @@ const CLASS_MODULES = {
   OkxSpotConnector: ['../lib/market-connectors.mjs'],
   CoinbaseConnector: ['../lib/coinbase-connector.mjs'],
   BitstampConnector: ['../lib/bitstamp-connector.mjs'],
+  KrakenSpotConnector: ['../lib/kraken-connector.mjs'],
+  BitfinexConnector: ['../lib/bitfinex-connector.mjs'],
+  HyperliquidConnector: ['../lib/hyperliquid-connector.mjs'],
 };
 
 const _classCache = new Map();
