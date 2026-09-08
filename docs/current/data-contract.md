@@ -111,15 +111,16 @@ CREATE TABLE canonical_frames (
 
 ### 不変条件（Issue #10 / #11 Done条件のstorage側）
 
-1. **追記のみ** — writerはINSERTしか実行しない。commit済行は後続appendで変更されない（UPDATE/merge/sort/dedupe-rewriteは本経路に存在しない）。`frame_sha256`で改変検出できる。
+1. **追記のみ** — writerはINSERTしか実行しない。commit済行は後続appendで変更されない（UPDATE/merge/sort/dedupe-rewriteは本経路に存在しない）。**自動TTL削除も存在しない**（後述: `pruneExpired()`の対象はlegacy `raw_batches` のみ）。`frame_sha256`で改変検出できる。
 2. **arrival-order** — `frame_id`（AUTOINCREMENT）が物理到着順。`event_ts_ms`はmetadataであり並び順を決めない。`ORDER BY frame_id`で受信順全走査できる。
 3. **重複防止はappend-safe** — 同一 `(connection_id, receive_seq)` が既存なら**skip**（INSERT constraint violationを期待動作として数える）。既存行のUPDATEはしない。`receive_seq = NULL`（REST等の非socket観測）はSQLite UNIQUEのNULLセマンティクスにより常に追記される。
 4. **fail-closed** — market単位の `BEGIN IMMEDIATE` トランザクション内で全行INSERT。想定外エラーはROLLBACKしバッチ全体を失敗扱い（部分書き込みなし）。呼び出し側（main process）は`reportRawDbFailure`でfail-closedにする。
 5. **dual-path** — 旧 `raw_batches` は従来どおり可変として維持（downstream互換）。両テーブルは同一market DB内でschema分離され、相互に書き込まない。
+6. **TTL対象外（無期限保持）** — `canonical_frames` は `pruneExpired()`（6時間毎・`orderflow_monitor.mjs`）の自動削除対象**ではない**。削除はlegacy `raw_batches` 系のみ。canonicalの削除はoperatorの明示操作のみ（手動DELETE / archive job）で、Receiverプロセスはcanonical履歴を自動破棄しない。容量増大は承知の上で、Issue #9/#10/#11 の「保存済みsource rawから全履歴を再計算できる」前提を守るための設計。
 
-### frame_json のenvelope shape（additive互換）
+### frame_json のenvelope shape（canonical専用・読み取りは新規adapterが必要）
 
-`frame_json`は既存raw parse（`raw_batches.raw_gzip`の各行）とadditive互換なJSON 1行。
+`frame_json`はcanonical専用のJSON 1行（下記shape）。**既存downstreamのraw parser（例: `agg-btc-downstream` の `parseRawLine`）はこのenvelopeを読めない** — payload本体が`frame`値に閉じているため既存parserの期待する構造とは異なり、渡すとnull扱いで読み捨てられる。canonical行を読むには**新規adapter**（envelopeから`frame`値を取り出し既存parserへ渡す変換層）が**将来のdownstream作業**として必要。これに対し legacy `raw_batches`（dual-path）は従来どおり既存parserで読み書きできる。
 
 ```json
 {
@@ -134,11 +135,12 @@ CREATE TABLE canonical_frames (
 }
 ```
 
-- `frame` が**parser前の完全なsource frame text**（socket受信bytesをそのまま文字列化）。canonical raw経路はこのtextを解釈しない（qty/side/ts換算ゼロ = Issue #10のNon-goal順守）。
-- 既存raw parseの必須キー（`schema/market/stream/recv_ts_ms/connection_id/receive_seq`等）を維持し、`frame`・`channel`は追加キー。
+- `frame` が**parser前の完全なsource frame text**（socket受信bytesをそのまま文字列化）。canonical raw経路はこのtextを解釈しない（qty/side/ts換算ゼロ = Issue #10のNon-goal順守）。byte-exact保存のため、text内の改行はrejectしない（外側の`JSON.stringify()`がエスケープし、`frame_json`は常に1行JSONとして格納される）。
+- キー名は既存envelopeと一部重複するが**additive互換ではない**（上記のとおり既存parserは読めない）。canonical行の消費は新規adapterの責務であり、legacy `raw_batches` の互換性は影響を受けない。
 
 ### 補足
 
-- 有効化: `raw_storage=sqlite` 時に、`_canonicalFrameMeta()` を実装したconnector（現状 Binance系6 market）のsocket messageをparser前で捕捉し `canonicalFrames` IPC → `RawSqliteWriter.appendCanonical()` へ流す。
-- 保持: `pruneExpired()` が `recv_ts_ms` 基準で90日経過行を削除（運用TTL。writerの書き込み経路にDELETE/UPDATEはない）。
+- 有効化: `raw_storage=sqlite` 時に、`_canonicalFrameMeta()` / `_canonicalUnparsedFrameMeta()` を実装したconnector（現状 Binance系6 market）のsocket messageをparser前で捕捉し `canonicalFrames` IPC → `RawSqliteWriter.appendCanonical()` へ流す。
+- **保持（TTL対象外）**: `canonical_frames` は自動TTL削除の対象外。`pruneExpired()`（起動時+6時間毎・`orderflow_monitor.mjs`）は legacy `raw_batches` のみを `last_recv_ts_ms` 基準（既定90日）で削除し、canonical行には一切触れない。canonicalは無期限に単調増加する（容量増大は許容する設計。Issue #9/#10/#11 の「保存済みsource rawから全履歴を再計算できる」前提を維持）。削除が必要な場合はoperatorの明示操作（手動DELETE / archive job）のみ。なお行DELETEは、削除した `(connection_id, receive_seq)` の再送に対してappend-safe重複ガードが効かなくなる副作用を持つため、削除より退避（コピー + cut-over）を推奨する。archive方針・実装は将来の運用作業として別途定める。
+- **分類 `parse_failed`（reserved stream）**: socket境界で `JSON.parse` に失敗したframeも、**parse試行より先に**byte-exact textを捕捉して保存する（Issue #10の「parser前source frame保存」を充足。`lib/base-connector.mjs` のmessage handlerはparse成功/失敗に関わらず先にcanonical envelopeをemitする）。失敗frameは内容を解釈できないためstream分類は不可能で、予約値 `stream='parse_failed'`・`channel=null` で記録される（`CANONICAL_UNPARSED_STREAM`定数）。`frame_json.frame` に失敗したsource textそのものを保持し、`receive_seq`/`recv_ts_ms` 等のingress metadataは他frameと同じ。既存downstream parserはこの行も読まない（新規adapterで `parse_failed` 行を除外/別扱いするかはdownstream側の設計判断）。対象connector（Binance系）のみ有効で、opt-inしないconnectorのparse失敗frameは従来どおりerror eventのみ。
 - 実データ移行手順: `docs/current/canonical-raw-migration.md` 参照。なお旧 `raw_batches` はnormalized eventでありsource frameを含まないため、**過去分のcanonical化は不可能**（新経路は有効化時点から蓄積）。

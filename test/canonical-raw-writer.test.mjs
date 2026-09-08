@@ -5,15 +5,23 @@
 //   3. append-safe duplicate guard on (connection_id, receive_seq): skip, no UPDATE
 //   4. fail-closed: unexpected error rolls back the whole market batch
 //   5. canonical rows never touch the legacy mutable raw_batches table
+//   6. TTL-exempt: pruneExpired() deletes legacy raw_batches only, never
+//      canonical_frames (Astra P1 regression)
+//   7. no newline rejection: multi-line / byte-exact frame_text is stored
+//      (Astra P2-2 regression)
+//   8. pre-parse capture: frames that fail JSON.parse are preserved under the
+//      reserved parse_failed classification (Astra P2-3 regression)
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { RawSqliteWriter } from '../lib/raw-sqlite-writer.mjs';
+import { BaseConnector, CANONICAL_UNPARSED_STREAM } from '../lib/base-connector.mjs';
 import { BinanceSpotConnector, BinancePerpConnector } from '../lib/binance-connector.mjs';
 
 function canonicalEnvelope(market, stream, overrides = {}) {
@@ -248,4 +256,158 @@ test('canonical frame envelope keeps the exact source text plus ingress metadata
   generic.market = 'x';
   // A connector that never overrides the hook yields null.
   assert.equal(generic._makeCanonicalFrame?.({}, rawText), null);
+});
+
+// ---- Astra audit regressions (PR #18 fixes) -------------------------------
+
+test('pruneExpired is TTL-exempt for canonical_frames: legacy raw_batches pruned, canonical rows survive', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'canonical-ttl-exempt-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root, retentionDays: 90 }).open();
+  const nowMs = 10_000_000_000;
+  const oldTs = nowMs - 91 * 24 * 60 * 60 * 1000; // beyond the 90-day window
+  const freshTs = nowMs - 10 * 24 * 60 * 60 * 1000;
+  // Legacy raw_batches: one expired, one fresh — the expired one MUST go.
+  await writer.append([
+    { schema: 'raw_v6_sqlite', market: 'p1m', stream: 'trades', event_ts_ms: oldTs, recv_ts_ms: oldTs, payload: { old: true } },
+    { schema: 'raw_v6_sqlite', market: 'p1m', stream: 'trades', event_ts_ms: freshTs, recv_ts_ms: freshTs, payload: { fresh: true } },
+  ]);
+  // Canonical rows with the same age split: the expired one MUST survive.
+  await writer.appendCanonical([
+    canonicalEnvelope('p1m', 'trades', { connection_id: 'p1m:1:1', receive_seq: 1, recv_ts_ms: oldTs, frame_text: '{"old":true}' }),
+    canonicalEnvelope('p1m', 'trades', { connection_id: 'p1m:1:1', receive_seq: 2, recv_ts_ms: freshTs, frame_text: '{"fresh":true}' }),
+  ]);
+  await writer.pruneExpired(nowMs);
+  await writer.close();
+
+  const dbPath = path.join(root, 'p1m.sqlite');
+  const legacy = query(dbPath, 'SELECT last_recv_ts_ms FROM raw_batches ORDER BY batch_id');
+  assert.equal(legacy.length, 1, 'legacy expired batch must be pruned by TTL');
+  assert.equal(Number(legacy[0].last_recv_ts_ms), freshTs, 'fresh legacy batch must survive');
+  const canonical = query(dbPath, 'SELECT recv_ts_ms FROM canonical_frames ORDER BY frame_id');
+  assert.equal(canonical.length, 2, 'canonical rows must never be TTL-pruned');
+  assert.deepEqual(canonical.map((r) => Number(r.recv_ts_ms)), [oldTs, freshTs],
+    'even past-retention canonical rows must be kept (immutable full history)');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('canonical frames with newline-containing source text append byte-exact (no newline rejection)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'canonical-newline-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  const prettyJson = '{\n  "stream": "btcusdt@trade",\n  "data": { "e": "trade", "p": "100" }\n}';
+  const textWithNewlines = 'line1\nline2\n{"partial": true';
+  await writer.appendCanonical([
+    canonicalEnvelope('m6', 'trades', { connection_id: 'c:6', receive_seq: 1, recv_ts_ms: 100, frame_text: prettyJson }),
+    canonicalEnvelope('m6', 'trades', { connection_id: 'c:6', receive_seq: 2, recv_ts_ms: 200, frame_text: textWithNewlines }),
+  ]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'm6.sqlite'), 'SELECT frame_json FROM canonical_frames ORDER BY frame_id');
+  assert.equal(rows.length, 2, 'frames containing newlines must not be rejected');
+  const stored = rows.map((r) => JSON.parse(r.frame_json));
+  assert.equal(stored[0].frame, prettyJson, 'pretty-printed JSON frame must round-trip byte-exact');
+  assert.equal(stored[1].frame, textWithNewlines, 'raw multi-line text must round-trip byte-exact');
+  assert.ok(!rows[0].frame_json.includes('\n'), 'outer JSON.stringify keeps frame_json a single line');
+  assert.ok(!rows[1].frame_json.includes('\n'));
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('binance connectors opt into parse_failed classification; base default stays disabled', () => {
+  for (const Conn of [BinanceSpotConnector, BinancePerpConnector]) {
+    const conn = Object.create(Conn.prototype);
+    conn.market = 'binance_x';
+    assert.deepEqual(conn._canonicalUnparsedFrameMeta('{broken json'),
+      { stream: CANONICAL_UNPARSED_STREAM, channel: null },
+      'opt-in connectors classify parse failures under the reserved stream');
+    assert.equal(CANONICAL_UNPARSED_STREAM, 'parse_failed');
+  }
+  const base = Object.create(BaseConnector.prototype);
+  assert.equal(base._canonicalUnparsedFrameMeta('{broken json'), null,
+    'non-opt-in connectors do not capture parse failures');
+});
+
+test('canonical envelope for a parse-failed frame keeps byte-exact text + ingress metadata (pre-parse capture)', () => {
+  const perp = Object.create(BinancePerpConnector.prototype);
+  perp.market = 'binance_perp';
+  const badText = '{"stream":"btcusdt@trade","data":{ "e":"trade", broken';
+  perp._ingress = { recv_ts_ms: 5555, recv_mono_ns: 7777, connection_id: 'binance_perp:9:1', receive_seq: 42 };
+  const frame = perp._makeCanonicalFrame(null, badText, new SyntaxError('Unexpected token'));
+  assert.equal(frame.stream, CANONICAL_UNPARSED_STREAM);
+  assert.equal(frame.channel, null);
+  assert.equal(frame.frame_text, badText, 'failing source text must be preserved byte-exact');
+  assert.equal(frame.connection_id, 'binance_perp:9:1');
+  assert.equal(frame.receive_seq, 42);
+  assert.equal(frame.recv_ts_ms, 5555);
+  assert.equal(frame.recv_mono_ns, 7777);
+  // Parseable frames still classify by content on the unchanged path.
+  const okText = JSON.stringify({ stream: 'btcusdt@trade', data: { e: 'trade', p: '100' } });
+  const okFrame = perp._makeCanonicalFrame(JSON.parse(okText), okText);
+  assert.equal(okFrame.stream, 'trades');
+  assert.equal(okFrame.channel, 'btcusdt@trade');
+  assert.equal(okFrame.frame_text, okText);
+});
+
+test('parse-failed WS frames are captured through the real socket handler before the error event and persist', async () => {
+  // ws-compatible mock (same shape as other connector tests).
+  class MockWebSocket extends EventEmitter {
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = 0; // CONNECTING
+    }
+
+    send() {}
+    close() { this.readyState = 3; }
+    terminate() { this.readyState = 3; }
+  }
+
+  const badFrame1 = '{"stream":"btcusdt@trade","data":{ "e":"trade", broken';
+  const badFrame2 = 'this is not json at all';
+  const conn = new BinancePerpConnector({ restUrl: 'http://localhost:1/book' });
+  conn._setWebSocket(MockWebSocket);
+  try {
+    const connectPromise = conn.connect();
+    setImmediate(() => {
+      conn._ws.readyState = 1; // OPEN
+      conn._ws.emit('open');
+    });
+    await connectPromise;
+
+    const frames = [];
+    const errors = [];
+    const order = [];
+    conn.on('canonicalFrame', (frame) => { frames.push(frame); order.push('frame'); });
+    conn.on('error', (ev) => { errors.push(ev); order.push('error'); });
+
+    conn._ws.emit('message', Buffer.from(badFrame1));
+    conn._ws.emit('message', Buffer.from(badFrame2));
+
+    assert.equal(frames.length, 2, 'parse-failed frames must be captured pre-parse');
+    assert.equal(errors.length, 2, 'parse errors must still surface as error events');
+    assert.deepEqual(order, ['frame', 'error', 'frame', 'error'],
+      'canonical capture must precede the parse error (pre-parse capture)');
+    assert.deepEqual(frames.map((f) => f.stream), ['parse_failed', 'parse_failed']);
+    assert.deepEqual(frames.map((f) => f.frame_text), [badFrame1, badFrame2],
+      'failing text must be preserved byte-exact per frame');
+    assert.deepEqual(frames.map((f) => f.receive_seq), [1, 2],
+      'parse failures consume receive_seq like any other socket frame');
+    assert.deepEqual(errors.map((e) => e.raw), [badFrame1, badFrame2]);
+    assert.ok(errors.every((e) => e.message.startsWith('parse error:')));
+
+    // Full path: the captured envelopes persist into canonical_frames.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'canonical-preparse-'));
+    const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+    await writer.appendCanonical(frames);
+    await writer.close();
+    const rows = query(path.join(root, 'binance_perp.sqlite'),
+      'SELECT stream, channel, receive_seq, frame_json FROM canonical_frames ORDER BY frame_id');
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.map((r) => r.stream), ['parse_failed', 'parse_failed']);
+    assert.deepEqual(rows.map((r) => r.channel), [null, null]);
+    assert.deepEqual(rows.map((r) => JSON.parse(r.frame_json).frame), [badFrame1, badFrame2],
+      'persisted frame_json.frame must carry the exact failing source text');
+    await fs.rm(root, { recursive: true, force: true });
+  } finally {
+    conn._clearTimers();
+    try { conn.disconnect(); } catch { /* ignore */ }
+  }
 });
