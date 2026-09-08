@@ -261,4 +261,102 @@ describe('BitstampConnector snapshot/diff boundary (Issue #13)', () => {
       globalThis.fetch = stubbed.original;
     }
   });
+
+  it('abandons a superseded REST retry so a stale snapshot never overwrites the newer connection book (Astra audit #19 P1)', async () => {
+    const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
+    conn._setState('connected');
+    const emitted = [];
+    conn.on('depth', (event) => emitted.push(event));
+
+    // Fetch call #1 (old generation, attempt 0) fails; call #2 serves the
+    // NEW connection's successful sync (qty 7); call #3 is the OLD
+    // generation's retry response (stale qty-1 book) landing only AFTER the
+    // new book is already live — the rollback window from the audit repro.
+    const staleOldBody = { ...REST_BODY, bids: [['65000', '1.0']] };
+    const newBody = { ...REST_BODY, bids: [['65000', '7.0']] };
+    const stubbed = stubFetch(null, { calls: [{ ok: false }, newBody, staleOldBody] });
+    try {
+      const oldSync = conn._syncBook(); // generation 0
+      await sleep(30); // attempt 0 has failed; the old sync is in its retry delay
+      conn._wsGeneration++; // a reconnect opens a new connection generation
+      const newSync = conn._syncBook();
+      await newSync;
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(conn.book.bids.get('65000'), '7.0');
+
+      // The old generation's retry response finally lands → must be abandoned
+      // (result never applied), leaving the newer sync's book untouched.
+      await oldSync;
+      assert.strictEqual(conn.getState(), 'running', 'superseded sync must not clobber the newer sync');
+      assert.strictEqual(conn.book.bids.get('65000'), '7.0', 'stale snapshot must not roll the book back');
+      assert.strictEqual(emitted.filter((e) => e.type === 'snapshot').length, 1,
+        'only the newer sync may emit a snapshot');
+      assert.strictEqual(conn._stats.resyncCount, 1);
+    } finally {
+      globalThis.fetch = stubbed.original;
+    }
+  });
+
+  it('never reaches running when a buffered diff has no source timestamp (boundary unprovable, fail-closed) (Astra audit #19 P1)', async () => {
+    const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
+    conn._setState('connected');
+    const errors = [];
+    conn.on('error', (ev) => errors.push(ev));
+    const stubbed = stubFetch(REST_BODY); // valid snapshot served on every attempt
+    try {
+      const sync = conn._syncBook();
+      // Diff with NO source microtimestamp buffers during sync: it may be
+      // NEWER than the snapshot, so its inclusion can never be proven and it
+      // must not be silently dropped while the sync reports success.
+      conn._onMessage({
+        event: 'data',
+        channel: 'diff_order_book_btcusd',
+        data: { bids: [['65000', '5.0']], asks: [], microtimestamp: undefined },
+      });
+      await assert.rejects(sync, /no source timestamp/);
+    } finally {
+      globalThis.fetch = stubbed.original;
+    }
+    // Three attempts, each aborted at the unprovable boundary → error state,
+    // never 'running'; the diff was NOT silently drop-counted.
+    assert.strictEqual(conn.getState(), 'error', 'unprovable boundary must never reach running');
+    assert.strictEqual(conn._stats.boundaryResyncCount, 3);
+    assert.strictEqual(conn._stats.resyncCount, 0);
+    assert.strictEqual(conn._stats.droppedDepthCount, 0, 'unprovable diff is not silently dropped');
+    assert.strictEqual(conn.book.bids.size, 0, 'no partial book may survive');
+    assert.ok(errors.some((e) => String(e.message).includes('no source timestamp')));
+  });
+
+  it('re-syncs instead of replaying an out-of-order (regressing) buffered diff pair (Astra audit #19 P1)', async () => {
+    const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
+    conn._setState('connected');
+    const emitted = [];
+    conn.on('depth', (event) => emitted.push(event));
+
+    // Buffered during sync in arrival order: ts = B+200ms then ts = B+100ms.
+    // Replaying them in arrival order would apply the B+200 diff and then
+    // ROLL the book back with the older B+100 diff — the replay path must
+    // enforce the same source-time monotonicity as the steady-state guard.
+    const newerBody = { ...REST_BODY, bids: [['65000', '9.0']], microtimestamp: micro(+5000) };
+    const stubbed = stubFetch(REST_BODY, { calls: [REST_BODY, newerBody] });
+    try {
+      const sync = conn._syncBook();
+      conn._onMessage(depthFrame([['65000', '2.0']], [], micro(+200)));
+      conn._onMessage(depthFrame([['65000', '3.0']], [], micro(+100))); // regression vs B+200
+      await sync;
+
+      assert.strictEqual(conn.getState(), 'running');
+      // The retry snapshot (boundary B+5000) provably covers BOTH diffs —
+      // neither is replayed, so the book can never hold the rolled-back value.
+      assert.strictEqual(conn.book.bids.get('65000'), '9.0');
+      assert.strictEqual(conn._stats.boundaryResyncCount, 1);
+      assert.strictEqual(conn._stats.snapshotIncludedDiffCount, 2);
+      assert.strictEqual(emitted.filter((e) => e.type === 'snapshot').length, 1,
+        'the aborted attempt must not emit a snapshot');
+      assert.strictEqual(emitted.filter((e) => e.type === 'update').length, 0,
+        'no regressing diff may ever be replayed');
+    } finally {
+      globalThis.fetch = stubbed.original;
+    }
+  });
 });

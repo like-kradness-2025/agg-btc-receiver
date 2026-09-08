@@ -102,4 +102,38 @@ describe('CoinbaseConnector market_trades idempotency (Issue #14)', () => {
       assert.strictEqual(ev.source_event_time_known, true);
     }
   });
+
+  it('refreshes recency of a duplicate trade_id so window overflow cannot re-emit it (Astra audit #19 P1)', () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    // Fill the recency window to its cap (IDs 1..8192).
+    conn._handleTrade(tradeFrame('update', Array.from({ length: 8192 }, (_, i) => trade(i + 1))));
+    assert.strictEqual(emitted.length, 8192);
+    assert.strictEqual(conn._tradeIdWindow.size, 8192);
+
+    // Reconnect overlap re-delivers the OLDEST id (1): it must be dropped AND
+    // moved to the recency tail so the next overflow cannot evict it.
+    conn._handleTrade(tradeFrame('snapshot', [trade(1)]));
+    assert.strictEqual(emitted.length, 8192);
+    assert.strictEqual(conn._stats.dedupedTradeCount, 1);
+
+    // A new trade overflows the window: eviction must take the true oldest
+    // (2), never the just-refreshed duplicate (1).
+    conn._handleTrade(tradeFrame('update', [trade(8193)]));
+    assert.strictEqual(emitted.length, 8193);
+    assert.strictEqual(conn._tradeIdWindow.has('1'), true);
+
+    // The reconnect overlap re-delivers id 1 once more → still deduped.
+    // Pre-fix: the duplicate branch's early continue left id 1 at the head,
+    // the 8193 overflow evicted it, and this re-delivery was emitted as new.
+    conn._handleTrade(tradeFrame('snapshot', [trade(1)]));
+    assert.strictEqual(emitted.length, 8193);
+    assert.strictEqual(conn._stats.dedupedTradeCount, 2);
+
+    const ids = emitted.map((e) => e.tradeId);
+    assert.strictEqual(new Set(ids).size, ids.length, 'no trade_id may be emitted twice');
+    assert.strictEqual(ids.filter((id) => id === '1').length, 1);
+  });
 });
