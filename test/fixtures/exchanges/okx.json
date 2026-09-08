@@ -1,0 +1,119 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "okx",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for OKX enabled markets (okx_perp BTC-USDT-SWAP, okx_spot BTC-USDT). Frames follow OKX V5 public WebSocket docs. Contract conversion semantics pinned: SWAP sz is in CONTRACTS of 0.01 BTC (BTC-USDT-SWAP ctVal=0.01); spot sz is already base BTC (ctVal=1).",
+  "cases": [
+    {
+      "id": "okx_perp.trade",
+      "market": "okx_perp",
+      "connector_class": "OkxConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://www.okx.com/docs-v5/en/#public-data-websocket-trades-channel", "note": "trades frame: {arg:{channel:'trades', instId}, data:[{instId, tradeId, px, sz, side, ts}]}. side = taker side; sz in contracts for SWAP; ts ms string." }
+      ],
+      "semantics": {
+        "side": "data[].side is the TAKER side (buy/sell) — direct mapping",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC = sz(contracts) * ctVal(0.01) for BTC-USDT-SWAP; derived conversion — pinned by this fixture",
+        "ts_field": "data[].ts (ms string)",
+        "ts_unit": "ms"
+      },
+      "frames": [
+        { "arg": { "channel": "trades", "instId": "BTC-USDT-SWAP" }, "data": [
+          { "instId": "BTC-USDT-SWAP", "tradeId": "okx-tx-1", "px": "65000.0", "sz": "2", "side": "buy", "ts": "1700000000000" },
+          { "instId": "BTC-USDT-SWAP", "tradeId": "okx-tx-2", "px": "64998.0", "sz": "5", "side": "sell", "ts": "1700000000100" }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "trade", "market": "okx_perp", "price": 65000, "qty": 0.02, "side": "buy", "ts": 1700000000000, "tradeId": "okx-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "kind": "trade", "market": "okx_perp", "price": 64998, "qty": 0.05, "side": "sell", "ts": 1700000000100, "tradeId": "okx-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "okx_spot.trade",
+      "market": "okx_spot",
+      "connector_class": "OkxSpotConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://www.okx.com/docs-v5/en/#public-data-websocket-trades-channel", "note": "Spot trades use the same frame shape; sz is ALREADY base BTC (ctVal=1) — no contract conversion." }
+      ],
+      "semantics": {
+        "side": "taker side, direct",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC (sz is base amount for spot)",
+        "ts_field": "data[].ts", "ts_unit": "ms"
+      },
+      "frames": [
+        { "arg": { "channel": "trades", "instId": "BTC-USDT" }, "data": [
+          { "instId": "BTC-USDT", "tradeId": "okx-sp-tx-1", "px": "65005.0", "sz": "0.500", "side": "sell", "ts": "1700000000300" }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "trade", "market": "okx_spot", "price": 65005, "qty": 0.5, "side": "sell", "ts": 1700000000300, "tradeId": "okx-sp-tx-1", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "okx_perp.liquidation",
+      "market": "okx_perp",
+      "connector_class": "OkxConnector",
+      "stream": "liquidations",
+      "kind": "liquidation",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://www.okx.com/docs-v5/en/#public-data-websocket-liquidation-orders-channel", "note": "liquidation-orders frame: {arg:{channel:'liquidation-orders', instType, instId}, data:[{instId, side, sz, ts, fillPx, fillSz, ...}]}. side = liquidation order side; sz in contracts; ts ms string; fillPx is the liquidation fill price." }
+      ],
+      "semantics": {
+        "side": "data[].side = liquidation ORDER side (buy/sell) — direct mapping",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC = sz(contracts) * ctVal(0.01)",
+        "price_field": "fillPx (fill price) — attempted-liquidations without fillPx are skipped",
+        "ts_field": "data[].ts", "ts_unit": "ms",
+        "notional": "derived = fillPx * base qty"
+      },
+      "frames": [
+        { "arg": { "channel": "liquidation-orders", "instType": "SWAP", "instId": "BTC-USDT-SWAP" }, "data": [
+          { "instType": "SWAP", "instId": "BTC-USDT-SWAP", "side": "sell", "sz": "5", "ts": "1700000000800", "fillPx": "62000.0", "fillSz": "5", "tdMode": "cross", "uly": "BTC-USDT" }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "liquidation", "market": "okx_perp", "exchange": "okx", "symbol": "BTC-USDT-SWAP", "side": "sell", "price": 62000, "qty": 0.05, "notional": 3100, "raw_type": "liquidation-orders", "trade_id": null, "source_ts": 1700000000800, "source_event_ts_ms": 1700000000800, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "okx_perp.books",
+      "market": "okx_perp",
+      "connector_class": "OkxConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://www.okx.com/docs-v5/en/#public-data-websocket-order-book-channel", "note": "books frame: {arg:{channel:'books', instId}, action: snapshot|update, data:[{asks, bids, ts, seqId, prevSeqId, checksum}]}. Level rows [px, sz, numLv1, numLv2]; sz in contracts; update prevSeqId must chain the local seqId." }
+      ],
+      "semantics": {
+        "side": "n/a (bids/asks arrays)",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC = level sz(contracts) * ctVal(0.01) — derived",
+        "ts_field": "data[].ts (ms string)", "ts_unit": "ms",
+        "seq": "seqId chained via prevSeqId — snapshot then +1 update pinned",
+        "checksum": "frame-level checksum is not validated by this connector (per project contract it is preserved in raw)"
+      },
+      "frames": [
+        { "arg": { "channel": "books", "instId": "BTC-USDT-SWAP" }, "action": "snapshot", "data": [
+          { "asks": [["65001.0", "2", "0", "1"]], "bids": [["65000.0", "1.5", "0", "2"]], "ts": "1700000000000", "seqId": 300, "checksum": 123456789 }
+        ] },
+        { "arg": { "channel": "books", "instId": "BTC-USDT-SWAP" }, "action": "update", "data": [
+          { "asks": [], "bids": [["65000.0", "2", "0", "2"]], "ts": "1700000000100", "seqId": 301, "prevSeqId": 300, "checksum": 123456790 }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "depth", "type": "snapshot", "market": "okx_perp", "bids": [["65000.0", "1.5"]], "asks": [["65001.0", "2"]], "ts": 1700000000000, "seq": 300, "snapshot_origin": "ws_sync", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "kind": "depth", "type": "update", "market": "okx_perp", "bids": [["65000.0", "2"]], "asks": [], "ts": 1700000000100, "seq": 301, "prev_seq": 300, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    }
+  ]
+}

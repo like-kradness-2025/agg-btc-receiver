@@ -1,0 +1,117 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "bybit",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for Bybit enabled markets (bybit_perp linear, bybit_spot). Wire frames follow Bybit V5 public WebSocket docs. Expected events pinned by hand from the documented semantics.",
+  "cases": [
+    {
+      "id": "bybit_perp.trade",
+      "market": "bybit_perp",
+      "connector_class": "BybitConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://bybit-exchange.github.io/docs/v5/websocket/public/trade", "note": "publicTrade frame: {topic, type, ts, data:[{T, s, S, v, p, L, i, t}]}. S is the taker side of the trade; T is the match time in ms; v base qty; i trade id." }
+      ],
+      "semantics": {
+        "side": "data[].S is the TAKER side (Buy/Sell) — normalized directly, no inversion",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC (linear perp v is base qty)",
+        "ts_field": "data[].T (match time ms)",
+        "ts_unit": "ms",
+        "frame_order": "a publicTrade message carries an ARRAY of trades; each item emits in array order"
+      },
+      "frames": [
+        { "topic": "publicTrade.BTCUSDT", "type": "snapshot", "ts": 1700000000000, "data": [
+          { "T": 1700000000000, "s": "BTCUSDT", "S": "Buy", "v": "0.500", "p": "65000.5", "L": "Market", "i": "bybit-tx-1", "t": "1700000000000" },
+          { "T": 1700000000100, "s": "BTCUSDT", "S": "Sell", "v": "1.250", "p": "64999.0", "L": "Market", "i": "bybit-tx-2", "t": "1700000000100" }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "trade", "market": "bybit_perp", "price": 65000.5, "qty": 0.5, "side": "buy", "ts": 1700000000000, "tradeId": "bybit-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "kind": "trade", "market": "bybit_perp", "price": 64999, "qty": 1.25, "side": "sell", "ts": 1700000000100, "tradeId": "bybit-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "bybit_spot.trade",
+      "market": "bybit_spot",
+      "connector_class": "BybitSpotConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://bybit-exchange.github.io/docs/v5/websocket/public/trade", "note": "Spot publicTrade uses the identical V5 frame shape (category=spot)." }
+      ],
+      "semantics": {
+        "side": "data[].S is taker side — direct mapping",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC",
+        "ts_field": "data[].T", "ts_unit": "ms"
+      },
+      "frames": [
+        { "topic": "publicTrade.BTCUSDT", "type": "snapshot", "ts": 1700000000000, "data": [
+          { "T": 1700000000200, "s": "BTCUSDT", "S": "Sell", "v": "0.020", "p": "65010.0", "L": "Market", "i": "sp-tx-1", "t": "1700000000200" }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "trade", "market": "bybit_spot", "price": 65010, "qty": 0.02, "side": "sell", "ts": 1700000000200, "tradeId": "sp-tx-1", "source_event_ts_ms": 1700000000200, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "bybit_perp.liquidation",
+      "market": "bybit_perp",
+      "connector_class": "BybitConnector",
+      "stream": "liquidations",
+      "kind": "liquidation",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://bybit-exchange.github.io/docs/v5/websocket/public/liquidation", "note": "allLiquidation frame: {topic, type, ts, data:[{updatedTime, symbol, side, size, price}]}. side is the liquidation order side; updatedTime ms; size base qty." }
+      ],
+      "semantics": {
+        "side": "data[].side = liquidation ORDER side (Buy/Sell), direct mapping",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC (linear)",
+        "ts_field": "data[].updatedTime (ms)",
+        "ts_unit": "ms",
+        "notional": "derived = price * qty"
+      },
+      "frames": [
+        { "topic": "allLiquidation.BTCUSDT", "type": "snapshot", "ts": 1700000000000, "data": [
+          { "updatedTime": 1700000000500, "symbol": "BTCUSDT", "side": "Buy", "size": "1.200", "price": "61000.0" }
+        ] }
+      ],
+      "expected_events": [
+        { "kind": "liquidation", "market": "bybit_perp", "exchange": "bybit", "symbol": "BTCUSDT", "side": "buy", "price": 61000, "qty": 1.2, "notional": 73200, "raw_type": "liquidation", "trade_id": null, "source_ts": 1700000000500, "source_event_ts_ms": 1700000000500, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "bybit_perp.orderbook",
+      "market": "bybit_perp",
+      "connector_class": "BybitConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://bybit-exchange.github.io/docs/v5/websocket/orderbook", "note": "orderbook frame: {topic, type: snapshot|delta, ts, data:{s, u, seq, b, a}}. Level rows [price, qty, updateType] where updateType 0=update 1=insert 2=delete; u is the book update id; delta u must chain local u+1." }
+      ],
+      "semantics": {
+        "side": "n/a (b=bids, a=asks arrays)",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC",
+        "ts_field": "data.ts or ts (ms)",
+        "ts_unit": "ms",
+        "seq": "data.u (book update id); snapshot then contiguous delta u+1 — snapshot/delta bridge pinned",
+        "delete_semantics": "qty 0 rows stay in the emitted update (applyDiff deletes from the book)"
+      },
+      "frames": [
+        { "topic": "orderbook.1000.BTCUSDT", "type": "snapshot", "ts": 1700000000000, "data": { "s": "BTCUSDT", "u": 200, "seq": 200, "b": [["65000.0", "1.500", "0"], ["64999.0", "2.000", "0"]], "a": [["65001.0", "0.800", "0"], ["65002.0", "1.200", "0"]] } },
+        { "topic": "orderbook.1000.BTCUSDT", "type": "delta", "ts": 1700000000100, "data": { "s": "BTCUSDT", "u": 201, "seq": 201, "b": [["65000.0", "2.000", "0"]], "a": [["65002.0", "0.000", "2"]] } }
+      ],
+      "expected_events": [
+        { "kind": "depth", "type": "snapshot", "market": "bybit_perp", "bids": [["65000.0", "1.500"], ["64999.0", "2.000"]], "asks": [["65001.0", "0.800"], ["65002.0", "1.200"]], "ts": 1700000000000, "seq": 200, "snapshot_origin": "ws_sync", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "kind": "depth", "type": "update", "market": "bybit_perp", "bids": [["65000.0", "2.000"]], "asks": [["65002.0", "0.000"]], "ts": 1700000000100, "seq": 201, "prev_seq": 200, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    }
+  ]
+}
