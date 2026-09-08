@@ -17,6 +17,11 @@
 //       connection id / receive_seq; _ingressFields keeps the ingress
 //       snapshot's connection_id across generations; strict timestamp
 //       coercion never fabricates ts=0/-1 from null/''/false.
+//   (f) Astra re-audit regressions: an awaiting OKX _syncBook never reports a
+//       replay-rejection resync as success (stays 'reconnecting', no forced
+//       'running'); Gemini depth-socket frames from a superseded generation
+//       are ignored; Gemini depth-trade timestamps are type-checked before
+//       Number() so false/''/blank never become ts:0.
 //
 // Fixtures are inline (matching existing connector test style); the only
 // fixture dir (test/fixtures/burst-v1) has no raw-frame fixtures to reuse.
@@ -500,9 +505,14 @@ describe('OKX replay (Astra P1): rejected replayed diff never touches book/seq',
     conn._ringBuf = [];
     conn._wsSnapshotReceived = false;
     // Record the fail-closed resync trigger without arming real reconnect
-    // timers (this test only asserts resync was entered).
+    // timers (these tests only assert resync was entered). Mirrors the real
+    // _scheduleReconnect state move so in-flight _syncBook() callers observe
+    // the same 'reconnecting' transition they would in production.
     conn.resyncScheduled = false;
-    conn._scheduleReconnect = () => { conn.resyncScheduled = true; };
+    conn._scheduleReconnect = () => {
+      conn.resyncScheduled = true;
+      conn._setState('reconnecting');
+    };
     register(conn);
     return conn;
   }
@@ -566,6 +576,70 @@ describe('OKX replay (Astra P1): rejected replayed diff never touches book/seq',
     assert.strictEqual(conn.book._lastSeq, 11);
     assert.strictEqual(conn._wsSnapshotReceived, true);
   });
+
+  it('(f) Astra P2: awaiting _syncBook does NOT force running when replay rejection derails the sync', async () => {
+    const conn = createOkx();
+    const errors = [];
+    conn.on('error', (ev) => errors.push(ev));
+    const emitted = [];
+    conn.on('depth', (ev) => emitted.push(ev));
+
+    // _syncBook arms the WS-snapshot waiter (state syncing) — buffer an
+    // update with NO exchange ts AFTER it, so the update rides the ring
+    // buffer (pre-snapshot) instead of being cleared by _beginWsSnapshotSync.
+    const syncPromise = conn._syncBook();
+    assert.strictEqual(conn.getState(), 'syncing');
+    conn._handleDepth({
+      action: 'update',
+      data: [{ seqId: 11, prevSeqId: 10, bids: [['65000', '1']], asks: [] }],
+    });
+    assert.strictEqual(conn._ringBuf.length, 1);
+
+    // Snapshot resolves the waiter; the replay then rejects the buffered
+    // diff (missing ts) and routes into _handleSequenceGap → book cleared,
+    // _wsSnapshotReceived reset, reconnect scheduled (state reconnecting).
+    conn._handleDepth({
+      action: 'snapshot',
+      data: [{ seqId: 10, ts: '1700000000000', bids: [['65000', '1.5']], asks: [['65001', '2.0']] }],
+    });
+
+    await syncPromise;
+
+    assert.strictEqual(conn.resyncScheduled, true);
+    assert.ok(errors.length >= 1 && /seq gap: OKX replay emit rejected/.test(errors[0].message));
+    // Fail-closed: a sync derailed into reconnect must NOT be reported as
+    // success — the resumed _syncBook leaves the state machine alone.
+    assert.strictEqual(conn.getState(), 'reconnecting',
+      'derailed sync must not flip the state back to running');
+    assert.strictEqual(conn._wsSnapshotReceived, false);
+    assert.strictEqual(conn.book.bids.size, 0, 'book stays empty until a real snapshot');
+    assert.strictEqual(conn._stats.resyncCount, 0, 'failed sync must not count as a resync');
+    // Downstream only ever saw the snapshot — nothing after the rejection.
+    assert.strictEqual(emitted.length, 1);
+    assert.strictEqual(emitted[0].type, 'snapshot');
+  });
+
+  it('(f) Astra P2 control: a clean snapshot sync still finalizes to running', async () => {
+    const conn = createOkx();
+    const syncPromise = conn._syncBook();
+
+    conn._handleDepth({
+      action: 'update',
+      data: [{ seqId: 11, prevSeqId: 10, ts: '1700000000011', bids: [['65000', '1']], asks: [] }],
+    });
+    conn._handleDepth({
+      action: 'snapshot',
+      data: [{ seqId: 10, ts: '1700000000000', bids: [['65000', '1.5']], asks: [['65001', '2.0']] }],
+    });
+    await syncPromise;
+
+    assert.strictEqual(conn.resyncScheduled, false);
+    assert.strictEqual(conn.getState(), 'running');
+    assert.strictEqual(conn._wsSnapshotReceived, true);
+    assert.strictEqual(conn._stats.resyncCount, 1);
+    assert.strictEqual(conn.book.bids.get('65000'), '1'); // replayed diff applied
+    assert.strictEqual(conn.book._lastSeq, 11);
+  });
 });
 
 // ====== Astra P2-1: Gemini depth socket owns its ingress stream (e) ======
@@ -626,6 +700,67 @@ describe('Gemini depth socket (Astra P2-1): independent connection id / receive_
     // Main socket frames after depth traffic still count independently.
     feedFrame(conn, { type: 'heartbeat' });
     assert.strictEqual(conn._receiveSeq, 3);
+  });
+
+  it('(f) Astra P2: frames from a superseded depth socket are ignored — never stamped with the new generation', async () => {
+    const conn = await createGemini();
+    const depthEvents = [];
+    conn.on('depth', (ev) => depthEvents.push(ev));
+    const depthFrame = (changes, trades = []) => ({ type: 'l2_updates', changes, trades });
+
+    // One frame on the ORIGINAL depth socket.
+    feedDepthFrame(conn, depthFrame([{ side: 'bid', price: '65000', remaining: '1.5' }]));
+    assert.strictEqual(depthEvents.length, 1);
+    const oldWs = conn._depthWs;
+    const oldId = conn._depthConnectionId;
+    assert.ok(oldWs && oldId);
+
+    // A reconnect cycle replaces the depth socket with a new generation
+    // (new connection id, receive_seq reset). _closeDepthWs nulls the socket
+    // first, so wait until the async _connectDepthWs has installed the new one.
+    conn.subscribe();
+    const t0 = Date.now();
+    while ((!conn._depthWs || conn._depthWs === oldWs) && Date.now() - t0 < 2000) await sleep(5);
+    assert.ok(conn._depthWs && conn._depthWs !== oldWs, 'depth WS was not recreated');
+    const newId = conn._depthConnectionId;
+    assert.notStrictEqual(newId, oldId, 'reconnect must assign a new depth connection id');
+    assert.strictEqual(conn._depthReceiveSeq, 0, 'reconnect resets the depth counter');
+
+    // Late frame from the OLD socket arrives after the new socket took over:
+    // the generation guard must drop it — it must NOT be recorded under the
+    // new generation's connection id / receive_seq.
+    oldWs.emit('message', Buffer.from(JSON.stringify(depthFrame([{ side: 'ask', price: '65001', remaining: '2.0' }]))));
+    assert.strictEqual(depthEvents.length, 1, 'stale depth frame must not emit a depth event');
+    assert.strictEqual(conn._depthReceiveSeq, 0, 'stale frame must not advance the counter');
+
+    // Control: the NEW socket's first frame starts at seq 1 under the new id.
+    feedDepthFrame(conn, depthFrame([{ side: 'bid', price: '65002', remaining: '3.0' }]));
+    assert.strictEqual(depthEvents.length, 2);
+    assert.strictEqual(depthEvents[1].connection_id, newId);
+    assert.strictEqual(depthEvents[1].receive_seq, 1);
+  });
+
+  it('(f) Astra P2: depth trades with invalid timestamps are dropped — never fabricated as ts:0/known', async () => {
+    const conn = await createGemini();
+    const trades = [];
+    conn.on('trade', (ev) => trades.push(ev));
+    const depthFrame = (changes, tradeRows) => ({ type: 'l2_updates', changes, trades: tradeRows });
+    const baseTrade = { price: '65000', quantity: '0.1', side: 'sell', event_id: 900, timestamp: 1700000000123 };
+
+    // Number(false)===0 / Number('')===0 / Number('   ')===0 would fabricate
+    // ts:0 with source_event_time_known:true — strict type-first coercion
+    // must null them out and drop the trades fail-closed.
+    feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 901, timestamp: false }]));
+    feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 902, timestamp: '' }]));
+    feedDepthFrame(conn, depthFrame([], [{ ...baseTrade, event_id: 903, timestamp: '   ' }]));
+    assert.strictEqual(trades.length, 0, 'invalid depth-trade timestamps must not emit ts:0 trades');
+
+    // Control: a valid timestamp still emits with the known source time.
+    feedDepthFrame(conn, depthFrame([], [baseTrade]));
+    assert.strictEqual(trades.length, 1);
+    assert.strictEqual(trades[0].ts, 1700000000123);
+    assert.strictEqual(trades[0].source_event_ts_ms, 1700000000123);
+    assert.strictEqual(trades[0].source_event_time_known, true);
   });
 });
 
