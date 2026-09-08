@@ -40,6 +40,25 @@ Receiverはpayloadの特徴量化、正規化、集計を行いません。保�
 
 `open_interest`のpayloadには、OI本体に加えて取得時刻、取引所側の`source_ts`、mark price、funding rate、単位変換後の`oi_btc` / `oi_usd`、取得状態を含めます。OI未取得時もエラー状態の観測として保存します。
 
+## 時刻の区別（receive time / event time / write time）
+
+Issue #12以降、envelope内の時刻は3種類に明確に区別されます（`raw_gzip`に収まるJSON Linesの各envelope列）。
+
+| フィールド | 意味 | 代替値の禁止 |
+|---|---|---|
+| `recv_ts_ms` | **receive time**: socket message境界で確定したwall-clock受信時刻。buffer/replay後も不変 | connector/workerは`Date.now()`で再採番しない。欠落は`null`（unknown） |
+| `recv_mono_ns` | プロセスmonotonic時刻(ナノ秒)。同一コネクション内で厳密単調増加 | 欠落時は`null` |
+| `receive_seq` | コネクション世代内の単調増加frame counter。新コネクションで1から再開 | — |
+| `connection_id` | socket世代の識別子(`market:pid:seq`) | 未接続時は`null` |
+| `source_event_ts_ms` | **event time**: 取引所が付与したevent発生時刻(パース済みms)。不正/欠落は`null` | `Date.now()`等のローカル時刻を代用しない |
+| `source_event_time_known` | source時刻が既知かどうか(`true`/`false`) | — |
+| `event_ts_ms` | envelopeのイベント時刻。source既知ならsource時刻、ローカル合成ならその処理時刻 | — |
+| `written_at_ms` / batchの`first/last_recv_ts_ms` | **write time**: DB書き込み時刻 | — |
+
+- source timestampを持たないfeed（Coinbase Advanced Trade l2、Kraken/Gemini/Bitfinex/BitMEX book等）は`ts`にローカル処理時刻を持ちますが、`source_event_ts_ms=null`・`source_event_time_known=false`・`event_time_source`(`local`/`book_local`/`rest_snapshot`等)で「source時刻不明」を明示します。
+- RESTスナップショット/定期bookスナップショットも同様に`source_event_ts_ms=null`とし、`receive_seq=null`（socket frameではないため）で区別します。
+- `recv_ts_ms >= source_event_ts_ms`は必須条件にしません（clock差を許容）。
+
 ## 基本確認SQL
 
 Receiver停止中、または専用のquery経路から実行します。
