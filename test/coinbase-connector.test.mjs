@@ -11,8 +11,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { CoinbaseConnector } from '../lib/coinbase-connector.mjs';
 
-function createConn() {
-  const conn = new CoinbaseConnector({});
+function createConn(extraConfig) {
+  const conn = new CoinbaseConnector({ ...extraConfig });
   conn._ws = { send: () => {} };
   conn._setState('running');
   return conn;
@@ -138,7 +138,7 @@ describe('CoinbaseConnector market_trades idempotency (Issue #14)', () => {
   });
 });
 
-describe('CoinbaseConnector _l2Continuity (Issue #14 / Astra audit #19 P2-4)', () => {
+describe('CoinbaseConnector _l2Continuity (Issue #14/#22 — monotonic + server-skip tolerance)', () => {
   it('anchors the first sequenced frame when no seq anchor exists (known limitation)', () => {
     const conn = createConn();
     // WS snapshots always carry sequence_num, so the WS path always leaves an
@@ -153,12 +153,64 @@ describe('CoinbaseConnector _l2Continuity (Issue #14 / Astra audit #19 P2-4)', (
     assert.strictEqual(conn._l2Continuity(null, 41), 'unverifiable');
   });
 
-  it('is strict after an anchor exists: exact +1 only, dups dropped, jumps gap', () => {
+  it('is monotonic with server-skip tolerance after an anchor exists', () => {
     const conn = createConn();
-    conn._l2BridgePending = false; // steady state
+    // Exact +1 (rare but valid) and within-tolerance coalesced skips apply.
     assert.strictEqual(conn._l2Continuity(42, 41), 'ok');
+    assert.strictEqual(conn._l2Continuity(44, 41), 'ok'); // delta 3 (measured normal)
+    assert.strictEqual(conn._l2Continuity(73, 41), 'ok'); // delta 32 == TOL boundary
+    // Stale / duplicate frames drop.
     assert.strictEqual(conn._l2Continuity(41, 41), 'dup');
     assert.strictEqual(conn._l2Continuity(40, 41), 'dup');
-    assert.strictEqual(conn._l2Continuity(44, 41), 'gap');
+    // Only a skip beyond L2_SEQ_SKIP_TOLERANCE (32) is a real drop → gap.
+    assert.strictEqual(conn._l2Continuity(74, 41), 'gap'); // delta 33 > TOL
+    assert.strictEqual(conn._l2Continuity(200, 41), 'gap');
+  });
+
+  it('treats a fresh snapshot anchor + coalesced post-snapshot skips as ok (no bridge false-positive)', () => {
+    const conn = createConn();
+    // Snapshot anchored at 2; the first live update is already 6 (server
+    // skipped 3-5 while coalescing / racing the snapshot) — the live incident
+    // pattern that strict +1 turned into an endless reconnect loop.
+    assert.strictEqual(conn._l2Continuity(6, 2), 'ok');
+    assert.strictEqual(conn._l2Continuity(8, 6), 'ok');
+    assert.strictEqual(conn._l2Continuity(8, 8), 'dup');
+    // A genuinely huge jump still fails closed.
+    assert.strictEqual(conn._l2Continuity(500, 8), 'gap');
+  });
+
+  it('records within-tolerance skip observability stats (Qwen P1)', () => {
+    const conn = createConn();
+    conn._l2Continuity(44, 41); // delta 3 → ok, counted
+    conn._l2Continuity(73, 41); // delta 32 → ok (boundary), counted
+    conn._l2Continuity(41, 41); // dup → not counted
+    conn._l2Continuity(74, 41); // delta 33 → gap (tracked in max delta)
+    assert.strictEqual(conn._stats.l2TolSkipCount, 2);
+    assert.strictEqual(conn._stats.l2MaxSeqSkipDelta, 33);
+  });
+
+  it('honors config.l2SeqSkipTolerance override for re-calibration', () => {
+    const conn = createConn({ l2SeqSkipTolerance: 4 });
+    assert.strictEqual(conn._l2SeqSkipTolerance, 4);
+    assert.strictEqual(conn._l2Continuity(44, 41), 'ok'); // delta 3 ≤ 4
+    assert.strictEqual(conn._l2Continuity(50, 41), 'gap'); // delta 9 > 4
+    // Default (no config) keeps the built-in ceiling.
+    const def = createConn();
+    assert.strictEqual(def._l2SeqSkipTolerance, 32);
+    assert.strictEqual(def._l2Continuity(50, 41), 'ok'); // delta 9 ≤ 32
+  });
+
+  it('rejects unsafe tolerance overrides (Qwen P1: NaN/0/negative/NaN-string fall back to default)', () => {
+    for (const bad of [undefined, null, 0, -5, NaN, 'abc', 'Infinity', {}]) {
+      const conn = createConn({ l2SeqSkipTolerance: bad });
+      assert.strictEqual(conn._l2SeqSkipTolerance, 32, `override ${String(bad)} must fall back to 32`);
+      assert.strictEqual(conn._l2Continuity(33, 1), 'ok'); // delta 32 = boundary ok
+      assert.strictEqual(conn._l2Continuity(34, 1), 'gap'); // delta 33 still gaps
+    }
+    // Fractional values floor to an integer >= 1.
+    const frac = createConn({ l2SeqSkipTolerance: 3.7 });
+    assert.strictEqual(frac._l2SeqSkipTolerance, 3);
+    assert.strictEqual(frac._l2Continuity(4, 1), 'ok'); // delta 3 ≤ 3
+    assert.strictEqual(frac._l2Continuity(5, 1), 'gap'); // delta 4 > 3
   });
 });

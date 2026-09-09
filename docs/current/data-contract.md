@@ -190,26 +190,35 @@ source ts を以下の不変条件で分割する。
 - **sequence domain**: `l2_data` channelのupdate frame連番を対象とする。
   `market_trades`は別channel/別domainであり連続性比較の対象にしない
   （channel横断の単純+1 checkはfalse positiveになるため禁止）。
-- **bridge / steady state の明示的分離**:
-  - snapshot直後の最初のupdate frameは **bridge**: snapshot frameのseqとupdate streamの
-    seqが同一counterであることは証明不能なため、`seq > snapshot seq`なら一度だけ受け入れる。
-  - bridge以降は `seq == localSeq + 1` を厳密に要求する。跳びを検出したら
-    gapped frameを**適用せず**bookをclearし、同一のsnapshot同期経路で即resyncする
-    （`l2SeqGapCount`計上、`_handleSequenceGap`経由）。
+- **連続性モデル（#22 で修正）: monotonic + tolerance**:
+  - #14 実装は「bridge（snapshot直後の最初のupdate）は一度だけ任意の跳びを許容し、
+    以降は `seq == localSeq + 1` を厳密要求」としたが、**実測（2026-09-09 live,
+    Advanced Trade l2_data）でCoinbaseはbook changeをcoalesceして配信するため、
+    frame間でseqが日常的に +2/+3 スキップする**（静止時でも数frame毎に発生、
+    snapshot直後の最初のupdateでも数個スキップし得る）。+1厳密要求はこの正常配信を
+    全て「ギャップ」と誤判定し、無限reconnect/resyncループを起こした（live incident）。
+  - #22 以降の契約: **monotonic + tolerance**。`localSeq < frameSeq <= localSeq + 32`
+    （`L2_SEQ_SKIP_TOLERANCE`）はサーバーcoalescingとして適用、
+    `frameSeq > localSeq + 32` のみを実dropと判定し、gapped frameを**適用せず**
+    bookをclearして同一のsnapshot同期経路で即resyncする
+    （`l2SeqGapCount`計上、`_handleSequenceGap`経由）。bridge専用の特別扱いは不要。
   - `seq <= localSeq` の重複/古いframeはdrop（`l2DupDropCount`計上）。
   - `sequence_num`欠落frameは連続性を証明できないためfail-closedでresync
     （fail-open適用はしない）。
 - ring buffer replay（snapshot前のbuffer frame）にも同じ不変条件を適用する。
-  buffer frame間にseqの跳びがあればsocket-level dropと判定しfail-closedで再同期。
-- 既知の限界: bridge時（snapshotと最初のupdateの間）に起きた欠落は、buffer frameが
-  無い場合は検知できない。sequence domainの完全な確定はlive capture /
-  official fixtureでの確認が望ましい（#14 Done条件#1の残作業）。
-- 既知の限界（audit #19 P2-4）: `_l2Continuity`は `localSeq == null`（適用済みseq
-  anchorなし）のframeを無条件にanchor化（`ok`）する。実運用のl2_data snapshotは常に
-  `sequence_num`を持つためWS snapshot経路ではanchorが必ず存在し、この分岐は
-  REST-fallback snapshot（REST/WSのsequence domainが異なるためseqを意図的にnull化）
-  直後の最初のWS update frame等でのみ到達し得る。WS domainに対して検証不能な最初の
-  frameをanchorにする以外に安全な選択が無いため、bridgeと同じ扱いとする既知限界。
+  buffer frame間でtolerance超のseq跳びがあればsocket-level dropと判定しfail-closedで再同期。
+- 既知の限界: snapshot到着と最初のupdateの間に起きた欠落は、buffer frameが
+  無い場合は検知できない。また **tolerance内（≤32 frame）の実欠落はcoalescingと
+  原理的に区別不能**であり、欠落中にtouchされたlevelのみ更新され他levelは一時
+  stale化し得る（欠落規模が小さいため自己回復が通常だが、頻度は
+  `l2TolSkipCount`/`l2MaxSeqSkipDelta` で監視する）。
+- 既知の限界（audit #19 P2-4 / #22で継続）: `_l2Continuity`は `localSeq == null`
+  （適用済みseq anchorなし）のframeを無条件にanchor化（`ok`）する。実運用の
+  l2_data snapshotは常に `sequence_num` を持つためWS snapshot経路ではanchorが
+  必ず存在し、この分岐はREST-fallback snapshot（REST/WSのsequence domainが
+  異なるためseqを意図的にnull化）直後の最初のWS update frame等でのみ到達し得る。
+  WS domainに対して検証不能な最初のframeをanchorにする以外に安全な選択が無い
+  既知限界。
 
 ### Coinbase Advanced Trade: market_trades idempotency（normalized層）
 
