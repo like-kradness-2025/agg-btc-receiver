@@ -245,3 +245,59 @@ source ts を以下の不変条件で分割する。
 - **data_complete の解釈詳細**: 必須marketが0件（enabledが全てoptional）の構成はvacuously complete（true）。`applyReady`でmarketのstateが欠落している場合は'unknown'扱いであり'running'既定にしない（欠落＝complete扱いはfail-visible原則に反する）。2秒周期のstats tickはmarket状態の**降格のみ**反映し、degraded解除（復帰）はstateChange→running・marketRestarted等の明示イベントに限定される（statsのstale 'running'によるfalse-recovery防止）。
 - 状態は `lib/market-status.mjs` の `MarketStatusTracker` が一元管理し、worker（`lib/orderflow-worker.mjs`）・main thread（`orderflow_monitor.mjs`）・health出力の3層で同じ意味論を使う。状態遷移はmarket毎に上限付き（直近20件、aggregateは50件）で履歴保持し、health/IPCに `expected_markets`/`running_markets`/`degraded_markets`/`data_complete` として公開する。
 - readyからcompleteへの昇格・degradedからの復帰は明示的に遷移として記録され、復帰時に`recovered`フラグが立つ。complete ⇔ incomplete の遷移はworkerログに常時出力される（`data_complete=false`時はERROR扱い）。
+
+## receiver market-status ファイル契約（Issue #9 Done#8・additive）
+
+receiver（`orderflow_monitor.mjs`）はdownstream（agg-btc-downstream）向けに
+per-market状態とaggregate complete判定をJSONファイルで公開する。**状態の
+一元管理は§16の `MarketStatusTracker`（lib/market-status.mjs）が行い、本
+ファイルはそのsnapshotを `formatMarketStatusV1()` で整形した射影**である。
+並行する別トラッカーは存在しない（旧 `lib/market-completeness.mjs` の
+重複実装は削除済み）。health.jsonl行への
+`expected_markets`/`running_markets`/`degraded_markets`/`data_complete`/
+`completeness_transitions` のadditive公開も同一snapshot由来（§16）。
+
+### パス
+- 既定: `<receiver --database-dir>/../market-status.json`
+  （SQLite dirの親。downstream `defaultReceiverStatusFile()` も同一導出）
+- 上書き: receiver `--status-file <path>`
+
+### schema: receiver-market-status/v1（単一JSON object・原子的書込）
+| キー | 型 | 意味 |
+|---|---|---|
+| `schema` | string | `receiver-market-status/v1`（不整合はreaderが拒否） |
+| `ts_ms` | int | このviewの計算時刻（staleness判定の基準） |
+| `process_ready` | bool | main threadが全workerを受入済みか（worker ready ≠ data complete） |
+| `expected_markets` | string[] | **全enabled market**（optional含む。§16語彙・health出力と一致） |
+| `optional_markets` | string[] | completeをblockしないoptional subset（expectedの内訳） |
+| `running_markets` | string[] | 現在streaming中のexpected market |
+| `degraded_markets` | object | market→reason。**optional marketも含み得る**（fail-visible報告）がdata_completeはfalseにしない |
+| `data_complete` | bool | 全**必須**market（expected − optional）がrunningかつ非degraded。必須0件はvacuously true（§16）。process_readyは判定に含めない（別フィールド） |
+| `markets` | object | market → `{state, degraded_reason, required, updated_at_ms}`。degraded中は`state='degraded'`が権威（直近connector stateがrunning等でも上書き） |
+
+### 書込周期
+- **状態変化時は即時書込**（stateChange / marketStatus / marketDegraded /
+  marketRestarted / marketRestartFailed / stats降格 / ready / workerクラッシュ降格）
+- **実行中は約2s周期で定期書込**（未変化かつ直近1s以内に書込済みの場合はskip。
+  downstream側staleness 15sは約7周期分のマージンに相当）
+
+### 原子性・耐久の前提（緩和事項）
+- 書込は同一ディレクトリ内の `tmp+rename` による原子的置換のみ保証する。
+  **fsyncは発行しない**。クラッシュ時は `*.tmp-<pid>` が残る可能性があり、
+  readerは `market-status.json` の完全一致名のみ読み `.tmp-*` を無視する。
+- クラッシュ直後は**旧ファイルが残り得る**（最後の書込が失われる）。
+  missing / unparsable / schema不一致 / staleは「complete」と解釈しては
+  ならない（downstreamはstaleness 15s + schema/型検証でfail-visible化）。
+
+### workerクラッシュ時の降格（Qwen P1-2）
+workerがexit/error（クラッシュ）した場合、mainはそのworkerに割当てられた
+全marketを `marketStatus.markDegraded(market, "worker <id> lost: …")` で
+degradedへ落とし（data_complete=false・ファイル即時書込）た上で、既存の
+runtime-failure方針に従いreceiver全体をfail-closed終了する。最後の
+market-status.json書込はshutdown flushで永続化される。graceful shutdown
+（SIGTERM/SIGINT等・planned）では降格しない（downstreamはstalenessで検知）。
+
+### 消費者
+agg-btc-downstream `src/receiver-completeness.mjs`（PR #9 merge済）:
+staleness 15s・schema検証・`data_complete` 複製・per-market
+`markets[].state/required` 反映。本節の変更時は同モジュールと整合を取ること。
