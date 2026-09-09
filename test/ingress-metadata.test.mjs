@@ -383,6 +383,57 @@ describe('Ingress metadata (c): missing/invalid source timestamps never fake "no
   });
 });
 
+// ====== _emitTrade precedence (Astra audit #19 P1-1) ======
+
+describe('_emitTrade precedence (Astra P1-1): additive meta can never override core/ingress fields', () => {
+  function createConn() {
+    const conn = new BaseConnector({}, { market: 'test_market', wsUrl: 'ws://localhost:1', restUrl: '' });
+    conn._setWebSocket(MockWebSocket);
+    conn.subscribe = () => {};
+    register(conn);
+    return conn;
+  }
+
+  it('keeps every core field intact when meta collides on all of them; additive keys still pass through', () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    const emittedTrade = conn._emitTrade(
+      65000, 0.25, 'buy', 1700000000000, 'tx-1', null,
+      {
+        // Hostile / accidental collisions with every core field — must lose:
+        market: 'evil_market', price: 1, qty: 2, side: 'sell', ts: 123, tradeId: 'evil',
+        // Collisions with ingress fields — must lose to the computed defaults:
+        connection_id: 'evil-conn', recv_ts_ms: 1, recv_mono_ns: 2, receive_seq: 3,
+        source_event_ts_ms: 999, source_event_time_known: false,
+        // Genuine additive metadata — must survive:
+        trade_event_type: 'snapshot',
+      });
+
+    assert.strictEqual(emittedTrade, true);
+    assert.strictEqual(emitted.length, 1);
+    const ev = emitted[0];
+    // Core fields win over the colliding meta keys (meta spread first).
+    assert.strictEqual(ev.market, 'test_market');
+    assert.strictEqual(ev.price, 65000);
+    assert.strictEqual(ev.qty, 0.25);
+    assert.strictEqual(ev.side, 'buy');
+    assert.strictEqual(ev.ts, 1700000000000);
+    assert.strictEqual(ev.tradeId, 'tx-1');
+    // Ingress fields win over the colliding meta keys (computed, spread last;
+    // outside any socket callback the defaults are null / ts-derived).
+    assert.strictEqual(ev.connection_id, null);
+    assert.strictEqual(ev.recv_ts_ms, null);
+    assert.strictEqual(ev.recv_mono_ns, null);
+    assert.strictEqual(ev.receive_seq, null);
+    assert.strictEqual(ev.source_event_ts_ms, 1700000000000);
+    assert.strictEqual(ev.source_event_time_known, true);
+    // Non-colliding additive metadata is preserved.
+    assert.strictEqual(ev.trade_event_type, 'snapshot');
+  });
+});
+
 // ====== buildRawDbEnvelope: worker never re-stamps receive time (d) ======
 
 describe('buildRawDbEnvelope (d): worker persists ingress metadata verbatim, never re-stamps', () => {

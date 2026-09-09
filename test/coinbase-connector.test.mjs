@@ -137,3 +137,28 @@ describe('CoinbaseConnector market_trades idempotency (Issue #14)', () => {
     assert.strictEqual(ids.filter((id) => id === '1').length, 1);
   });
 });
+
+describe('CoinbaseConnector _l2Continuity (Issue #14 / Astra audit #19 P2-4)', () => {
+  it('anchors the first sequenced frame when no seq anchor exists (known limitation)', () => {
+    const conn = createConn();
+    // WS snapshots always carry sequence_num, so the WS path always leaves an
+    // anchor; localSeq == null is only reachable after the REST-fallback
+    // snapshot (seq deliberately null: REST/WS sequence domains differ), where
+    // the first sequenced WS frame must become the anchor — continuity cannot
+    // be proven against the REST domain, so it acts like the bridge
+    // (documented known limitation, audit #19 P2-4).
+    assert.strictEqual(conn._l2Continuity(42, null), 'ok');
+    // A frame without sequence_num still fails closed regardless of anchor.
+    assert.strictEqual(conn._l2Continuity(null, null), 'unverifiable');
+    assert.strictEqual(conn._l2Continuity(null, 41), 'unverifiable');
+  });
+
+  it('is strict after an anchor exists: exact +1 only, dups dropped, jumps gap', () => {
+    const conn = createConn();
+    conn._l2BridgePending = false; // steady state
+    assert.strictEqual(conn._l2Continuity(42, 41), 'ok');
+    assert.strictEqual(conn._l2Continuity(41, 41), 'dup');
+    assert.strictEqual(conn._l2Continuity(40, 41), 'dup');
+    assert.strictEqual(conn._l2Continuity(44, 41), 'gap');
+  });
+});

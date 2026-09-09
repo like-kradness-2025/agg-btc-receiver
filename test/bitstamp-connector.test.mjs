@@ -194,6 +194,37 @@ describe('BitstampConnector snapshot/diff boundary (Issue #13)', () => {
     }
   });
 
+  it('counts boundary-included diffs exactly once across an aborted attempt and its retry (Astra audit #19 P2-3)', async () => {
+    // Attempt 1's boundary (B1) classifies diff A (ts < B1) as included and
+    // then aborts on diff C (ts == B1). Attempt 2's strictly newer boundary
+    // (B2) provably covers BOTH diffs. Each diff describes one real inclusion
+    // in the APPLIED snapshot, so the stat must be 2 — never 3 (A counted on
+    // the aborted attempt, then A and C re-counted on the retry).
+    const boundaryEqualBody = { ...REST_BODY, microtimestamp: SNAP_MICRO };
+    const newerBody = { ...REST_BODY, bids: [['65000', '3.0']], microtimestamp: micro(+2000) };
+    const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
+    conn._setState('connected');
+    const emitted = [];
+    conn.on('depth', (event) => emitted.push(event));
+    const stubbed = stubFetch(REST_BODY, { calls: [boundaryEqualBody, newerBody] });
+    try {
+      const sync = conn._syncBook();
+      conn._onMessage(depthFrame([['65000', '0.1']], [], micro(-100))); // ts < B1 → included
+      conn._onMessage(depthFrame([['65000', '9.9']], [], micro(0)));    // ts == B1 → abort attempt 1
+      await sync;
+
+      assert.strictEqual(conn.getState(), 'running');
+      assert.strictEqual(conn._stats.boundaryResyncCount, 1);
+      assert.strictEqual(conn._stats.snapshotIncludedDiffCount, 2,
+        'each included diff counted once on the applied snapshot (no retry double count)');
+      assert.strictEqual(conn.book.bids.get('65000'), '3.0');
+      assert.strictEqual(emitted.filter((e) => e.type === 'snapshot').length, 1,
+        'the aborted attempt must not emit a snapshot');
+    } finally {
+      globalThis.fetch = stubbed.original;
+    }
+  });
+
   it('never reaches running when the REST snapshot has no source microtimestamp (boundary unprovable)', async () => {
     const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
     conn._setState('connected');
@@ -236,6 +267,40 @@ describe('BitstampConnector snapshot/diff boundary (Issue #13)', () => {
     assert.strictEqual(conn.book.asks.size, 0);
     assert.strictEqual(emitted.length, 1); // only the healthy update was emitted
     assert.strictEqual(conn.getState(), 'reconnecting');
+  });
+
+  it('drops a steady-state diff with no source timestamp without touching the anchor (Astra audit #19 P2-1)', () => {
+    // Asymmetry contract: in steady state a ts==null diff skips the regression
+    // guard (nothing to compare against) and is fail-closed dropped by
+    // _handleDepth's _isValidTimestamp check — connector stays 'running', the
+    // anchor does NOT advance, so a later genuinely-older diff is still
+    // caught. (The SYNC path must error instead — covered by the
+    // 'never reaches running when a buffered diff has no source timestamp'
+    // test, because there a dropped diff could be a change the REST snapshot
+    // does not include.)
+    const conn = new BitstampConnector({ restUrl: 'https://example.test/book' });
+    conn._ws = { send: () => {} };
+    conn._setState('running');
+    conn._depthSyncing = false;
+    conn._lastAppliedDiffTsMs = SNAP_MS + 300;
+    conn.book.applySnapshot([['65000', '1.5']], [['65001', '2.0']], null);
+    const emitted = [];
+    conn.on('depth', (event) => emitted.push(event));
+
+    // No microtimestamp → ts == null: unverifiable frame, dropped + counted.
+    conn._onMessage({
+      event: 'data',
+      channel: 'diff_order_book_btcusd',
+      data: { bids: [['65000', '0.2']], asks: [], microtimestamp: undefined },
+    });
+
+    assert.strictEqual(conn._stats.droppedDepthCount, 1);
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(conn._lastAppliedDiffTsMs, SNAP_MS + 300,
+      'anchor must not advance on an unverifiable frame');
+    assert.strictEqual(conn.book.bids.get('65000'), '1.5', 'book untouched');
+    assert.strictEqual(conn.getState(), 'running',
+      'steady state stays running (asymmetry vs the sync path, which errors)');
   });
 
   it('keeps buffered diffs across a failed attempt and covers them with the retry snapshot', async () => {
@@ -317,10 +382,13 @@ describe('BitstampConnector snapshot/diff boundary (Issue #13)', () => {
     } finally {
       globalThis.fetch = stubbed.original;
     }
-    // Three attempts, each aborted at the unprovable boundary → error state,
-    // never 'running'; the diff was NOT silently drop-counted.
+    // The null-ts condition is PERMANENT (no newer boundary can locate it), so
+    // the sync fails fast on attempt 1 instead of burning MAX_SYNC_ATTEMPTS
+    // identical retries (Astra audit #19 P2-2) → error state, never 'running';
+    // the diff was NOT silently drop-counted.
+    assert.strictEqual(stubbed.callCount(), 1, 'permanent ts==null boundary must fail without retries (P2-2)');
     assert.strictEqual(conn.getState(), 'error', 'unprovable boundary must never reach running');
-    assert.strictEqual(conn._stats.boundaryResyncCount, 3);
+    assert.strictEqual(conn._stats.boundaryResyncCount, 1, 'one abort, not one per wasted retry');
     assert.strictEqual(conn._stats.resyncCount, 0);
     assert.strictEqual(conn._stats.droppedDepthCount, 0, 'unprovable diff is not silently dropped');
     assert.strictEqual(conn.book.bids.size, 0, 'no partial book may survive');

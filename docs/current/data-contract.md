@@ -167,9 +167,20 @@ source ts を以下の不変条件で分割する。
   これは「REST snapshotはsource時刻不明」の一般則に対するBitstampの例外である。
 - steady stateで受信diffのtsが直前適用diffより遡った場合、板の巻き戻しとして
   sequence-gap扱いで即再同期する（fail-closed、適用前に検出）。
+- steady stateの`ts == null` diff（source時刻なし）はregression guardを素通りし、
+  `_handleDepth`の`_isValidTimestamp` fail-closed drop（`droppedDepthCount`）になる。
+  板は適用済みで巻き戻し不能・anchorは進めないためdropで整合（audit #19 P2-1）。
+  一方**同期中**にbufferされた`ts == null` diffは「snapshotが含むか証明不能」であり、
+  dropすると未計上の変更を失って証明不能なまま`running`に到達するため、境界未証明
+  として即`error`へ（retryしても新しい境界では解消不能 → retry消費せずfail-fast、
+  audit #19 P2-2）。非対称だが両経路ともfail-closedで整合。
 - 再試行の不変条件: 新しいsnapshotの境界は常に古いものを包含するため、再試行中に
-  bufferされたdiffは失われず、二重適用もされない。`ts`が不正でparse不能なdiffは
-  steady stateと同じfail-closed drop（`droppedDepthCount`）。
+  bufferされたdiffは失われず、二重適用もされない。`ts == B`（境界一致）や順序逆転の
+  bufferは新しい境界で証明可能になるため上限3回まで再試行する。
+- 境界メトリクス（audit #19 P2-3）: `snapshotIncludedDiffCount`は**適用が成功した**
+  snapshotに含まれると証明されたdiff数のみ計上（abortしたattemptの途中集計は破棄、
+  retry間の二重計上なし）。`boundaryResyncCount`は境界証明不能でabortしたattempt数
+  （1回のsyncが複数attemptをabortし得るため「abortイベント数」であってsync数ではない）。
 - 境界の「欠落」検出: Bitstamp diff channelにsequence番号が無いため、同期中にWS自体が
   diffを欠落させた場合は検出不能（#13 実装候補Bの `order_data` gap-recovery連携は
   未実装の残作業。実装前にlive fixtureでevent ID対応を確認すること）。
@@ -193,11 +204,22 @@ source ts を以下の不変条件で分割する。
 - 既知の限界: bridge時（snapshotと最初のupdateの間）に起きた欠落は、buffer frameが
   無い場合は検知できない。sequence domainの完全な確定はlive capture /
   official fixtureでの確認が望ましい（#14 Done条件#1の残作業）。
+- 既知の限界（audit #19 P2-4）: `_l2Continuity`は `localSeq == null`（適用済みseq
+  anchorなし）のframeを無条件にanchor化（`ok`）する。実運用のl2_data snapshotは常に
+  `sequence_num`を持つためWS snapshot経路ではanchorが必ず存在し、この分岐は
+  REST-fallback snapshot（REST/WSのsequence domainが異なるためseqを意図的にnull化）
+  直後の最初のWS update frame等でのみ到達し得る。WS domainに対して検証不能な最初の
+  frameをanchorにする以外に安全な選択が無いため、bridgeと同じ扱いとする既知限界。
 
 ### Coinbase Advanced Trade: market_trades idempotency（normalized層）
 
 - `market_trades`の各trade eventは `trade_event_type: 'snapshot' | 'update'` を保持して
   伝播する（snapshot = 購読/再接続時に再送される直近trade window）。
+- **trade eventのフィールド優先順位（audit #19 P1-1）**: 付加meta（例: `trade_event_type`）
+  は `_emitTrade` のspread順によりcoreフィールド（`market`/`price`/`qty`/`side`/`ts`/
+  `tradeId`）やingressフィールド（`connection_id`/`recv_ts_ms`/`recv_mono_ns`/
+  `receive_seq`/`source_event_*`）を**決して上書きできない**。metaが同名キーを含んでも
+  core/ingressが勝つ（`_emitDepth`/`_emitRawDepth`と同じ順序）。
 - **normalized trade層のidempotency key = `(market, trade_id)`**。connectorは直近
   8192件の受信済みtrade_idを保持し、reconnect snapshotで再送された同一trade_idは
   emitしない（`dedupedTradeCount`計上）→ downstreamのCVD等で二重計上されない。
