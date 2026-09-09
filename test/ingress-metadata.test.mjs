@@ -143,8 +143,17 @@ describe('BaseConnector ingress metadata (a): receive_seq & socket generations',
 // ====== Bitstamp _pendingDepth: buffer→replay keeps recv_ts_ms (b) ======
 
 describe('Bitstamp ingress metadata (b): _pendingDepth replay keeps original recv_ts_ms', () => {
-  const SNAPSHOT_BODY = { bids: [['65000', '1.0']], asks: [['65001', '2.0']] };
-  const depthFrame = (bids, asks, micro = '1700000000000000') => ({
+  // REST snapshot carries its matching-engine microtimestamp as-of
+  // 1700000000000 ms (issue #13 boundary).
+  const SNAPSHOT_BODY = {
+    bids: [['65000', '1.0']],
+    asks: [['65001', '2.0']],
+    microtimestamp: '1700000000000000',
+    timestamp: '1700000000',
+  };
+  // Buffered diff is provably NEWER than the snapshot boundary so the
+  // boundary partition replays it (issue #13).
+  const depthFrame = (bids, asks, micro = '1700000000500000') => ({
     event: 'data',
     channel: 'diff_order_book_btcusd',
     data: { bids, asks, microtimestamp: micro },
@@ -188,11 +197,13 @@ describe('Bitstamp ingress metadata (b): _pendingDepth replay keeps original rec
       assert.strictEqual(emitted[0].type, 'snapshot');
       assert.strictEqual(emitted[1].type, 'update');
 
-      // REST snapshot is a local capture: no socket receive_seq, and the
-      // source event time is explicitly unknown (not the local wall clock).
+      // REST snapshot is a local capture: no socket receive_seq. Since the
+      // snapshot response carries the exchange microtimestamp, its source
+      // event time IS known (issue #13) — distinct from feeds without one.
       assert.strictEqual(emitted[0].receive_seq, null);
-      assert.strictEqual(emitted[0].source_event_ts_ms, null);
-      assert.strictEqual(emitted[0].source_event_time_known, false);
+      assert.strictEqual(emitted[0].source_event_ts_ms, 1700000000000);
+      assert.strictEqual(emitted[0].source_event_time_known, true);
+      assert.strictEqual(emitted[0].snapshot_asof_ts_ms, 1700000000000);
 
       // The replayed diff keeps the recv time stamped at buffer time (600ms
       // earlier), not the replay/enqueue moment.
@@ -200,7 +211,7 @@ describe('Bitstamp ingress metadata (b): _pendingDepth replay keeps original rec
       assert.strictEqual(update.recv_ts_ms, bufferedRecvTs);
       assert.strictEqual(update.receive_seq, 1);
       assert.strictEqual(update.connection_id, buffered.connection_id);
-      assert.strictEqual(update.source_event_ts_ms, 1700000000000);
+      assert.strictEqual(update.source_event_ts_ms, 1700000000500);
       assert.strictEqual(update.source_event_time_known, true);
       assert.ok(emitted[0].recv_ts_ms - bufferedRecvTs >= 400,
         `replay recv_ts_ms drifted to replay time: snapshot=${emitted[0].recv_ts_ms} buffered=${bufferedRecvTs}`);
@@ -212,7 +223,7 @@ describe('Bitstamp ingress metadata (b): _pendingDepth replay keeps original rec
       assert.strictEqual(live.type, 'update');
       assert.strictEqual(live.receive_seq, 2);
       assert.strictEqual(live.connection_id, conn._connectionId);
-      assert.strictEqual(live.source_event_ts_ms, 1700000000000);
+      assert.strictEqual(live.source_event_ts_ms, 1700000000500);
       assert.ok(live.recv_ts_ms >= emitted[0].recv_ts_ms);
     } finally {
       globalThis.fetch = originalFetch;
@@ -369,6 +380,57 @@ describe('Ingress metadata (c): missing/invalid source timestamps never fake "no
     assert.strictEqual(emitted[1].source_event_ts_ms, 1700000000000);
     assert.strictEqual(emitted[1].source_event_time_known, true);
     assert.strictEqual(conn._stats.droppedLiquidationCount, 1);
+  });
+});
+
+// ====== _emitTrade precedence (Astra audit #19 P1-1) ======
+
+describe('_emitTrade precedence (Astra P1-1): additive meta can never override core/ingress fields', () => {
+  function createConn() {
+    const conn = new BaseConnector({}, { market: 'test_market', wsUrl: 'ws://localhost:1', restUrl: '' });
+    conn._setWebSocket(MockWebSocket);
+    conn.subscribe = () => {};
+    register(conn);
+    return conn;
+  }
+
+  it('keeps every core field intact when meta collides on all of them; additive keys still pass through', () => {
+    const conn = createConn();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    const emittedTrade = conn._emitTrade(
+      65000, 0.25, 'buy', 1700000000000, 'tx-1', null,
+      {
+        // Hostile / accidental collisions with every core field — must lose:
+        market: 'evil_market', price: 1, qty: 2, side: 'sell', ts: 123, tradeId: 'evil',
+        // Collisions with ingress fields — must lose to the computed defaults:
+        connection_id: 'evil-conn', recv_ts_ms: 1, recv_mono_ns: 2, receive_seq: 3,
+        source_event_ts_ms: 999, source_event_time_known: false,
+        // Genuine additive metadata — must survive:
+        trade_event_type: 'snapshot',
+      });
+
+    assert.strictEqual(emittedTrade, true);
+    assert.strictEqual(emitted.length, 1);
+    const ev = emitted[0];
+    // Core fields win over the colliding meta keys (meta spread first).
+    assert.strictEqual(ev.market, 'test_market');
+    assert.strictEqual(ev.price, 65000);
+    assert.strictEqual(ev.qty, 0.25);
+    assert.strictEqual(ev.side, 'buy');
+    assert.strictEqual(ev.ts, 1700000000000);
+    assert.strictEqual(ev.tradeId, 'tx-1');
+    // Ingress fields win over the colliding meta keys (computed, spread last;
+    // outside any socket callback the defaults are null / ts-derived).
+    assert.strictEqual(ev.connection_id, null);
+    assert.strictEqual(ev.recv_ts_ms, null);
+    assert.strictEqual(ev.recv_mono_ns, null);
+    assert.strictEqual(ev.receive_seq, null);
+    assert.strictEqual(ev.source_event_ts_ms, 1700000000000);
+    assert.strictEqual(ev.source_event_time_known, true);
+    // Non-colliding additive metadata is preserved.
+    assert.strictEqual(ev.trade_event_type, 'snapshot');
   });
 });
 

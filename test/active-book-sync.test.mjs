@@ -97,14 +97,16 @@ describe('active book sync invariants', () => {
     assert.strictEqual(conn.book.bids.has('65000'), false);
   });
 
-  it('Coinbase accepts non-contiguous runtime update (relaxed seq check, only stale rejection)', () => {
+  it('Coinbase accepts a seq jump on the FIRST post-snapshot update (bridge), then drops stale frames', () => {
     const conn = new CoinbaseConnector({});
     suppressReconnectTimer(conn);
     conn._setState('running');
     conn._notifyWsSnapshotReceived(100);
     conn.book.applySnapshot([['64999', '1']], [['65001', '1']], 100);
 
-    // Update with seq jump (102 from 100) — Coinbase allows this
+    // Issue #14: the snapshot→first-update bridge is the one frame whose seq
+    // jump is unprovable (the update stream can already be ahead of the
+    // snapshot frame's seq), so 102 after 100 is accepted once…
     conn._handleDepth({
       channel: 'l2_data',
       sequence_num: 102,
@@ -116,8 +118,9 @@ describe('active book sync invariants', () => {
 
     assert.strictEqual(conn.book.bids.get('65000'), '1');
     assert.strictEqual(conn.book._lastSeq, 102);
+    assert.strictEqual(conn._l2BridgePending, false);
 
-    // Stale update (seq <= localSeq) should still be rejected
+    // …and any later stale frame (seq <= localSeq) is still rejected.
     conn._handleDepth({
       channel: 'l2_data',
       sequence_num: 101,
@@ -129,5 +132,159 @@ describe('active book sync invariants', () => {
 
     assert.strictEqual(conn.book.asks.has('65002'), false);
     assert.strictEqual(conn.book._lastSeq, 102); // unchanged
+    assert.strictEqual(conn._stats.l2DupDropCount, 1);
+  });
+
+  it('Coinbase rejects a steady-state seq gap (fail-closed, book not polluted)', () => {
+    const conn = new CoinbaseConnector({});
+    suppressReconnectTimer(conn);
+    const errors = collectErrors(conn);
+    conn._setState('running');
+    conn._notifyWsSnapshotReceived(100);
+    conn.book.applySnapshot([['64999', '1']], [['65001', '1']], 100);
+
+    // Bridge frame first (any strictly-newer seq accepted once).
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 102,
+      events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '1' }] }],
+    });
+    assert.strictEqual(conn.book._lastSeq, 102);
+
+    // Steady state: 104 after 102 means frame 103 was dropped. The gapped
+    // frame must never be applied — book is cleared and resync is forced.
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 104,
+      events: [{ type: 'update', updates: [{ side: 'ask', price_level: '65002', new_quantity: '2' }] }],
+    });
+
+    assert.ok(errors.some((e) => String(e.message || '').includes('coinbase l2 sequence gap: 102 -> 104')));
+    assert.strictEqual(conn.book.asks.has('65002'), false); // gapped frame not applied
+    assert.strictEqual(conn._stats.l2SeqGapCount, 1);
+    assert.strictEqual(conn.getState(), 'reconnecting');
+  });
+
+  it('Coinbase rejects a seq jump between ring-buffered replay frames (fail-closed)', () => {
+    const conn = new CoinbaseConnector({});
+    suppressReconnectTimer(conn);
+    const errors = collectErrors(conn);
+    conn._setState('syncing');
+    conn._ringBuf = [];
+
+    // Two update frames buffered before the snapshot; frame 103 is missing
+    // between them (socket-level drop during sync).
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 101,
+      events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '1' }] }],
+    });
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 103,
+      events: [{ type: 'update', updates: [{ side: 'ask', price_level: '65002', new_quantity: '2' }] }],
+    });
+    assert.strictEqual(conn._ringBuf.length, 2);
+
+    // Snapshot arrives → replay hits the 101→103 jump → fail-closed resync.
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 100,
+      events: [{
+        type: 'snapshot',
+        updates: [
+          { side: 'bid', price_level: '64999', new_quantity: '1' },
+          { side: 'ask', price_level: '65001', new_quantity: '1' },
+        ],
+      }],
+    });
+
+    assert.ok(errors.some((e) => String(e.message || '').includes('coinbase l2 replay sequence gap: 101 -> 103')));
+    assert.strictEqual(conn.book.asks.has('65002'), false); // gapped frame never applied
+    assert.strictEqual(conn._stats.l2SeqGapCount, 1);
+    assert.strictEqual(conn.getState(), 'reconnecting');
+  });
+
+  it('Coinbase awaiting _syncBook never finalizes to running when a replay gap derails the sync (Astra audit #19 P1)', async () => {
+    const conn = new CoinbaseConnector({});
+    suppressReconnectTimer(conn);
+    const errors = collectErrors(conn);
+    conn._setState('connected');
+
+    // _syncBook arms the WS-snapshot waiter (state → syncing). Updates 101
+    // and 103 are fed AFTER it so they ride the ring buffer instead of being
+    // cleared by _beginWsSnapshotSync.
+    const syncPromise = conn._syncBook();
+    assert.strictEqual(conn.getState(), 'syncing');
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 101,
+      events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '1' }] }],
+    });
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 103,
+      events: [{ type: 'update', updates: [{ side: 'ask', price_level: '65002', new_quantity: '2' }] }],
+    });
+    assert.strictEqual(conn._ringBuf.length, 2);
+
+    // Snapshot 100 resolves the waiter; the synchronous replay then hits the
+    // 101→103 jump and _handleSequenceGap clears the book, resets
+    // _wsSnapshotReceived and moves to 'reconnecting' — all while _syncBook
+    // is still awaiting the resolved waiter.
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 100,
+      events: [{
+        type: 'snapshot',
+        updates: [
+          { side: 'bid', price_level: '64999', new_quantity: '1' },
+          { side: 'ask', price_level: '65001', new_quantity: '1' },
+        ],
+      }],
+    });
+
+    await syncPromise;
+
+    assert.ok(errors.some((e) => String(e.message || '').includes('coinbase l2 replay sequence gap: 101 -> 103')));
+    assert.strictEqual(conn.getState(), 'reconnecting',
+      'derailed sync must not flip the state back to running');
+    assert.strictEqual(conn._wsSnapshotReceived, false);
+    assert.strictEqual(conn.book.bids.size, 0, 'book stays empty until a real snapshot');
+    assert.strictEqual(conn._stats.l2SeqGapCount, 1);
+    assert.strictEqual(conn._stats.resyncCount, 0, 'derailed sync must not count as a resync');
+  });
+
+  it('Coinbase control: a clean snapshot sync still finalizes to running (Astra audit #19 P1)', async () => {
+    const conn = new CoinbaseConnector({});
+    suppressReconnectTimer(conn);
+    conn._setState('connected');
+
+    const syncPromise = conn._syncBook();
+    assert.strictEqual(conn.getState(), 'syncing');
+    // Buffered update rides the ring buffer; the snapshot then replays it.
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 101,
+      events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '1' }] }],
+    });
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 100,
+      events: [{
+        type: 'snapshot',
+        updates: [
+          { side: 'bid', price_level: '64999', new_quantity: '1' },
+          { side: 'ask', price_level: '65001', new_quantity: '1' },
+        ],
+      }],
+    });
+    await syncPromise;
+
+    assert.strictEqual(conn.getState(), 'running');
+    assert.strictEqual(conn._wsSnapshotReceived, true);
+    assert.strictEqual(conn._stats.resyncCount, 1);
+    assert.strictEqual(conn.book.bids.get('65000'), '1'); // replayed diff applied
+    assert.strictEqual(conn.book._lastSeq, 101);
   });
 });

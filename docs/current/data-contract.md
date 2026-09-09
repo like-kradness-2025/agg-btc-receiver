@@ -144,3 +144,88 @@ CREATE TABLE canonical_frames (
 - **保持（TTL対象外）**: `canonical_frames` は自動TTL削除の対象外。`pruneExpired()`（起動時+6時間毎・`orderflow_monitor.mjs`）は legacy `raw_batches` のみを `last_recv_ts_ms` 基準（既定90日）で削除し、canonical行には一切触れない。canonicalは無期限に単調増加する（容量増大は許容する設計。Issue #9/#10/#11 の「保存済みsource rawから全履歴を再計算できる」前提を維持）。削除が必要な場合はoperatorの明示操作（手動DELETE / archive job）のみ。なお行DELETEは、削除した `(connection_id, receive_seq)` の再送に対してappend-safe重複ガードが効かなくなる副作用を持つため、削除より退避（コピー + cut-over）を推奨する。archive方針・実装は将来の運用作業として別途定める。
 - **分類 `parse_failed`（reserved stream）**: socket境界で `JSON.parse` に失敗したframeも、**parse試行より先に**byte-exact textを捕捉して保存する（Issue #10の「parser前source frame保存」を充足。`lib/base-connector.mjs` のmessage handlerはparse成功/失敗に関わらず先にcanonical envelopeをemitする）。失敗frameは内容を解釈できないためstream分類は不可能で、予約値 `stream='parse_failed'`・`channel=null` で記録される（`CANONICAL_UNPARSED_STREAM`定数）。`frame_json.frame` に失敗したsource textそのものを保持し、`receive_seq`/`recv_ts_ms` 等のingress metadataは他frameと同じ。既存downstream parserはこの行も読まない（新規adapterで `parse_failed` 行を除外/別扱いするかはdownstream側の設計判断）。対象connector（Binance系）のみ有効で、opt-inしないconnectorのparse失敗frameは従来どおりerror eventのみ。**空文字`''`のframe**（空socket message → parse失敗）も同様に `frame: ""` としてbyte-exact保存される（Astra再監査P2修正。拒否されるのは`frame_text`が**欠落/非文字列**の場合のみ。空文字と欠落を区別する）。
 - 実データ移行手順: `docs/current/canonical-raw-migration.md` 参照。なお旧 `raw_batches` はnormalized eventでありsource frameを含まないため、**過去分のcanonical化は不可能**（新経路は有効化時点から蓄積）。
+---
+
+## 板同期境界の契約（Issue #13 Bitstamp / #14 Coinbase、additive追記）
+
+### Bitstamp: snapshot/diff境界は source microtimestamp で証明する
+
+REST `order_book` 応答と WS `diff_order_book_btcusd` の双方が matching-engine の
+`microtimestamp` を持つため、境界判定は wall clock ではなく **source time** で行う。
+snapshotの境界 `B` = REST応答のmicrotimestamp(ms) とし、同期中にbufferしたdiffの
+source ts を以下の不変条件で分割する。
+
+| diff ts vs B | 判定 | 挙動 |
+|---|---|---|
+| `ts < B` | snapshotに含まれることが**証明済み** | 適用しない（`snapshotIncludedDiffCount`で計上） |
+| `ts > B` | snapshotより新しいことが**証明済み** | 元のingress metadata付きでreplay |
+| `ts == B` | 包含関係が**証明不能**（サーバ内部でdump前後が決まる） | 推測禁止。より新しいsnapshotで再同期（最大3回）。解消不能なら`error`へ |
+| RESTにmicrotimestampなし | 境界が**証明不能** | `running`/full-qualityへ遷移しない（fail-closed）。3回失敗で`error` |
+
+- snapshot depthイベントは `ts` / `source_event_ts_ms` = REST microtimestamp
+  （`source_event_time_known=true`、`snapshot_asof_ts_ms`付与）を運ぶ。
+  これは「REST snapshotはsource時刻不明」の一般則に対するBitstampの例外である。
+- steady stateで受信diffのtsが直前適用diffより遡った場合、板の巻き戻しとして
+  sequence-gap扱いで即再同期する（fail-closed、適用前に検出）。
+- steady stateの`ts == null` diff（source時刻なし）はregression guardを素通りし、
+  `_handleDepth`の`_isValidTimestamp` fail-closed drop（`droppedDepthCount`）になる。
+  板は適用済みで巻き戻し不能・anchorは進めないためdropで整合（audit #19 P2-1）。
+  一方**同期中**にbufferされた`ts == null` diffは「snapshotが含むか証明不能」であり、
+  dropすると未計上の変更を失って証明不能なまま`running`に到達するため、境界未証明
+  として即`error`へ（retryしても新しい境界では解消不能 → retry消費せずfail-fast、
+  audit #19 P2-2）。非対称だが両経路ともfail-closedで整合。
+- 再試行の不変条件: 新しいsnapshotの境界は常に古いものを包含するため、再試行中に
+  bufferされたdiffは失われず、二重適用もされない。`ts == B`（境界一致）や順序逆転の
+  bufferは新しい境界で証明可能になるため上限3回まで再試行する。
+- 境界メトリクス（audit #19 P2-3）: `snapshotIncludedDiffCount`は**適用が成功した**
+  snapshotに含まれると証明されたdiff数のみ計上（abortしたattemptの途中集計は破棄、
+  retry間の二重計上なし）。`boundaryResyncCount`は境界証明不能でabortしたattempt数
+  （1回のsyncが複数attemptをabortし得るため「abortイベント数」であってsync数ではない）。
+- 境界の「欠落」検出: Bitstamp diff channelにsequence番号が無いため、同期中にWS自体が
+  diffを欠落させた場合は検出不能（#13 実装候補Bの `order_data` gap-recovery連携は
+  未実装の残作業。実装前にlive fixtureでevent ID対応を確認すること）。
+
+### Coinbase Advanced Trade: L2 sequence continuity（fail-closed）
+
+- **sequence domain**: `l2_data` channelのupdate frame連番を対象とする。
+  `market_trades`は別channel/別domainであり連続性比較の対象にしない
+  （channel横断の単純+1 checkはfalse positiveになるため禁止）。
+- **bridge / steady state の明示的分離**:
+  - snapshot直後の最初のupdate frameは **bridge**: snapshot frameのseqとupdate streamの
+    seqが同一counterであることは証明不能なため、`seq > snapshot seq`なら一度だけ受け入れる。
+  - bridge以降は `seq == localSeq + 1` を厳密に要求する。跳びを検出したら
+    gapped frameを**適用せず**bookをclearし、同一のsnapshot同期経路で即resyncする
+    （`l2SeqGapCount`計上、`_handleSequenceGap`経由）。
+  - `seq <= localSeq` の重複/古いframeはdrop（`l2DupDropCount`計上）。
+  - `sequence_num`欠落frameは連続性を証明できないためfail-closedでresync
+    （fail-open適用はしない）。
+- ring buffer replay（snapshot前のbuffer frame）にも同じ不変条件を適用する。
+  buffer frame間にseqの跳びがあればsocket-level dropと判定しfail-closedで再同期。
+- 既知の限界: bridge時（snapshotと最初のupdateの間）に起きた欠落は、buffer frameが
+  無い場合は検知できない。sequence domainの完全な確定はlive capture /
+  official fixtureでの確認が望ましい（#14 Done条件#1の残作業）。
+- 既知の限界（audit #19 P2-4）: `_l2Continuity`は `localSeq == null`（適用済みseq
+  anchorなし）のframeを無条件にanchor化（`ok`）する。実運用のl2_data snapshotは常に
+  `sequence_num`を持つためWS snapshot経路ではanchorが必ず存在し、この分岐は
+  REST-fallback snapshot（REST/WSのsequence domainが異なるためseqを意図的にnull化）
+  直後の最初のWS update frame等でのみ到達し得る。WS domainに対して検証不能な最初の
+  frameをanchorにする以外に安全な選択が無いため、bridgeと同じ扱いとする既知限界。
+
+### Coinbase Advanced Trade: market_trades idempotency（normalized層）
+
+- `market_trades`の各trade eventは `trade_event_type: 'snapshot' | 'update'` を保持して
+  伝播する（snapshot = 購読/再接続時に再送される直近trade window）。
+- **trade eventのフィールド優先順位（audit #19 P1-1）**: 付加meta（例: `trade_event_type`）
+  は `_emitTrade` のspread順によりcoreフィールド（`market`/`price`/`qty`/`side`/`ts`/
+  `tradeId`）やingressフィールド（`connection_id`/`recv_ts_ms`/`recv_mono_ns`/
+  `receive_seq`/`source_event_*`）を**決して上書きできない**。metaが同名キーを含んでも
+  core/ingressが勝つ（`_emitDepth`/`_emitRawDepth`と同じ順序）。
+- **normalized trade層のidempotency key = `(market, trade_id)`**。connectorは直近
+  8192件の受信済みtrade_idを保持し、reconnect snapshotで再送された同一trade_idは
+  emitしない（`dedupedTradeCount`計上）→ downstreamのCVD等で二重計上されない。
+  順序非依存（snapshotが新しい順でも正しく判定）。
+- source raw層はこのdedupeの対象外（#10/#11のcanonical rawは重複受信をそのまま保持する
+  のが責務）。プロセス再起動を跨ぐ冪等性はdownstream/raw層の責務であり、本connectorの
+  メモリ内window（プロセス生存期間）では担保されない。
+- `trade_id`が空のtradeはidentityを証明できないため常にemitする
+  （Coinbase実データは常に数値idを持つ）。
