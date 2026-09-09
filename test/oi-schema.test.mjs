@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_OI_MAX_AGE_MS,
+  DEFAULT_OI_CLOCK_SKEW_TOLERANCE_MS,
   OI_CAPABILITIES,
   getOICapability,
   joinOpenInterestAsOf,
@@ -46,6 +47,25 @@ describe('OI schema and capabilities', () => {
     assert.equal(spot.status, 'error');
     assert.equal(spot.error_code, 'oi_not_supported');
     assert.equal(spot.oi_btc, null);
+  });
+
+  it('clamps bounded exchange clock skew but rejects large look-ahead', () => {
+    const now = 1_700_000_000_000;
+    const within = normalizeOpenInterest({
+      market: 'bybit_perp', ts: now + 85, open_interest: 1, mark_price: 40_000,
+    }, { nowMs: now });
+    assert.equal(within.status, 'fresh');
+    assert.equal(within.as_of_ms, now);
+    assert.equal(within.age_ms, 0);
+    assert.equal(within.oi_btc, 1);
+
+    const beyond = normalizeOpenInterest({
+      market: 'bybit_perp', ts: now + DEFAULT_OI_CLOCK_SKEW_TOLERANCE_MS + 1,
+      open_interest: 1, mark_price: 40_000,
+    }, { nowMs: now });
+    assert.equal(beyond.status, 'error');
+    assert.equal(beyond.error_code, 'future_sample');
+    assert.equal(beyond.oi_btc, null);
   });
 
   it('reports source and conversion errors instead of fabricating zeros', () => {
