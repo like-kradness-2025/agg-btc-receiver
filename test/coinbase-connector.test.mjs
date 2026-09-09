@@ -199,4 +199,18 @@ describe('CoinbaseConnector _l2Continuity (Issue #14/#22 — monotonic + server-
     assert.strictEqual(def._l2SeqSkipTolerance, 32);
     assert.strictEqual(def._l2Continuity(50, 41), 'ok'); // delta 9 ≤ 32
   });
+
+  it('rejects unsafe tolerance overrides (Qwen P1: NaN/0/negative/NaN-string fall back to default)', () => {
+    for (const bad of [undefined, null, 0, -5, NaN, 'abc', '0x10', {}]) {
+      const conn = createConn({ l2SeqSkipTolerance: bad });
+      assert.strictEqual(conn._l2SeqSkipTolerance, 32, `override ${String(bad)} must fall back to 32`);
+      assert.strictEqual(conn._l2Continuity(33, 1), 'ok'); // delta 32 = boundary ok
+      assert.strictEqual(conn._l2Continuity(34, 1), 'gap'); // delta 33 still gaps
+    }
+    // Fractional values floor to an integer >= 1.
+    const frac = createConn({ l2SeqSkipTolerance: 3.7 });
+    assert.strictEqual(frac._l2SeqSkipTolerance, 3);
+    assert.strictEqual(frac._l2Continuity(4, 1), 'ok'); // delta 3 ≤ 3
+    assert.strictEqual(frac._l2Continuity(5, 1), 'gap'); // delta 4 > 3
+  });
 });
