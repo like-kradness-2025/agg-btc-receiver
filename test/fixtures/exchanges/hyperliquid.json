@@ -1,0 +1,71 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "hyperliquid",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for hyperliquid_perp (BTC perpetual). Frames follow the Hyperliquid WebSocket API docs (subscriptions page + info-endpoint data structures): channel 'l2Book' pushes are FULL book replacements (WsBook: levels = [bids, asks], each level {px, sz, n}, time in NANOSECONDS) and channel 'trades' pushes carry WsTrade arrays (side 'B'=buy/'A'=sell). Hyperliquid has no public liquidation stream, so no liquidation fixture exists for this market. Expected events are pinned by hand from the documented semantics and verified by driving the real HyperliquidConnector parser.",
+  "cases": [
+    {
+      "id": "hyperliquid_perp.trade",
+      "market": "hyperliquid_perp",
+      "connector_class": "HyperliquidConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions", "note": "Subscription type 'trades': {method:'subscribe', subscription:{type:'trades', coin:'BTC'}}; pushes are TradesMsg {channel:'trades', data:[WsTrade,...]}. WsTrade = {coin, side ('B'|'A'), px, sz, time, tid, users, hash}; the WS ack is {channel:'subscriptionResponse', data:{method:'subscribe',...}} and is not a trade push. px/sz are strings on the wire; time is epoch ms." }
+      ],
+      "semantics": {
+        "side": "data[].side is the taker side: 'B' -> 'buy', 'A' -> 'sell' (direct mapping)",
+        "price_unit": "quote (USDC)",
+        "qty_unit": "base BTC",
+        "ts_field": "data[].time (epoch ms; connector also tolerates ns > 1e15 via /1e6 — this fixture pins the ms passthrough)",
+        "ts_unit": "ms",
+        "trade_id": "data[].tid (number -> string)"
+      },
+      "frames": [
+        { "channel": "subscriptionResponse", "data": { "method": "subscribe", "subscription": { "type": "trades", "coin": "BTC" } } },
+        { "channel": "trades", "data": [
+          { "coin": "BTC", "side": "B", "px": "65000.5", "sz": "0.125", "time": 1700000000000, "tid": 77001, "users": [ "0xabc" ], "hash": "0x1111" },
+          { "coin": "BTC", "side": "A", "px": "64999.5", "sz": "0.250", "time": 1700000000100, "tid": 77002, "users": [], "hash": "0x2222" }
+        ] }
+      ],
+      "expected_events": [
+        { "frame": 1, "kind": "trade", "market": "hyperliquid_perp", "price": 65000.5, "qty": 0.125, "side": "buy", "ts": 1700000000000, "tradeId": "77001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "hyperliquid_perp", "price": 64999.5, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "77002", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "hyperliquid_perp.l2Book",
+      "market": "hyperliquid_perp",
+      "connector_class": "HyperliquidConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions", "note": "Subscription type 'l2Book': {method:'subscribe', subscription:{type:'l2Book', coin:'BTC'}}; every push is a FULL book replacement L2BookMsg {channel:'l2Book', data:{coin, levels:[[bid L2Level...],[ask L2Level...]], time}}. L2Level = {px, sz, n}; px/sz are strings; time is epoch NANOSECONDS on this feed." }
+      ],
+      "semantics": {
+        "side": "n/a (levels[0] = bids, levels[1] = asks)",
+        "price_unit": "quote (USDC)",
+        "qty_unit": "base BTC",
+        "ts_field": "data.time (epoch nanoseconds -> Math.floor(time / 1e6) ms; pinned conversion)",
+        "ts_unit": "ns on wire, ms emitted",
+        "replace_semantics": "each l2Book frame REPLACES the whole book; the connector emits a depth 'update' carrying the changed levels vs the previous book state — the first frame diff (empty -> new book) lists the full book in frame order, later frames list only changed rows with qty '0' for levels that disappeared (deletes). No snapshot event is emitted when frames are replayed to a running connector (the ws_sync snapshot path only fires while state='syncing')."
+      },
+      "frames": [
+        { "channel": "l2Book", "data": { "coin": "BTC", "levels": [
+          [ { "px": "65000.0", "sz": "1.5", "n": 2 }, { "px": "64999.0", "sz": "2.0", "n": 1 } ],
+          [ { "px": "65001.0", "sz": "0.8", "n": 3 }, { "px": "65002.0", "sz": "1.2", "n": 1 } ]
+        ], "time": 1700000000000000000 } },
+        { "channel": "l2Book", "data": { "coin": "BTC", "levels": [
+          [ { "px": "65000.0", "sz": "2.0", "n": 2 } ],
+          [ { "px": "65001.0", "sz": "1.0", "n": 2 }, { "px": "65002.0", "sz": "1.2", "n": 1 } ]
+        ], "time": 1700000000100000000 } }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "depth", "type": "update", "market": "hyperliquid_perp", "bids": [ [ "65000.0", "1.5" ], [ "64999.0", "2.0" ] ], "asks": [ [ "65001.0", "0.8" ], [ "65002.0", "1.2" ] ], "ts": 1700000000000, "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "hyperliquid_perp", "bids": [ [ "65000.0", "2.0" ], [ "64999.0", "0" ] ], "asks": [ [ "65001.0", "1.0" ] ], "ts": 1700000000100, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "coinbase",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for coinbase_spot (Advanced Trade WebSocket: level2 + market_trades channels).",
+  "cases": [
+    {
+      "id": "coinbase_spot.market_trades",
+      "market": "coinbase_spot",
+      "connector_class": "CoinbaseConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://docs.cdp.coinbase.com/advanced-trade/docs/ws-market-trades", "note": "market_trades frame: {channel:'market_trades', events:[{type:'snapshot'|'update', trades:[{trade_id, product_id, price, size, side, time, bid, ask}]}]}. Docs: side is the MAKER side of the trade; time is an ISO-8601 UTC timestamp." }
+      ],
+      "semantics": {
+        "side": "wire side = MAKER side (docs). Normalized side = the opposite side (the AGGRESSOR/TAKER): 'SELL' (maker sell) -> 'buy', anything else -> 'sell'. CVD uses the aggressor side, hence the inversion is intentional and pinned here.",
+        "price_unit": "quote (USD)",
+        "qty_unit": "base BTC",
+        "ts_field": "trade.time (ISO-8601, Date.parse -> ms)",
+        "ts_unit": "ms (parsed)"
+      },
+      "frames": [
+        { "channel": "market_trades", "events": [
+          { "type": "snapshot", "product_id": "BTC-USD", "trades": [
+            { "trade_id": "cb-tx-1", "product_id": "BTC-USD", "price": "65000.5", "size": "0.100", "side": "SELL", "time": "2023-11-14T22:13:20.000Z", "bid": "64999.9", "ask": "65000.2" },
+            { "trade_id": "cb-tx-2", "product_id": "BTC-USD", "price": "65001.0", "size": "0.250", "side": "BUY", "time": "2023-11-14T22:13:20.100Z", "bid": "65000.5", "ask": "65001.1" }
+          ] }
+        ] }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "trade", "market": "coinbase_spot", "price": 65000.5, "qty": 0.1, "side": "buy", "ts": 1700000000000, "tradeId": "cb-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 0, "kind": "trade", "market": "coinbase_spot", "price": 65001, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "cb-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "coinbase_spot.l2",
+      "market": "coinbase_spot",
+      "connector_class": "CoinbaseConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://docs.cdp.coinbase.com/advanced-trade/docs/ws-level2", "note": "l2_data frame: {channel:'l2_data', sequence_num, events:[{type:'snapshot'|'update', product_id, updates:[{side, event_time, price_level, new_quantity}]}]}. sequence_num is the Advanced Trade level2 sequence; the feed has NO exchange event timestamp (event_time is a message-local time)." }
+      ],
+      "semantics": {
+        "side": "n/a (updates[].side bid/ask; 'offer' is treated as ask)",
+        "price_unit": "quote (USD)",
+        "qty_unit": "base BTC",
+        "ts_field": "none — no exchange event time in l2_data. Emitted ts is the local processing time with source_event_ts_ms=null / source_event_time_known=false / event_time_source='local'",
+        "seq": "sequence_num (relaxed > localSeq stale check after snapshot; not strict +1 per docs)",
+        "delete_semantics": "new_quantity 0 = delete; rows are emitted as-is"
+      },
+      "frames": [
+        { "channel": "l2_data", "sequence_num": 400, "events": [
+          { "type": "snapshot", "product_id": "BTC-USD", "updates": [
+            { "side": "bid", "event_time": "2023-11-14T22:13:20.000Z", "price_level": "65000.00", "new_quantity": "1.000" },
+            { "side": "ask", "event_time": "2023-11-14T22:13:20.000Z", "price_level": "65001.00", "new_quantity": "2.000" }
+          ] }
+        ] },
+        { "channel": "l2_data", "sequence_num": 401, "events": [
+          { "type": "update", "product_id": "BTC-USD", "updates": [
+            { "side": "bid", "event_time": "2023-11-14T22:13:20.010Z", "price_level": "65000.00", "new_quantity": "2.500" },
+            { "side": "ask", "event_time": "2023-11-14T22:13:20.010Z", "price_level": "65002.00", "new_quantity": "0.000" }
+          ] }
+        ] }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "depth", "type": "snapshot", "market": "coinbase_spot", "bids": [["65000.00", "1.000"]], "asks": [["65001.00", "2.000"]], "seq": 400, "snapshot_origin": "ws_sync", "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "coinbase_spot", "bids": [["65000.00", "2.500"]], "asks": [["65002.00", "0.000"]], "seq": 401, "prev_seq": 400, "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
+      ]
+    }
+  ]
+}

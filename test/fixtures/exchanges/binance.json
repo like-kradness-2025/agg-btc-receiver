@@ -1,0 +1,216 @@
+{
+  "schema": "golden-raw-frame-fixture/v1",
+  "exchange": "binance",
+  "generated": "2026-09-09",
+  "notes": "Source-provenance golden fixtures for Binance enabled markets (binance_spot, binance_perp, binance_spot_usdc, binance_spot_fdusd, binance_perp_btcusdc). Frames follow the documented combined-stream wire shape; expected events are the normalized connector output pinned by hand from the docs semantics below (not a snapshot of parser output). Ingress fields (recv_ts_ms/receive_seq/connection_id) are null in this corpus because frames are replayed through the parser entry point, not a live socket — the conformance test asserts that envelope contract separately.",
+  "cases": [
+    {
+      "id": "binance_spot.trade",
+      "market": "binance_spot",
+      "connector_class": "BinanceSpotConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams", "note": "trade stream frame: e/E/s/t/p/q/T/m/M. E and T are ms event times; m=true means the BUYER is the market maker." }
+      ],
+      "semantics": {
+        "side": "m=true (buyer is maker) -> taker/aggressor is the seller -> normalized 'sell'; m=false -> 'buy'. Emitted side is the AGGRESSOR (taker) side, derived from maker flag.",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC (spot qty is base amount)",
+        "ts_field": "T (trade time, ms)",
+        "ts_unit": "ms"
+      },
+      "frames": [
+        { "e": "trade", "E": 1700000000000, "s": "BTCUSDT", "t": 123456, "p": "65000.5", "q": "0.125", "T": 1700000000000, "m": false, "M": true },
+        { "e": "trade", "E": 1700000000100, "s": "BTCUSDT", "t": 123457, "p": "64999.0", "q": "0.200", "T": 1700000000100, "m": true, "M": true }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "trade", "market": "binance_spot", "price": 65000.5, "qty": 0.125, "side": "buy", "ts": 1700000000000, "tradeId": "123456", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "binance_spot", "price": 64999, "qty": 0.2, "side": "sell", "ts": 1700000000100, "tradeId": "123457", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_spot_usdc.trade",
+      "market": "binance_spot_usdc",
+      "connector_class": "BinanceSpotUsdcConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams", "note": "Same trade stream protocol as binance_spot; symbol differs (BTCUSDC)." }
+      ],
+      "semantics": {
+        "side": "aggressor/taker side derived from m (buyer-is-maker flag), identical to binance_spot",
+        "price_unit": "quote (USDC)",
+        "qty_unit": "base BTC",
+        "ts_field": "T", "ts_unit": "ms"
+      },
+      "frames": [
+        { "e": "trade", "E": 1700000000000, "s": "BTCUSDC", "t": 990001, "p": "65010.0", "q": "0.050", "T": 1700000000000, "m": true },
+        { "e": "trade", "E": 1700000000200, "s": "BTCUSDC", "t": 990002, "p": "65005.0", "q": "0.300", "T": 1700000000200, "m": false }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "trade", "market": "binance_spot_usdc", "price": 65010, "qty": 0.05, "side": "sell", "ts": 1700000000000, "tradeId": "990001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "binance_spot_usdc", "price": 65005, "qty": 0.3, "side": "buy", "ts": 1700000000200, "tradeId": "990002", "source_event_ts_ms": 1700000000200, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_spot_fdusd.trade",
+      "market": "binance_spot_fdusd",
+      "connector_class": "BinanceSpotFdusdConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams", "note": "Same trade stream protocol; symbol differs (BTCFDUSD)." }
+      ],
+      "semantics": {
+        "side": "aggressor/taker side derived from m",
+        "price_unit": "quote (FDUSD)",
+        "qty_unit": "base BTC",
+        "ts_field": "T", "ts_unit": "ms"
+      },
+      "frames": [
+        { "e": "trade", "E": 1700000000100, "s": "BTCFDUSD", "t": 771001, "p": "64980.0", "q": "1.000", "T": 1700000000100, "m": false }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "trade", "market": "binance_spot_fdusd", "price": 64980, "qty": 1, "side": "buy", "ts": 1700000000100, "tradeId": "771001", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_perp.trade",
+      "market": "binance_perp",
+      "connector_class": "BinancePerpConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams#trade-streams", "note": "USD-M futures trade stream: same e/E/s/t/p/q/T/m shape as spot (connector subscribes to @trade)." }
+      ],
+      "semantics": {
+        "side": "aggressor/taker side derived from m (buyer is maker)",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC (USD-M qty is base amount)",
+        "ts_field": "T", "ts_unit": "ms"
+      },
+      "frames": [
+        { "e": "trade", "E": 1700000000000, "s": "BTCUSDT", "t": 777001, "p": "65001.0", "q": "0.400", "T": 1700000000000, "m": false },
+        { "e": "trade", "E": 1700000000100, "s": "BTCUSDT", "t": 777002, "p": "65000.0", "q": "0.150", "T": 1700000000100, "m": true }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "trade", "market": "binance_perp", "price": 65001, "qty": 0.4, "side": "buy", "ts": 1700000000000, "tradeId": "777001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "binance_perp", "price": 65000, "qty": 0.15, "side": "sell", "ts": 1700000000100, "tradeId": "777002", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_perp_btcusdc.trade",
+      "market": "binance_perp_btcusdc",
+      "connector_class": "BinancePerpBtcusdcConnector",
+      "stream": "trades",
+      "kind": "trade",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams#trade-streams", "note": "USD-M protocol; symbol differs (BTCUSDC)." }
+      ],
+      "semantics": {
+        "side": "aggressor/taker side derived from m",
+        "price_unit": "quote (USDC)",
+        "qty_unit": "base BTC",
+        "ts_field": "T", "ts_unit": "ms"
+      },
+      "frames": [
+        { "e": "trade", "E": 1700000000300, "s": "BTCUSDC", "t": 88001, "p": "65020.0", "q": "0.250", "T": 1700000000300, "m": true }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "trade", "market": "binance_perp_btcusdc", "price": 65020, "qty": 0.25, "side": "sell", "ts": 1700000000300, "tradeId": "88001", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_perp.forceOrder",
+      "market": "binance_perp",
+      "connector_class": "BinancePerpConnector",
+      "stream": "liquidations",
+      "kind": "liquidation",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams#liquidation-order-streams", "note": "forceOrder frame: {e:'forceOrder', E, o:{s,S,o,f,q,p,ap,X,l,z,T}}. f='LIQUIDATION' or 'ROE_LIQUIDATION'; S is the liquidation ORDER side; T order event time ms." }
+      ],
+      "semantics": {
+        "side": "o.S = liquidation order side (SELL -> 'sell'); only orders with f IN (LIQUIDATION, ROE_LIQUIDATION) emit",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC; z (executed qty) preferred over q (order qty)",
+        "ts_field": "o.T (order event time, ms)",
+        "ts_unit": "ms",
+        "notional": "derived = price * qty"
+      },
+      "frames": [
+        { "e": "forceOrder", "E": 1700000000500, "o": { "s": "BTCUSDT", "S": "SELL", "o": "SELL", "f": "LIQUIDATION", "q": "0.050", "p": "63000.0", "ap": "62999.0", "X": "FILLED", "l": "0.050", "z": "0.050", "T": 1700000000500 } }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "liquidation", "market": "binance_perp", "exchange": "binance", "symbol": "BTCUSDT", "side": "sell", "price": 63000, "qty": 0.05, "notional": 3150, "raw_type": "forceOrder", "trade_id": null, "source_ts": 1700000000500, "source_event_ts_ms": 1700000000500, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_spot.depth",
+      "market": "binance_spot",
+      "connector_class": "BinanceSpotConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#how-to-manage-a-local-order-book-correctly", "note": "depthUpdate frame: {e:'depthUpdate', E, s, U, u, pu, b, a}. u=last update id of this event; REST snapshot lastUpdateId anchors the bridge: first live event must satisfy U <= lastUpdateId+1 <= u (spot)." }
+      ],
+      "semantics": {
+        "side": "n/a (levels carry bid/ask side by array position: b=bids, a=asks)",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC; qty '0' = delete level",
+        "ts_field": "E (event time ms)",
+        "ts_unit": "ms",
+        "seq": "u (update id); rawDepth candidate emitted before book application with book_apply='candidate'",
+        "prep": "book seeded from REST snapshot (lastUpdateId=1000) then two contiguous diff frames"
+      },
+      "prep": { "mode": "book_snapshot_running", "book": { "bids": [["64999.0", "0.500"]], "asks": [["65001.0", "0.700"]], "lastSeq": 1000 } },
+      "frames": [
+        { "e": "depthUpdate", "E": 1700000010000, "s": "BTCUSDT", "U": 1001, "u": 1002, "pu": 1000, "b": [["65000.0", "1.500"]], "a": [["65001.0", "0.000"]] },
+        { "e": "depthUpdate", "E": 1700000010100, "s": "BTCUSDT", "U": 1003, "u": 1004, "pu": 1002, "b": [["64999.0", "0.000"]], "a": [["65002.0", "0.300"]] }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "rawDepth", "market": "binance_spot", "bids": [["65000.0", "1.500"]], "asks": [["65001.0", "0.000"]], "ts": 1700000010000, "seq": 1002, "seq_start": 1001, "seq_end": 1002, "prev_seq": 1000, "book_apply": "candidate", "source_event_ts_ms": 1700000010000, "source_event_time_known": true },
+        { "frame": 0, "kind": "depth", "type": "update", "market": "binance_spot", "bids": [["65000.0", "1.500"]], "asks": [["65001.0", "0.000"]], "ts": 1700000010000, "seq": 1002, "seq_start": 1001, "seq_end": 1002, "prev_seq": 1000, "source_event_ts_ms": 1700000010000, "source_event_time_known": true },
+        { "frame": 1, "kind": "rawDepth", "market": "binance_spot", "bids": [["64999.0", "0.000"]], "asks": [["65002.0", "0.300"]], "ts": 1700000010100, "seq": 1004, "seq_start": 1003, "seq_end": 1004, "prev_seq": 1002, "book_apply": "candidate", "source_event_ts_ms": 1700000010100, "source_event_time_known": true },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "binance_spot", "bids": [["64999.0", "0.000"]], "asks": [["65002.0", "0.300"]], "ts": 1700000010100, "seq": 1004, "seq_start": 1003, "seq_end": 1004, "prev_seq": 1002, "source_event_ts_ms": 1700000010100, "source_event_time_known": true }
+      ]
+    },
+    {
+      "id": "binance_perp.depth",
+      "market": "binance_perp",
+      "connector_class": "BinancePerpConnector",
+      "stream": "book_updates",
+      "kind": "depth",
+      "capture_date": "2026-09-09",
+      "sources": [
+        { "type": "docs", "url": "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams#how-to-manage-a-local-order-book-correctly", "note": "USD-M futures depth bridge: first live event after REST snapshot (lastUpdateId) must satisfy U <= lastUpdateId <= u; subsequent events require pu === local last update id." }
+      ],
+      "semantics": {
+        "side": "n/a (b=bids, a=asks)",
+        "price_unit": "quote (USDT)",
+        "qty_unit": "base BTC",
+        "ts_field": "E", "ts_unit": "ms",
+        "seq": "u (update id); pu chaining verified on every diff after the first bridge",
+        "prep": "book seeded (lastUpdateId=1000), _firstRunningDiff=true: bridging frame overlaps the snapshot anchor, second frame chains pu"
+      },
+      "prep": { "mode": "book_snapshot_running", "book": { "bids": [["64999.0", "0.500"]], "asks": [["65001.0", "0.700"]], "lastSeq": 1000 }, "firstRunningDiff": true },
+      "frames": [
+        { "e": "depthUpdate", "E": 1700000010000, "s": "BTCUSDT", "U": 999, "u": 1002, "pu": 1000, "b": [["65000.0", "1.500"]], "a": [["65001.0", "0.000"]] },
+        { "e": "depthUpdate", "E": 1700000010100, "s": "BTCUSDT", "U": 1003, "u": 1004, "pu": 1002, "b": [["65001.0", "0.200"]], "a": [] }
+      ],
+      "expected_events": [
+        { "frame": 0, "kind": "rawDepth", "market": "binance_perp", "bids": [["65000.0", "1.500"]], "asks": [["65001.0", "0.000"]], "ts": 1700000010000, "seq": 1002, "seq_start": 999, "seq_end": 1002, "prev_seq": 1000, "book_apply": "candidate", "source_event_ts_ms": 1700000010000, "source_event_time_known": true },
+        { "frame": 0, "kind": "depth", "type": "update", "market": "binance_perp", "bids": [["65000.0", "1.500"]], "asks": [["65001.0", "0.000"]], "ts": 1700000010000, "seq": 1002, "seq_start": 999, "seq_end": 1002, "prev_seq": 1000, "source_event_ts_ms": 1700000010000, "source_event_time_known": true },
+        { "frame": 1, "kind": "rawDepth", "market": "binance_perp", "bids": [["65001.0", "0.200"]], "asks": [], "ts": 1700000010100, "seq": 1004, "seq_start": 1003, "seq_end": 1004, "prev_seq": 1002, "book_apply": "candidate", "source_event_ts_ms": 1700000010100, "source_event_time_known": true },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "binance_perp", "bids": [["65001.0", "0.200"]], "asks": [], "ts": 1700000010100, "seq": 1004, "seq_start": 1003, "seq_end": 1004, "prev_seq": 1002, "source_event_ts_ms": 1700000010100, "source_event_time_known": true }
+      ]
+    }
+  ]
+}
