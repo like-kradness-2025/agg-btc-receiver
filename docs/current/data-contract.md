@@ -190,17 +190,23 @@ source ts を以下の不変条件で分割する。
 - **sequence domain**: `l2_data` channelのupdate frame連番を対象とする。
   `market_trades`は別channel/別domainであり連続性比較の対象にしない
   （channel横断の単純+1 checkはfalse positiveになるため禁止）。
-- **bridge / steady state の明示的分離**:
-  - snapshot直後の最初のupdate frameは **bridge**: snapshot frameのseqとupdate streamの
-    seqが同一counterであることは証明不能なため、`seq > snapshot seq`なら一度だけ受け入れる。
-  - bridge以降は `seq == localSeq + 1` を厳密に要求する。跳びを検出したら
-    gapped frameを**適用せず**bookをclearし、同一のsnapshot同期経路で即resyncする
-    （`l2SeqGapCount`計上、`_handleSequenceGap`経由）。
+- **bridge / steady state の明示的分離（#22 で修正）**:
+  - #14 実装は「bridge（snapshot直後の最初のupdate）は一度だけ任意の跳びを許容し、
+    以降は `seq == localSeq + 1` を厳密要求」としたが、**実測（2026-09-09 live,
+    Advanced Trade l2_data）でCoinbaseはbook changeをcoalesceして配信するため、
+    frame間でseqが日常的に +2/+3 スキップする**（静止時でも数frame毎に発生、
+    snapshot直後の最初のupdateでも数個スキップし得る）。+1厳密要求はこの正常配信を
+    全て「ギャップ」と誤判定し、無限reconnect/resyncループを起こした（live incident）。
+  - #22 以降の契約: **monotonic + tolerance**。`localSeq < frameSeq <= localSeq + 32`
+    （`L2_SEQ_SKIP_TOLERANCE`）はサーバーcoalescingとして適用、
+    `frameSeq > localSeq + 32` のみを実dropと判定し、gapped frameを**適用せず**
+    bookをclearして同一のsnapshot同期経路で即resyncする
+    （`l2SeqGapCount`計上、`_handleSequenceGap`経由）。bridge専用の特別扱いは不要。
   - `seq <= localSeq` の重複/古いframeはdrop（`l2DupDropCount`計上）。
   - `sequence_num`欠落frameは連続性を証明できないためfail-closedでresync
     （fail-open適用はしない）。
 - ring buffer replay（snapshot前のbuffer frame）にも同じ不変条件を適用する。
-  buffer frame間にseqの跳びがあればsocket-level dropと判定しfail-closedで再同期。
+  buffer frame間でtolerance超のseq跳びがあればsocket-level dropと判定しfail-closedで再同期。
 - 既知の限界: bridge時（snapshotと最初のupdateの間）に起きた欠落は、buffer frameが
   無い場合は検知できない。sequence domainの完全な確定はlive capture /
   official fixtureでの確認が望ましい（#14 Done条件#1の残作業）。

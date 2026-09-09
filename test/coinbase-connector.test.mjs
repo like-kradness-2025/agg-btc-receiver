@@ -138,7 +138,7 @@ describe('CoinbaseConnector market_trades idempotency (Issue #14)', () => {
   });
 });
 
-describe('CoinbaseConnector _l2Continuity (Issue #14 / Astra audit #19 P2-4)', () => {
+describe('CoinbaseConnector _l2Continuity (Issue #14/#22 — monotonic + server-skip tolerance)', () => {
   it('anchors the first sequenced frame when no seq anchor exists (known limitation)', () => {
     const conn = createConn();
     // WS snapshots always carry sequence_num, so the WS path always leaves an
@@ -153,12 +153,29 @@ describe('CoinbaseConnector _l2Continuity (Issue #14 / Astra audit #19 P2-4)', (
     assert.strictEqual(conn._l2Continuity(null, 41), 'unverifiable');
   });
 
-  it('is strict after an anchor exists: exact +1 only, dups dropped, jumps gap', () => {
+  it('is monotonic with server-skip tolerance after an anchor exists', () => {
     const conn = createConn();
-    conn._l2BridgePending = false; // steady state
+    // Exact +1 (rare but valid) and within-tolerance coalesced skips apply.
     assert.strictEqual(conn._l2Continuity(42, 41), 'ok');
+    assert.strictEqual(conn._l2Continuity(44, 41), 'ok'); // delta 3 (measured normal)
+    assert.strictEqual(conn._l2Continuity(73, 41), 'ok'); // delta 32 == TOL boundary
+    // Stale / duplicate frames drop.
     assert.strictEqual(conn._l2Continuity(41, 41), 'dup');
     assert.strictEqual(conn._l2Continuity(40, 41), 'dup');
-    assert.strictEqual(conn._l2Continuity(44, 41), 'gap');
+    // Only a skip beyond L2_SEQ_SKIP_TOLERANCE (32) is a real drop → gap.
+    assert.strictEqual(conn._l2Continuity(74, 41), 'gap'); // delta 33 > TOL
+    assert.strictEqual(conn._l2Continuity(200, 41), 'gap');
+  });
+
+  it('treats a fresh snapshot anchor + coalesced post-snapshot skips as ok (no bridge false-positive)', () => {
+    const conn = createConn();
+    // Snapshot anchored at 2; the first live update is already 6 (server
+    // skipped 3-5 while coalescing / racing the snapshot) — the live incident
+    // pattern that strict +1 turned into an endless reconnect loop.
+    assert.strictEqual(conn._l2Continuity(6, 2), 'ok');
+    assert.strictEqual(conn._l2Continuity(8, 6), 'ok');
+    assert.strictEqual(conn._l2Continuity(8, 8), 'dup');
+    // A genuinely huge jump still fails closed.
+    assert.strictEqual(conn._l2Continuity(500, 8), 'gap');
   });
 });
