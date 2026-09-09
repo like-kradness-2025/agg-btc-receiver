@@ -493,7 +493,7 @@ function createWorker(workerId, groupMarkets) {
         logCompletenessChange(refreshHealthCompleteness(), `worker ${msg.workerId} ready`);
         console.log(
           `[main] worker ${msg.workerId} ready ` +
-          `(processReady=true, data_complete=${msg.dataComplete !== false})`,
+          `(processReady=true, data_complete=${msg.dataComplete === true})`,
         );
         break;
 
@@ -509,6 +509,15 @@ function createWorker(workerId, groupMarkets) {
         break;
       case 'marketRestartFailed':
         console.error(`[main] module restart failed: ${msg.market}: ${msg.reason}`);
+        // PR #20 re-audit: the watchdog only restarts a market whose connector
+        // still reports state='running' with stale data, so after a FAILED
+        // restart the 2s stats tick would keep re-asserting a stale
+        // 'running' and data_complete=true forever. A failed restart leaves
+        // the market isolated from its feed — degrade it exactly like the
+        // marketDegraded path (fail-visible: data_complete=false until an
+        // explicit recovery event arrives).
+        marketStatus.markDegraded(msg.market, `module restart failed: ${msg.reason}`);
+        logCompletenessChange(refreshHealthCompleteness(), `market ${msg.market} restart failed`);
         break;
 
       case 'writerStatus':

@@ -15,9 +15,10 @@
 //   (c) field invariance — every pinned field (price/qty/side/ts/tradeId,
 //       book bids/asks/seq chain, source ts semantics) equals the emitted
 //       value exactly; no connector-side normalization drift is allowed,
-//   (d) ingress metadata — recv_ts_ms/receive_seq/connection_id are null on
-//       direct parser feed: they are stamped ONLY at the socket boundary by
-//       the worker (issue #12 contract), never fabricated in the parser,
+//   (d) ingress metadata — recv_ts_ms/receive_seq/connection_id/recv_mono_ns
+//       are null on direct parser feed: they are stamped ONLY at the socket
+//       boundary by the worker (issue #12 contract), never fabricated in the
+//       parser,
 //   (e) source-ts nulling — events without an exchange event time (Coinbase
 //       L2) must carry source_event_ts_ms:null and
 //       source_event_time_known:false, never Date.now() or 0.
@@ -300,14 +301,23 @@ describe('golden raw-frame conformance (semantic + raw-save contract)', () => {
     }
   }
 
-  it('corpus covers every enabled market + all three event kinds (guard)', () => {
+  it('corpus covers every enabled market in the default config + all three event kinds (guard)', () => {
     // Corpus property, computed statically — independent of test execution
-    // order (no counters accumulated across earlier its()).
+    // order (no counters accumulated across earlier its()). The comparison
+    // set is the REAL `enabled` market list of config.v3.json — the
+    // implementation default of orderflow_monitor.mjs (used when --config is
+    // absent) — so a newly enabled market without golden coverage fails here
+    // instead of silently passing a bare count threshold.
     const markets = new Set(corpus.flatMap((d) => d.cases.map((c) => c.market)));
     const kinds = new Set(corpus.flatMap((d) => d.cases.map((c) => c.kind)));
     const pinned = corpus.reduce(
       (n, d) => n + d.cases.reduce((m, c) => m + c.expected_events.length, 0), 0);
-    assert.ok(markets.size >= 10, `expected >= 10 distinct markets, got ${markets.size}`);
+    const config = JSON.parse(readFileSync(join(__dirname, '..', 'config.v3.json'), 'utf8'));
+    const enabled = Object.entries(config.markets ?? {})
+      .filter(([, v]) => v?.enabled).map(([m]) => m);
+    assert.ok(enabled.length >= 10, `expected >= 10 enabled markets in config.v3.json, got ${enabled.length}`);
+    const missing = enabled.filter((m) => !markets.has(m));
+    assert.deepEqual(missing, [], `enabled markets without corpus coverage: ${missing.join(', ') || 'none'}`);
     assert.ok(kinds.has('trade') && kinds.has('depth') && kinds.has('liquidation'));
     assert.ok(pinned >= 30, `expected >= 30 pinned events, got ${pinned}`);
   });

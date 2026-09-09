@@ -232,7 +232,7 @@ source ts を以下の不変条件で分割する。
 ## golden raw fixture conformance（#15・additive）
 
 - `test/fixtures/exchanges/<exchange>.json`（schema `golden-raw-frame-fixture/v1`）は、各取引所ドキュメント記載のwire形状に忠実なframe列をケース単位で保持する。各ケースは `sources[].url`（docs URL）・`capture_date`・`semantics`（ts_field/ts_unit等）・任意の`prep`（book_snapshot_running: seed book）・`frames`（実wire形状）・`expected_events`（手で確定したパース結果）を持つ。
-- conformanceテスト（`test/golden-fixtures.test.mjs`）は実connectorの `_onMessage` にframeを実投下し、①全frameが例外なく消費される(frame完全性)、②emitted eventが `expected_events` とframe順に1:1一致する(受信順序不変)、③pinned fieldが完全一致する(field不変)、④parser出力では `recv_ts_ms`/`receive_seq`/`connection_id` が常に`null`（socket境界でのみworkerが採番。parserでの捏造禁止）を検証する。
+- conformanceテスト（`test/golden-fixtures.test.mjs`）は実connectorの `_onMessage` にframeを実投下し、①全frameが例外なく消費される(frame完全性)、②emitted eventが `expected_events` とframe順に1:1一致する(受信順序不変)、③pinned fieldが完全一致する(field不変)、④parser出力では `recv_ts_ms`/`receive_seq`/`connection_id`/`recv_mono_ns` が常に`null`（socket境界でのみworkerが採番。parserでの捏造禁止）を検証する。
 - source時刻を持たないfeedのfixture（Coinbase Advanced Trade l2等）は `source_event_ts_ms:null`・`source_event_time_known:false`・`event_time_source:"local"` をpinし、「source時刻不明をローカル時刻で偽装しない」契約を回帰試験する。
 - 追加取引所fixtureは既存ファイルへadditiveにケース追加する（既存ケースの変更・削除はしない）。
 

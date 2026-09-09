@@ -162,4 +162,36 @@ describe('HealthMonitor setCompleteness merge + fail-visible state promotion', (
     await monitor.close();
     await fs.rm(file, { force: true });
   });
+
+  it('P2-4: completeness_transitions is written only when the transition list changes', async () => {
+    // Regression: the full transition history (up to 50 entries) must not be
+    // repeated on every health.jsonl row — only rows that follow an actual
+    // state transition carry the list; unchanged ticks write [].
+    const { monitor, file } = await freshMonitor();
+    const t1 = { market: 'm1', from: 'unknown', to: 'running', tsMs: 1000 };
+    const completeness = (transitions) => ({
+      expected_markets: ['m1'], running_markets: ['m1'],
+      degraded_markets: {}, data_complete: true, transitions,
+    });
+
+    monitor.setCompleteness(completeness([t1]));
+    monitor._tick(); // transition t1: emit the history
+    monitor._tick(); // unchanged: must NOT repeat the history
+    monitor._tick(); // unchanged again
+
+    const t2 = { market: 'm1', from: 'running', to: 'reconnecting', tsMs: 2000 };
+    monitor.setCompleteness(completeness([t1, t2]));
+    monitor._tick(); // new transition t2: emit again
+    monitor._tick(); // unchanged
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 5);
+    assert.deepEqual(rows[0].completeness_transitions, [t1], 'first row carries the transition history');
+    assert.deepEqual(rows[1].completeness_transitions, [], 'unchanged history must not repeat on every row');
+    assert.deepEqual(rows[2].completeness_transitions, []);
+    assert.deepEqual(rows[3].completeness_transitions, [t1, t2], 'a new transition reappears on the next row');
+    assert.deepEqual(rows[4].completeness_transitions, []);
+    await fs.rm(file, { force: true });
+  });
 });

@@ -237,4 +237,80 @@ describe('MarketStatusTracker — worker ready vs data_complete separation', () 
     t.markDegraded('opt1', 'spot feed degraded');
     assert.equal(t.snapshot().data_complete, true);
   });
+
+  it('(k) P1-1: module restart FAILURE degrades a running market (data_complete true → false)', () => {
+    // The watchdog restarts exactly the markets whose connector still ticks
+    // a stale state='running' (data stale). The main thread's
+    // marketRestartFailed handler must degrade — the mirror of
+    // marketRestarted's observeState('running') — otherwise the 2s stats
+    // tick re-asserts data_complete=true forever after a failed restart
+    // (docs fail-visible contradiction).
+    const t = new MarketStatusTracker({ expectedMarkets: ['m1'] });
+    t.observeState('m1', 'running');
+    assert.equal(t.snapshot().data_complete, true);
+
+    // No stateChange event fires during the reseed (the socket was silent,
+    // not errored) — the tracker still holds 'running' when the failure
+    // report lands. The degraded call is what flips completeness.
+    const r = t.markDegraded('m1', 'module restart failed: snapshot timeout after disconnect');
+    assert.equal(r.dataComplete, false);
+    assert.equal(r.changed, true, 'running → degraded must flip data_complete');
+    assert.ok(r.transition, 'running → degraded must be recorded');
+    assert.equal(r.transition.from, 'running');
+    assert.equal(r.transition.to, 'degraded');
+
+    let s = t.snapshot();
+    assert.equal(s.data_complete, false);
+    assert.equal(s.markets['m1'].state, 'degraded');
+    assert.equal(s.markets['m1'].degraded_reason, 'module restart failed: snapshot timeout after disconnect');
+
+    // The isolated market's connector may keep ticking stale 'running' stats
+    // (that is exactly why the watchdog restarted it) — a stats tick must
+    // NOT resurrect data_complete (false recovery).
+    const stale = t.observeStatsState('m1', 'running');
+    assert.equal(stale.recovered, false);
+    assert.equal(stale.dataComplete, false);
+    s = t.snapshot();
+    assert.equal(s.data_complete, false);
+    assert.deepEqual(s.degraded_markets, { m1: 'module restart failed: snapshot timeout after disconnect' });
+
+    // Recovery only via an explicit running event (background reconnect).
+    const rec = t.observeState('m1', 'running');
+    assert.equal(rec.recovered, true);
+    assert.equal(rec.dataComplete, true);
+    assert.equal(t.snapshot().data_complete, true);
+  });
+
+  it('(l) P2-5: markDegraded with a NEW reason while already degraded records the reason update', () => {
+    const t = new MarketStatusTracker({ expectedMarkets: ['m1'] });
+    t.observeState('m1', 'running');
+    t.markDegraded('m1', 'watchdog: depth socket generation expired');
+    assert.equal(t.snapshot().data_complete, false);
+
+    // Repeating the same reason is idempotent — no phantom transition.
+    const same = t.markDegraded('m1', 'watchdog: depth socket generation expired');
+    assert.equal(same.transition, null, 'same-reason re-degrade must not record a transition');
+
+    // A replacement reason (e.g. restart failure supersedes the original
+    // isolation cause) must be visible in the transition history.
+    const changed = t.markDegraded('m1', 'module restart failed: snapshot timeout after disconnect');
+    assert.equal(changed.dataComplete, false);
+    assert.ok(changed.transition, 'reason change while degraded must record a transition');
+    assert.equal(changed.transition.from, 'degraded');
+    assert.equal(changed.transition.to, 'degraded');
+    assert.equal(changed.transition.reason, 'module restart failed: snapshot timeout after disconnect');
+
+    const s = t.snapshot();
+    assert.equal(s.markets['m1'].degraded_reason, 'module restart failed: snapshot timeout after disconnect');
+    assert.equal(s.markets['m1'].last_transition.to, 'degraded');
+    assert.equal(s.markets['m1'].last_transition.reason, 'module restart failed: snapshot timeout after disconnect');
+    assert.equal(s.data_complete, false);
+
+    // Recovery still works after a reason-refresh.
+    const rec = t.observeState('m1', 'running');
+    assert.equal(rec.recovered, true);
+    assert.equal(rec.dataComplete, true);
+    assert.equal(rec.transition.from, 'degraded');
+    assert.equal(rec.transition.to, 'running');
+  });
 });
