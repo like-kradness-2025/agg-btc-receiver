@@ -66,6 +66,19 @@ describe('formatMarketStatusV1 — receiver-market-status/v1 document', () => {
     assert.equal(doc.markets.binance_spot.required, false);
   });
 
+  it('re-stamps a fresh ts_ms on every publish (downstream staleness contract)', async () => {
+    const t = freshTracker();
+    t.applyReady('B', readyReport('B', ['binance_perp', 'coinbase_spot']));
+    t.applyReady('A', readyReport('A', ['binance_spot']));
+    const first = docFor(t);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = docFor(t); // quiet state: no transitions in between
+    assert.ok(second.ts_ms > first.ts_ms,
+      `quiet-state publish must advance ts_ms (${first.ts_ms} -> ${second.ts_ms}) — ` +
+      'downstream staleness (15s) relies on periodic re-stamping');
+    assert.equal(second.data_complete, true);
+  });
+
   it('required market degraded (markDegraded) ⇒ data_complete=false with the reason', () => {
     const t = freshTracker();
     t.applyReady('B', readyReport('B', ['binance_perp', 'coinbase_spot']));

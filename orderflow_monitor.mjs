@@ -619,11 +619,13 @@ function currentStatusDocument() {
 
 /**
  * Persist market-status.json atomically (tmp+rename). Called on every
- * state-changing IPC event (immediate write when the document changed) and by
- * a 2s periodic timer; an unchanged document is skipped when one was written
- * within the last second (stats ticks arrive every ~2s — debounce keeps the
- * file fresh without hammering the disk). Returns the document that was (or
- * would be) written.
+ * state-changing IPC event and by a 2s periodic timer. The document carries a
+ * fresh ts_ms (Date.now() re-stamped on every snapshot), so consecutive
+ * publishes always differ and the file stays fresh — the freshness contract
+ * for the downstream staleness window (15s) depends on this. The interval arm
+ * below only guards the (practically unreachable) identical-document case as
+ * a disk-safety backstop. Returns the document that was (or would be)
+ * written.
  */
 function publishMarketStatusFile(force = false) {
   const doc = currentStatusDocument();
