@@ -1,6 +1,11 @@
-# raw_batches データ契約（SQLite）
+# raw データ契約（SQLite）
 
-## テーブル
+本ドキュメントはmarket別SQLite（`data/sqlite/<market>.sqlite`）内の2系統を定義する。
+
+1. **`raw_batches`**（schema `raw_v6_sqlite` / 移行済み `raw_v5_duckdb`）— 従来のnormalized互換層。event-time sort / late-event UPDATE mergeを含む可変batch。
+2. **`canonical_frames`**（schema `raw_v7_canonical`）— Issue #10/#11のcanonical raw。**immutable append-only / arrival-order**のsource frame log。
+
+## 1. raw_batches（従来契約・変更なし）
 
 ```sql
 CREATE TABLE raw_batches (
@@ -78,3 +83,64 @@ FROM raw_batches
 GROUP BY stream, market
 ORDER BY stream, market;
 ```
+
+## 2. canonical_frames（Issue #10/#11 新契約）
+
+```sql
+CREATE TABLE canonical_frames (
+  frame_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schema TEXT NOT NULL,            -- 'raw_v7_canonical'
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,            -- trades / book_updates / liquidations ...
+  channel TEXT,                    -- 取引所stream識別子（例 'btcusdt@trade'）
+  connection_id TEXT,              -- socket世代識別子（#12）
+  receive_seq INTEGER,             -- コネクション内単調増加frame counter（#12）
+  recv_ts_ms INTEGER NOT NULL,     -- socket境界で確定した受信時刻（#12）
+  recv_mono_ns INTEGER,
+  source_event_ts_ms INTEGER,      -- 保存時に解釈しないため原則 null（metadata）
+  source_event_time_known INTEGER,
+  event_ts_ms INTEGER,             -- 検索用metadata。並び順を決めない
+  ingest_seq TEXT,
+  writer_session_id TEXT,
+  frame_json TEXT NOT NULL,        -- envelope JSON 1行（下記shape）
+  frame_sha256 TEXT NOT NULL,      -- frame_jsonのSHA-256（immutability検証用）
+  written_at_ms INTEGER NOT NULL,
+  UNIQUE (connection_id, receive_seq)
+);
+```
+
+### 不変条件（Issue #10 / #11 Done条件のstorage側）
+
+1. **追記のみ** — writerはINSERTしか実行しない。commit済行は後続appendで変更されない（UPDATE/merge/sort/dedupe-rewriteは本経路に存在しない）。**自動TTL削除も存在しない**（後述: `pruneExpired()`の対象はlegacy `raw_batches` のみ）。`frame_sha256`で改変検出できる。
+2. **arrival-order** — `frame_id`（AUTOINCREMENT）が物理到着順。`event_ts_ms`はmetadataであり並び順を決めない。`ORDER BY frame_id`で受信順全走査できる。
+3. **重複防止はappend-safe** — 同一 `(connection_id, receive_seq)` が既存なら**skip**（INSERT constraint violationを期待動作として数える）。既存行のUPDATEはしない。`receive_seq = NULL`（REST等の非socket観測）はSQLite UNIQUEのNULLセマンティクスにより常に追記される。
+4. **fail-closed** — market単位の `BEGIN IMMEDIATE` トランザクション内で全行INSERT。想定外エラーはROLLBACKしバッチ全体を失敗扱い（部分書き込みなし）。呼び出し側（main process）は`reportRawDbFailure`でfail-closedにする。
+5. **dual-path** — 旧 `raw_batches` は従来どおり可変として維持（downstream互換）。両テーブルは同一market DB内でschema分離され、相互に書き込まない。
+6. **TTL対象外（無期限保持）** — `canonical_frames` は `pruneExpired()`（6時間毎・`orderflow_monitor.mjs`）の自動削除対象**ではない**。削除はlegacy `raw_batches` 系のみ。canonicalの削除はoperatorの明示操作のみ（手動DELETE / archive job）で、Receiverプロセスはcanonical履歴を自動破棄しない。容量増大は承知の上で、Issue #9/#10/#11 の「保存済みsource rawから全履歴を再計算できる」前提を守るための設計。
+
+### frame_json のenvelope shape（canonical専用・読み取りは新規adapterが必要）
+
+`frame_json`はcanonical専用のJSON 1行（下記shape）。**既存downstreamのraw parser（例: `agg-btc-downstream` の `parseRawLine`）はこのenvelopeを読めない** — payload本体が`frame`値に閉じているため既存parserの期待する構造とは異なり、渡すとnull扱いで読み捨てられる。canonical行を読むには**新規adapter**（envelopeから`frame`値を取り出し既存parserへ渡す変換層）が**将来のdownstream作業**として必要。これに対し legacy `raw_batches`（dual-path）は従来どおり既存parserで読み書きできる。
+
+```json
+{
+  "schema": "raw_v7_canonical", "market": "binance_perp", "stream": "trades",
+  "channel": "btcusdt@trade",
+  "connection_id": "binance_perp:123:1", "receive_seq": 42,
+  "recv_ts_ms": 1750000000000, "recv_mono_ns": 123456,
+  "source_event_ts_ms": null, "source_event_time_known": null,
+  "event_ts_ms": null, "ingest_seq": "17", "writer_session_id": "sqlite:1:2",
+  "frame": "{\"stream\":\"btcusdt@trade\",\"data\":{\"e\":\"trade\",...}}",
+  "written_at_ms": 1750000000100
+}
+```
+
+- `frame` が**parser前の完全なsource frame text**（socket受信bytesをそのまま文字列化）。canonical raw経路はこのtextを解釈しない（qty/side/ts換算ゼロ = Issue #10のNon-goal順守）。byte-exact保存のため、text内の改行はrejectしない（外側の`JSON.stringify()`がエスケープし、`frame_json`は常に1行JSONとして格納される）。
+- キー名は既存envelopeと一部重複するが**additive互換ではない**（上記のとおり既存parserは読めない）。canonical行の消費は新規adapterの責務であり、legacy `raw_batches` の互換性は影響を受けない。
+
+### 補足
+
+- 有効化: `raw_storage=sqlite` 時に、`_canonicalFrameMeta()` / `_canonicalUnparsedFrameMeta()` を実装したconnector（現状 Binance系6 market）のsocket messageをparser前で捕捉し `canonicalFrames` IPC → `RawSqliteWriter.appendCanonical()` へ流す。
+- **保持（TTL対象外）**: `canonical_frames` は自動TTL削除の対象外。`pruneExpired()`（起動時+6時間毎・`orderflow_monitor.mjs`）は legacy `raw_batches` のみを `last_recv_ts_ms` 基準（既定90日）で削除し、canonical行には一切触れない。canonicalは無期限に単調増加する（容量増大は許容する設計。Issue #9/#10/#11 の「保存済みsource rawから全履歴を再計算できる」前提を維持）。削除が必要な場合はoperatorの明示操作（手動DELETE / archive job）のみ。なお行DELETEは、削除した `(connection_id, receive_seq)` の再送に対してappend-safe重複ガードが効かなくなる副作用を持つため、削除より退避（コピー + cut-over）を推奨する。archive方針・実装は将来の運用作業として別途定める。
+- **分類 `parse_failed`（reserved stream）**: socket境界で `JSON.parse` に失敗したframeも、**parse試行より先に**byte-exact textを捕捉して保存する（Issue #10の「parser前source frame保存」を充足。`lib/base-connector.mjs` のmessage handlerはparse成功/失敗に関わらず先にcanonical envelopeをemitする）。失敗frameは内容を解釈できないためstream分類は不可能で、予約値 `stream='parse_failed'`・`channel=null` で記録される（`CANONICAL_UNPARSED_STREAM`定数）。`frame_json.frame` に失敗したsource textそのものを保持し、`receive_seq`/`recv_ts_ms` 等のingress metadataは他frameと同じ。既存downstream parserはこの行も読まない（新規adapterで `parse_failed` 行を除外/別扱いするかはdownstream側の設計判断）。対象connector（Binance系）のみ有効で、opt-inしないconnectorのparse失敗frameは従来どおりerror eventのみ。**空文字`''`のframe**（空socket message → parse失敗）も同様に `frame: ""` としてbyte-exact保存される（Astra再監査P2修正。拒否されるのは`frame_text`が**欠落/非文字列**の場合のみ。空文字と欠落を区別する）。
+- 実データ移行手順: `docs/current/canonical-raw-migration.md` 参照。なお旧 `raw_batches` はnormalized eventでありsource frameを含まないため、**過去分のcanonical化は不可能**（新経路は有効化時点から蓄積）。
