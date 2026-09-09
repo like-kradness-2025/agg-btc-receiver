@@ -201,7 +201,7 @@ describe('CoinbaseConnector _l2Continuity (Issue #14/#22 — monotonic + server-
   });
 
   it('rejects unsafe tolerance overrides (Qwen P1: NaN/0/negative/NaN-string fall back to default)', () => {
-    for (const bad of [undefined, null, 0, -5, NaN, 'abc', '0x10', {}]) {
+    for (const bad of [undefined, null, 0, -5, NaN, 'abc', 'Infinity', {}]) {
       const conn = createConn({ l2SeqSkipTolerance: bad });
       assert.strictEqual(conn._l2SeqSkipTolerance, 32, `override ${String(bad)} must fall back to 32`);
       assert.strictEqual(conn._l2Continuity(33, 1), 'ok'); // delta 32 = boundary ok
