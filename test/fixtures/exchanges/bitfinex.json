@@ -31,10 +31,10 @@
         [ 19111, "tu", [ 401597396, 1700000000300, -1.25, 65005.5 ] ]
       ],
       "expected_events": [
-        { "kind": "trade", "market": "bitfinex_spot", "price": 65000, "qty": 0.5, "side": "buy", "ts": 1700000000000, "tradeId": "401597393", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "trade", "market": "bitfinex_spot", "price": 65001, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "401597394", "source_event_ts_ms": 1700000000100, "source_event_time_known": true },
-        { "kind": "trade", "market": "bitfinex_spot", "price": 65000, "qty": 0.005, "side": "buy", "ts": 1700000000200, "tradeId": "401597395", "source_event_ts_ms": 1700000000200, "source_event_time_known": true },
-        { "kind": "trade", "market": "bitfinex_spot", "price": 65005.5, "qty": 1.25, "side": "sell", "ts": 1700000000300, "tradeId": "401597396", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
+        { "frame": 1, "kind": "trade", "market": "bitfinex_spot", "price": 65000, "qty": 0.5, "side": "buy", "ts": 1700000000000, "tradeId": "401597393", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "bitfinex_spot", "price": 65001, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "401597394", "source_event_ts_ms": 1700000000100, "source_event_time_known": true },
+        { "frame": 3, "kind": "trade", "market": "bitfinex_spot", "price": 65000, "qty": 0.005, "side": "buy", "ts": 1700000000200, "tradeId": "401597395", "source_event_ts_ms": 1700000000200, "source_event_time_known": true },
+        { "frame": 4, "kind": "trade", "market": "bitfinex_spot", "price": 65005.5, "qty": 1.25, "side": "sell", "ts": 1700000000300, "tradeId": "401597396", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
       ]
     },
     {
@@ -62,9 +62,9 @@
         [ 17082, [ 65002.0, 0, -1.2 ] ]
       ],
       "expected_events": [
-        { "kind": "depth", "type": "snapshot", "market": "bitfinex_spot", "bids": [ [ "65000", "1.5" ], [ "64999", "2" ] ], "asks": [ [ "65001", "0.8" ], [ "65002", "1.2" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
-        { "kind": "depth", "type": "update", "market": "bitfinex_spot", "bids": [], "asks": [ [ "65001", "1" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
-        { "kind": "depth", "type": "update", "market": "bitfinex_spot", "bids": [], "asks": [ [ "65002", "" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
+        { "frame": 1, "kind": "depth", "type": "snapshot", "market": "bitfinex_spot", "bids": [ [ "65000", "1.5" ], [ "64999", "2" ] ], "asks": [ [ "65001", "0.8" ], [ "65002", "1.2" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "frame": 2, "kind": "depth", "type": "update", "market": "bitfinex_spot", "bids": [], "asks": [ [ "65001", "1" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "frame": 3, "kind": "depth", "type": "update", "market": "bitfinex_spot", "bids": [], "asks": [ [ "65002", "" ] ], "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
       ]
     }
   ]

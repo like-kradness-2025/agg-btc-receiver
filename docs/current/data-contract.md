@@ -242,5 +242,6 @@ source ts を以下の不変条件で分割する。
 - **market running**: あるmarketのconnectorがストリーム受信＋book同期完了を経て`running`に達した状態。
 - **market degraded**: 初期接続失敗・watchdog再起動等でfeedから隔離され、バックグラウンド再試行中の状態。degraded reason（`degraded_reason`/`degraded_markets`）を常に伴う。
 - **data_complete**: 全**必須**market（enabledからoptionalを除く）が同時にrunningかつ非degradedである状態。optional market・期待集合外marketはdata_completeをfalseにしない。1marketでもdegraded/reconnectingに落ちれば即false（fail-visible。downstreamはdata_complete=falseを「正常aggregateとして提示不可」と扱う）。
+- **data_complete の解釈詳細**: 必須marketが0件（enabledが全てoptional）の構成はvacuously complete（true）。`applyReady`でmarketのstateが欠落している場合は'unknown'扱いであり'running'既定にしない（欠落＝complete扱いはfail-visible原則に反する）。2秒周期のstats tickはmarket状態の**降格のみ**反映し、degraded解除（復帰）はstateChange→running・marketRestarted等の明示イベントに限定される（statsのstale 'running'によるfalse-recovery防止）。
 - 状態は `lib/market-status.mjs` の `MarketStatusTracker` が一元管理し、worker（`lib/orderflow-worker.mjs`）・main thread（`orderflow_monitor.mjs`）・health出力の3層で同じ意味論を使う。状態遷移はmarket毎に上限付き（直近20件、aggregateは50件）で履歴保持し、health/IPCに `expected_markets`/`running_markets`/`degraded_markets`/`data_complete` として公開する。
 - readyからcompleteへの昇格・degradedからの復帰は明示的に遷移として記録され、復帰時に`recovered`フラグが立つ。complete ⇔ incomplete の遷移はworkerログに常時出力される（`data_complete=false`時はERROR扱い）。

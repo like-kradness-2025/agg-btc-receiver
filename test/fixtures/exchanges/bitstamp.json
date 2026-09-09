@@ -27,8 +27,8 @@
         { "data": { "id": 9002, "timestamp": "1700000000", "amount": "0.250", "amount_str": "0.25000000", "price": "64999.50", "price_str": "64999.50", "type": 1, "microtimestamp": "1700000000100000", "buy_order_id": 10003, "sell_order_id": 10004 }, "channel": "live_trades_btcusd", "event": "trade" }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "bitstamp_spot", "price": 65000, "qty": 0.001, "side": "buy", "ts": 1700000000000, "tradeId": "9001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "trade", "market": "bitstamp_spot", "price": 64999.5, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "9002", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "trade", "market": "bitstamp_spot", "price": 65000, "qty": 0.001, "side": "buy", "ts": 1700000000000, "tradeId": "9001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "bitstamp_spot", "price": 64999.5, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "9002", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     }
   ]

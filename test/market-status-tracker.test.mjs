@@ -152,4 +152,89 @@ describe('MarketStatusTracker — worker ready vs data_complete separation', () 
     const r = t.observeState('m1', 'reconnecting');
     assert.equal(r.transition, null, 'same-state observe must not record a transition');
   });
+
+  it('(g) applyReady defaults a missing market state to unknown, not running (fail-visible)', () => {
+    // A ready report that omits a market's state must NOT silently count that
+    // market as running: the default is 'unknown' (data_complete stays false
+    // until an explicit running report) — optimistic defaults hide outages.
+    const t = new MarketStatusTracker({ expectedMarkets: ['m1', 'm2'] });
+    const snap = t.applyReady('w1', {
+      dataComplete: false,
+      markets: [
+        { market: 'm1', state: 'running', degradedReason: null },
+        { market: 'm2', degradedReason: null }, // state omitted
+      ],
+    });
+    assert.equal(snap.data_complete, false, 'missing state must not imply running');
+    assert.equal(snap.markets['m2'].state, 'unknown');
+    assert.deepEqual(snap.running_markets, ['m1']);
+  });
+
+  it('(h) stats-tick observations downgrade but never clear an active degradation', () => {
+    const t = new MarketStatusTracker({ expectedMarkets: ['m1'] });
+    t.markDegraded('m1', 'initial sync failed: snapshot timeout');
+
+    // Periodic stats keep ticking a stale 'running' for the isolated market —
+    // must NOT clear the degradation (false recovery via the 2s stats push).
+    const r = t.observeStatsState('m1', 'running');
+    assert.equal(r.recovered, false);
+    assert.equal(r.dataComplete, false);
+    assert.equal(r.changed, false);
+    let s = t.snapshot();
+    assert.equal(s.markets['m1'].state, 'degraded');
+    assert.equal(s.markets['m1'].degraded_reason, 'initial sync failed: snapshot timeout');
+    assert.ok('m1' in s.degraded_markets, 'stats running must not clear degraded_markets');
+
+    // A stats downgrade (reconnecting) IS reflected while degradation persists.
+    const d = t.observeStatsState('m1', 'reconnecting');
+    assert.equal(d.dataComplete, false);
+    s = t.snapshot();
+    assert.equal(s.markets['m1'].state, 'reconnecting');
+    assert.ok('m1' in s.degraded_markets, 'downgrade must keep the degraded flag');
+
+    // Only an explicit event (stateChange → running) recovers the market.
+    const rec = t.observeState('m1', 'running');
+    assert.equal(rec.recovered, true);
+    assert.equal(rec.dataComplete, true);
+    s = t.snapshot();
+    assert.equal(s.markets['m1'].degraded_reason, null);
+    assert.deepEqual(s.degraded_markets, {});
+
+    // A non-degraded market is freely updated by stats ticks.
+    const t2 = new MarketStatusTracker({ expectedMarkets: ['m2'] });
+    t2.observeStatsState('m2', 'running');
+    assert.equal(t2.snapshot().data_complete, true);
+    const down = t2.observeStatsState('m2', 'reconnecting');
+    assert.equal(down.dataComplete, false, 'stats downgrade must flip data_complete');
+  });
+
+  it('(i) markDegraded(null) records the degraded→unknown transition on clear', () => {
+    const t = new MarketStatusTracker({ expectedMarkets: ['m1'] });
+    t.markDegraded('m1', 'watchdog restart');
+    const r = t.markDegraded('m1', null);
+    assert.ok(r.transition, 'clear-without-recovery must record a transition');
+    assert.equal(r.transition.from, 'degraded');
+    assert.equal(r.transition.to, 'unknown');
+    const s = t.snapshot();
+    assert.equal(s.markets['m1'].state, 'unknown');
+    assert.equal(s.markets['m1'].degraded_reason, null);
+    assert.equal(s.markets['m1'].last_transition.to, 'unknown');
+    assert.equal(s.data_complete, false, 'cleared-but-never-running stays incomplete');
+    // Clearing when nothing is degraded stays a no-op.
+    const noop = t.markDegraded('m1', '');
+    assert.equal(noop.transition, null);
+    assert.equal(noop.changed, false);
+  });
+
+  it('(j) scope with no required markets (all optional) is vacuously complete', () => {
+    const t = new MarketStatusTracker({
+      expectedMarkets: ['opt1', 'opt2'],
+      optionalMarkets: ['opt1', 'opt2'],
+    });
+    assert.equal(t.snapshot().data_complete, true,
+      'zero required markets must not pin data_complete to false forever');
+    // Optional degradations still never block completeness.
+    t.markDegraded('opt1', 'spot feed degraded');
+    assert.equal(t.snapshot().data_complete, true);
+  });
 });

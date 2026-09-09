@@ -470,9 +470,12 @@ function createWorker(workerId, groupMarkets) {
 
       case 'stats':
         healthMonitor.updateConnector(msg.market, msg.payload);
-        // Report the connector's current state so a mid-run reconnect/error is
-        // reflected in data_complete without waiting for a stateChange frame.
-        if (msg.payload?.state) marketStatus.observeState(msg.market, msg.payload.state);
+        // Periodic stats reflect the connector's current state so a mid-run
+        // reconnect/error downgrades data_complete without waiting for a
+        // stateChange frame — but a stats tick must never CLEAR an active
+        // degradation (observeStatsState keeps the degraded flag until an
+        // explicit stateChange/marketRestarted recovery event arrives).
+        if (msg.payload?.state) marketStatus.observeStatsState(msg.market, msg.payload.state);
         refreshHealthCompleteness();
         break;
 

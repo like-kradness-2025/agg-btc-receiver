@@ -30,8 +30,8 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "coinbase_spot", "price": 65000.5, "qty": 0.1, "side": "buy", "ts": 1700000000000, "tradeId": "cb-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "trade", "market": "coinbase_spot", "price": 65001, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "cb-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "trade", "market": "coinbase_spot", "price": 65000.5, "qty": 0.1, "side": "buy", "ts": 1700000000000, "tradeId": "cb-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 0, "kind": "trade", "market": "coinbase_spot", "price": 65001, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "cb-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     },
     {
@@ -67,8 +67,8 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "depth", "type": "snapshot", "market": "coinbase_spot", "bids": [["65000.00", "1.000"]], "asks": [["65001.00", "2.000"]], "seq": 400, "snapshot_origin": "ws_sync", "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
-        { "kind": "depth", "type": "update", "market": "coinbase_spot", "bids": [["65000.00", "2.500"]], "asks": [["65002.00", "0.000"]], "seq": 401, "prev_seq": 400, "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
+        { "frame": 0, "kind": "depth", "type": "snapshot", "market": "coinbase_spot", "bids": [["65000.00", "1.000"]], "asks": [["65001.00", "2.000"]], "seq": 400, "snapshot_origin": "ws_sync", "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "coinbase_spot", "bids": [["65000.00", "2.500"]], "asks": [["65002.00", "0.000"]], "seq": 401, "prev_seq": 400, "source_event_ts_ms": null, "source_event_time_known": false, "event_time_source": "local" }
       ]
     }
   ]

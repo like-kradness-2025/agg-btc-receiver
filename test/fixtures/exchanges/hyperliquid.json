@@ -30,8 +30,8 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "hyperliquid_perp", "price": 65000.5, "qty": 0.125, "side": "buy", "ts": 1700000000000, "tradeId": "77001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "trade", "market": "hyperliquid_perp", "price": 64999.5, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "77002", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 1, "kind": "trade", "market": "hyperliquid_perp", "price": 65000.5, "qty": 0.125, "side": "buy", "ts": 1700000000000, "tradeId": "77001", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "trade", "market": "hyperliquid_perp", "price": 64999.5, "qty": 0.25, "side": "sell", "ts": 1700000000100, "tradeId": "77002", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     },
     {
@@ -63,8 +63,8 @@
         ], "time": 1700000000100000000 } }
       ],
       "expected_events": [
-        { "kind": "depth", "type": "update", "market": "hyperliquid_perp", "bids": [ [ "65000.0", "1.5" ], [ "64999.0", "2.0" ] ], "asks": [ [ "65001.0", "0.8" ], [ "65002.0", "1.2" ] ], "ts": 1700000000000, "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "depth", "type": "update", "market": "hyperliquid_perp", "bids": [ [ "65000.0", "2.0" ], [ "64999.0", "0" ] ], "asks": [ [ "65001.0", "1.0" ] ], "ts": 1700000000100, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "depth", "type": "update", "market": "hyperliquid_perp", "bids": [ [ "65000.0", "1.5" ], [ "64999.0", "2.0" ] ], "asks": [ [ "65001.0", "0.8" ], [ "65002.0", "1.2" ] ], "ts": 1700000000000, "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "hyperliquid_perp", "bids": [ [ "65000.0", "2.0" ], [ "64999.0", "0" ] ], "asks": [ [ "65001.0", "1.0" ] ], "ts": 1700000000100, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     }
   ]

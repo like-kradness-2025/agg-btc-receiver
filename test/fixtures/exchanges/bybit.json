@@ -29,8 +29,8 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "bybit_perp", "price": 65000.5, "qty": 0.5, "side": "buy", "ts": 1700000000000, "tradeId": "bybit-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "trade", "market": "bybit_perp", "price": 64999, "qty": 1.25, "side": "sell", "ts": 1700000000100, "tradeId": "bybit-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "trade", "market": "bybit_perp", "price": 65000.5, "qty": 0.5, "side": "buy", "ts": 1700000000000, "tradeId": "bybit-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 0, "kind": "trade", "market": "bybit_perp", "price": 64999, "qty": 1.25, "side": "sell", "ts": 1700000000100, "tradeId": "bybit-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     },
     {
@@ -55,7 +55,7 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "bybit_spot", "price": 65010, "qty": 0.02, "side": "sell", "ts": 1700000000200, "tradeId": "sp-tx-1", "source_event_ts_ms": 1700000000200, "source_event_time_known": true }
+        { "frame": 0, "kind": "trade", "market": "bybit_spot", "price": 65010, "qty": 0.02, "side": "sell", "ts": 1700000000200, "tradeId": "sp-tx-1", "source_event_ts_ms": 1700000000200, "source_event_time_known": true }
       ]
     },
     {
@@ -82,7 +82,7 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "liquidation", "market": "bybit_perp", "exchange": "bybit", "symbol": "BTCUSDT", "side": "buy", "price": 61000, "qty": 1.2, "notional": 73200, "raw_type": "liquidation", "trade_id": null, "source_ts": 1700000000500, "source_event_ts_ms": 1700000000500, "source_event_time_known": true }
+        { "frame": 0, "kind": "liquidation", "market": "bybit_perp", "exchange": "bybit", "symbol": "BTCUSDT", "side": "buy", "price": 61000, "qty": 1.2, "notional": 73200, "raw_type": "liquidation", "trade_id": null, "source_ts": 1700000000500, "source_event_ts_ms": 1700000000500, "source_event_time_known": true }
       ]
     },
     {
@@ -109,8 +109,8 @@
         { "topic": "orderbook.1000.BTCUSDT", "type": "delta", "ts": 1700000000100, "data": { "s": "BTCUSDT", "u": 201, "seq": 201, "b": [["65000.0", "2.000", "0"]], "a": [["65002.0", "0.000", "2"]] } }
       ],
       "expected_events": [
-        { "kind": "depth", "type": "snapshot", "market": "bybit_perp", "bids": [["65000.0", "1.500"], ["64999.0", "2.000"]], "asks": [["65001.0", "0.800"], ["65002.0", "1.200"]], "ts": 1700000000000, "seq": 200, "snapshot_origin": "ws_sync", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "depth", "type": "update", "market": "bybit_perp", "bids": [["65000.0", "2.000"]], "asks": [["65002.0", "0.000"]], "ts": 1700000000100, "seq": 201, "prev_seq": 200, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "depth", "type": "snapshot", "market": "bybit_perp", "bids": [["65000.0", "1.500"], ["64999.0", "2.000"]], "asks": [["65001.0", "0.800"], ["65002.0", "1.200"]], "ts": 1700000000000, "seq": 200, "snapshot_origin": "ws_sync", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "bybit_perp", "bids": [["65000.0", "2.000"]], "asks": [["65002.0", "0.000"]], "ts": 1700000000100, "seq": 201, "prev_seq": 200, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     }
   ]

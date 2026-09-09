@@ -28,8 +28,8 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "okx_perp", "price": 65000, "qty": 0.02, "side": "buy", "ts": 1700000000000, "tradeId": "okx-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "trade", "market": "okx_perp", "price": 64998, "qty": 0.05, "side": "sell", "ts": 1700000000100, "tradeId": "okx-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "trade", "market": "okx_perp", "price": 65000, "qty": 0.02, "side": "buy", "ts": 1700000000000, "tradeId": "okx-tx-1", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 0, "kind": "trade", "market": "okx_perp", "price": 64998, "qty": 0.05, "side": "sell", "ts": 1700000000100, "tradeId": "okx-tx-2", "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     },
     {
@@ -54,7 +54,7 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "trade", "market": "okx_spot", "price": 65005, "qty": 0.5, "side": "sell", "ts": 1700000000300, "tradeId": "okx-sp-tx-1", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
+        { "frame": 0, "kind": "trade", "market": "okx_spot", "price": 65005, "qty": 0.5, "side": "sell", "ts": 1700000000300, "tradeId": "okx-sp-tx-1", "source_event_ts_ms": 1700000000300, "source_event_time_known": true }
       ]
     },
     {
@@ -81,7 +81,7 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "liquidation", "market": "okx_perp", "exchange": "okx", "symbol": "BTC-USDT-SWAP", "side": "sell", "price": 62000, "qty": 0.05, "notional": 3100, "raw_type": "liquidation-orders", "trade_id": null, "source_ts": 1700000000800, "source_event_ts_ms": 1700000000800, "source_event_time_known": true }
+        { "frame": 0, "kind": "liquidation", "market": "okx_perp", "exchange": "okx", "symbol": "BTC-USDT-SWAP", "side": "sell", "price": 62000, "qty": 0.05, "notional": 3100, "raw_type": "liquidation-orders", "trade_id": null, "source_ts": 1700000000800, "source_event_ts_ms": 1700000000800, "source_event_time_known": true }
       ]
     },
     {
@@ -111,8 +111,8 @@
         ] }
       ],
       "expected_events": [
-        { "kind": "depth", "type": "snapshot", "market": "okx_perp", "bids": [["65000.0", "1.5"]], "asks": [["65001.0", "2"]], "ts": 1700000000000, "seq": 300, "snapshot_origin": "ws_sync", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
-        { "kind": "depth", "type": "update", "market": "okx_perp", "bids": [["65000.0", "2"]], "asks": [], "ts": 1700000000100, "seq": 301, "prev_seq": 300, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
+        { "frame": 0, "kind": "depth", "type": "snapshot", "market": "okx_perp", "bids": [["65000.0", "1.5"]], "asks": [["65001.0", "2"]], "ts": 1700000000000, "seq": 300, "snapshot_origin": "ws_sync", "source_event_ts_ms": 1700000000000, "source_event_time_known": true },
+        { "frame": 1, "kind": "depth", "type": "update", "market": "okx_perp", "bids": [["65000.0", "2"]], "asks": [], "ts": 1700000000100, "seq": 301, "prev_seq": 300, "source_event_ts_ms": 1700000000100, "source_event_time_known": true }
       ]
     }
   ]
