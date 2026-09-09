@@ -204,6 +204,64 @@ describe('active book sync invariants', () => {
     assert.strictEqual(conn.getState(), 'reconnecting');
   });
 
+  it('Coinbase stays running across continuous within-tolerance skips (live incident shape, Qwen P2)', () => {
+    const conn = new CoinbaseConnector({});
+    suppressReconnectTimer(conn);
+    const errors = collectErrors(conn);
+    conn._setState('running');
+    conn._notifyWsSnapshotReceived(100);
+    conn.book.applySnapshot([['64999', '1']], [['65001', '1']], 100);
+
+    // The live flapping shape: after the snapshot anchor, updates arrive with
+    // coalesced skips (2, then 3, then 3) — all NORMAL delivery. Strict +1
+    // resynced on every one of these; monotonic+tolerance must keep applying.
+    conn._handleDepth({ channel: 'l2_data', sequence_num: 102, events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '1' }] }] });
+    conn._handleDepth({ channel: 'l2_data', sequence_num: 105, events: [{ type: 'update', updates: [{ side: 'ask', price_level: '65002', new_quantity: '2' }] }] });
+    conn._handleDepth({ channel: 'l2_data', sequence_num: 108, events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '0' }] }] });
+
+    assert.strictEqual(errors.length, 0);
+    assert.strictEqual(conn.getState(), 'running');
+    assert.strictEqual(conn.book._lastSeq, 108);
+    assert.strictEqual(conn.book.asks.get('65002'), '2'); // applied through skips
+    assert.strictEqual(conn.book.bids.has('65000'), false); // last update removed it
+    assert.strictEqual(conn._stats.l2SeqGapCount, 0);
+    assert.strictEqual(conn._stats.l2TolSkipCount, 3);
+    assert.strictEqual(conn._stats.l2MaxSeqSkipDelta, 3);
+  });
+
+  it('Coinbase replay applies within-tolerance skips between ring-buffered frames (Qwen P2)', () => {
+    const conn = new CoinbaseConnector({});
+    suppressReconnectTimer(conn);
+    const errors = collectErrors(conn);
+    conn._setState('syncing');
+    conn._ringBuf = [];
+
+    // Buffered 101 and 104 (delta 3 — normal coalesced delivery, same as live).
+    conn._handleDepth({ channel: 'l2_data', sequence_num: 101, events: [{ type: 'update', updates: [{ side: 'bid', price_level: '65000', new_quantity: '1' }] }] });
+    conn._handleDepth({ channel: 'l2_data', sequence_num: 104, events: [{ type: 'update', updates: [{ side: 'ask', price_level: '65002', new_quantity: '2' }] }] });
+    assert.strictEqual(conn._ringBuf.length, 2);
+
+    // Snapshot arrives → replay applies both (101→104 within tolerance).
+    conn._handleDepth({
+      channel: 'l2_data',
+      sequence_num: 100,
+      events: [{
+        type: 'snapshot',
+        updates: [
+          { side: 'bid', price_level: '64999', new_quantity: '1' },
+          { side: 'ask', price_level: '65001', new_quantity: '1' },
+        ],
+      }],
+    });
+
+    assert.strictEqual(errors.length, 0, 'within-tolerance replay must not resync');
+    assert.strictEqual(conn.getState(), 'syncing', 'no fail-closed transition');
+    assert.strictEqual(conn.book._lastSeq, 104);
+    assert.strictEqual(conn.book.asks.get('65002'), '2'); // replayed through the skip
+    assert.strictEqual(conn._stats.l2SeqGapCount, 0);
+    assert.strictEqual(conn._stats.l2TolSkipCount, 1);
+  });
+
   it('Coinbase awaiting _syncBook never finalizes to running when a replay gap beyond tolerance derails the sync (Astra audit #19 P1)', async () => {
     const conn = new CoinbaseConnector({});
     suppressReconnectTimer(conn);

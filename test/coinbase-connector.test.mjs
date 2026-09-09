@@ -11,8 +11,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { CoinbaseConnector } from '../lib/coinbase-connector.mjs';
 
-function createConn() {
-  const conn = new CoinbaseConnector({});
+function createConn(extraConfig) {
+  const conn = new CoinbaseConnector({ ...extraConfig });
   conn._ws = { send: () => {} };
   conn._setState('running');
   return conn;
@@ -177,5 +177,26 @@ describe('CoinbaseConnector _l2Continuity (Issue #14/#22 — monotonic + server-
     assert.strictEqual(conn._l2Continuity(8, 8), 'dup');
     // A genuinely huge jump still fails closed.
     assert.strictEqual(conn._l2Continuity(500, 8), 'gap');
+  });
+
+  it('records within-tolerance skip observability stats (Qwen P1)', () => {
+    const conn = createConn();
+    conn._l2Continuity(44, 41); // delta 3 → ok, counted
+    conn._l2Continuity(73, 41); // delta 32 → ok (boundary), counted
+    conn._l2Continuity(41, 41); // dup → not counted
+    conn._l2Continuity(74, 41); // delta 33 → gap (tracked in max delta)
+    assert.strictEqual(conn._stats.l2TolSkipCount, 2);
+    assert.strictEqual(conn._stats.l2MaxSeqSkipDelta, 33);
+  });
+
+  it('honors config.l2SeqSkipTolerance override for re-calibration', () => {
+    const conn = createConn({ l2SeqSkipTolerance: 4 });
+    assert.strictEqual(conn._l2SeqSkipTolerance, 4);
+    assert.strictEqual(conn._l2Continuity(44, 41), 'ok'); // delta 3 ≤ 4
+    assert.strictEqual(conn._l2Continuity(50, 41), 'gap'); // delta 9 > 4
+    // Default (no config) keeps the built-in ceiling.
+    const def = createConn();
+    assert.strictEqual(def._l2SeqSkipTolerance, 32);
+    assert.strictEqual(def._l2Continuity(50, 41), 'ok'); // delta 9 ≤ 32
   });
 });
