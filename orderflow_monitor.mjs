@@ -283,7 +283,10 @@ const derivativesHelper = rawDbWriter
         schema: rawEnvelopeSchema,
         market: row.market,
         stream: 'open_interest',
-        event_ts_ms: row.source_ts ?? row.ts,
+        event_ts_ms: Math.min(
+          Number.isFinite(row.as_of_ms) ? row.as_of_ms : (row.source_ts ?? row.ts),
+          row.ts,
+        ),
         recv_ts_ms: row.ts,
         writer_session_id: `main:${process.pid}:oi`,
         ingest_seq: ++rawIngestSeq,
