@@ -7,6 +7,7 @@ import {
   getOICapability,
   joinOpenInterestAsOf,
   normalizeOpenInterest,
+  openInterestEventTimestamp,
   openInterestAsOf,
   supportsOpenInterest,
 } from '../lib/oi-schema.mjs';
@@ -66,6 +67,42 @@ describe('OI schema and capabilities', () => {
     assert.equal(beyond.status, 'error');
     assert.equal(beyond.error_code, 'future_sample');
     assert.equal(beyond.oi_btc, null);
+
+    const exact = normalizeOpenInterest({
+      market: 'bybit_perp', ts: now + DEFAULT_OI_CLOCK_SKEW_TOLERANCE_MS,
+      open_interest: 1, mark_price: 40_000,
+    }, { nowMs: now });
+    assert.equal(exact.status, 'fresh');
+    assert.equal(exact.as_of_ms, now);
+
+    const strict = normalizeOpenInterest({
+      market: 'bybit_perp', ts: now + 101, open_interest: 1, mark_price: 40_000,
+    }, { nowMs: now, clockSkewToleranceMs: 100 });
+    assert.equal(strict.error_code, 'future_sample');
+
+    const disabled = normalizeOpenInterest({
+      market: 'bybit_perp', ts: now + 1, open_interest: 1, mark_price: 40_000,
+    }, { nowMs: now, clockSkewToleranceMs: 0 });
+    assert.equal(disabled.error_code, 'future_sample');
+  });
+
+  it('persists OI event time no later than receive time for every row branch', () => {
+    const receiveTs = 1_700_000_000_000;
+    assert.equal(openInterestEventTimestamp({
+      ts: receiveTs, as_of_ms: receiveTs, source_ts: receiveTs + 85,
+    }), receiveTs);
+    assert.equal(openInterestEventTimestamp({
+      ts: receiveTs, as_of_ms: receiveTs + DEFAULT_OI_CLOCK_SKEW_TOLERANCE_MS + 1,
+      source_ts: receiveTs + DEFAULT_OI_CLOCK_SKEW_TOLERANCE_MS + 1,
+      status: 'error', error_code: 'future_sample',
+    }), receiveTs);
+    assert.equal(openInterestEventTimestamp({
+      ts: receiveTs, as_of_ms: null, source_ts: null, status: 'error',
+    }), receiveTs);
+    assert.equal(openInterestEventTimestamp({
+      ts: receiveTs, as_of_ms: receiveTs + DEFAULT_OI_CLOCK_SKEW_TOLERANCE_MS,
+    }), receiveTs);
+    assert.equal(openInterestEventTimestamp({ ts: 'not-a-timestamp' }), null);
   });
 
   it('reports source and conversion errors instead of fabricating zeros', () => {

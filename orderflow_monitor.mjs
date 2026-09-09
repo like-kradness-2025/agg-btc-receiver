@@ -30,7 +30,7 @@ import { acquireOutputRootLock, releaseOutputRootLock } from './lib/lock.mjs';
 import { RawDbWriter, DEFAULT_RAW_RETENTION_DAYS } from './lib/raw-db-writer.mjs';
 import { RawSqliteWriter } from './lib/raw-sqlite-writer.mjs';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
-import { getOICapability } from './lib/oi-schema.mjs';
+import { getOICapability, openInterestEventTimestamp } from './lib/oi-schema.mjs';
 
 // ====== Market grouping ======
 
@@ -283,10 +283,7 @@ const derivativesHelper = rawDbWriter
         schema: rawEnvelopeSchema,
         market: row.market,
         stream: 'open_interest',
-        event_ts_ms: Math.min(
-          Number.isFinite(row.as_of_ms) ? row.as_of_ms : (row.source_ts ?? row.ts),
-          row.ts,
-        ),
+        event_ts_ms: openInterestEventTimestamp(row),
         recv_ts_ms: row.ts,
         writer_session_id: `main:${process.pid}:oi`,
         ingest_seq: ++rawIngestSeq,
