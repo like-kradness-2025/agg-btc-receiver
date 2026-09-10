@@ -4,8 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { gunzipSync } from 'node:zlib';
-import { RawSqliteWriter } from '../lib/raw-sqlite-writer.mjs';
+import { gunzipSync, gzipSync } from 'node:zlib';
+import { RawSqliteWriter, mergeLinesIntoBatch } from '../lib/raw-sqlite-writer.mjs';
 
 function envelope(market, stream, recvTs, payload) {
   return {
@@ -205,7 +205,7 @@ test('RawSqliteWriter exposes late-event statistics', async () => {
   ]);
   const summary = writer.lateEventSummary();
   assert.deepEqual(summary['stats_test.trades'],
-    { merged: 1, mergedRows: 1, minibatches: 1, overlaps: 0 });
+    { merged: 1, mergedRows: 1, minibatches: 1, overlaps: 0, duplicatesSkipped: 0 });
   await writer.close();
   await fs.rm(root, { recursive: true, force: true });
 });
@@ -295,5 +295,145 @@ test('RawSqliteWriter serializes concurrent append calls before watermark routin
   assert.deepEqual(merged.map((line) => line.event_ts_ms), [1000, 1500, 3000]);
   assert.equal(Number(rows[1].first_event_ts_ms), 4000);
   assert.equal(Number(rows[1].last_event_ts_ms), 4000);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+// ---- R-03: idempotent late merge -------------------------------------------
+// Regression: re-merging the SAME late row used to append a second copy of it
+// (row_count 2 -> 3, two identical lines inside one batch). The merge must be
+// identity-checked: a line already present in the batch is skipped and counted.
+
+test('mergeLinesIntoBatch skips lines already present in the batch (R-03)', () => {
+  const lineA = JSON.stringify({ event_ts_ms: 5000, ingest_seq: 7, source_id: 'T7' });
+  const lineB = JSON.stringify({ event_ts_ms: 6000, ingest_seq: 8, source_id: 'T8' });
+  const meta = {
+    raw_gzip: gzipSync(Buffer.from(`${lineA}\n`, 'utf8')),
+    first_recv_ts_ms: 100,
+    last_recv_ts_ms: 100,
+  };
+
+  const again = mergeLinesIntoBatch(meta, [{ raw_line: lineA, recv_ts_ms: 200 }]);
+  assert.equal(again.row_count, 1, 'a line already in the batch must not be inserted twice');
+  assert.equal(again.mergedRows, 0);
+  assert.equal(again.duplicatesSkipped, 1);
+  assert.equal(again.first_recv_ts_ms, 100, 'a rejected duplicate must not widen the recv window');
+  assert.equal(again.last_recv_ts_ms, 100);
+
+  // A genuinely new line still merges at its event-time position.
+  const merged = mergeLinesIntoBatch(meta, [{ raw_line: lineB, recv_ts_ms: 300 }]);
+  assert.equal(merged.row_count, 2);
+  assert.equal(merged.mergedRows, 1);
+  assert.equal(merged.duplicatesSkipped, 0);
+  assert.equal(merged.last_recv_ts_ms, 300);
+});
+
+test('RawSqliteWriter re-merging the same late row is idempotent (R-03)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-idem-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('late_idem', 'trades', 1000, 5000, { i: 'A' }),
+    lateEnvelope('late_idem', 'trades', 3000, 5100, { i: 'C' }),
+  ]);
+  const reDelivered = () => ({
+    ...lateEnvelope('late_idem', 'trades', 2500, 9000, { i: 'L1' }),
+    source_id: 'L1',
+  });
+  await writer.append([reDelivered()]);
+  await writer.append([reDelivered()]); // same event delivered a second time
+  await writer.close();
+
+  const rows = query(path.join(root, 'late_idem.sqlite'),
+    'SELECT batch_id, row_count, first_recv_ts_ms, last_recv_ts_ms, raw_gzip FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 1, 'the re-delivered row must merge into the covering batch');
+  assert.equal(Number(rows[0].row_count), 3, 're-delivery must not grow row_count');
+  const lines = gunzipSync(rows[0].raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(lines.map((line) => line.payload.i), ['A', 'L1', 'C']);
+  assert.equal(Number(rows[0].last_recv_ts_ms), 9000, 'the accepted merge still extends the recv window');
+  const summary = writer.lateEventSummary()['late_idem.trades'];
+  assert.deepEqual(summary,
+    { merged: 1, mergedRows: 1, minibatches: 0, overlaps: 0, duplicatesSkipped: 1 });
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter uses source_id to detect a re-delivered trade with a new ingest_seq (R-03)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-srcid-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('late_src', 'trades', 1000, 5000, { i: 'A' }),
+    lateEnvelope('late_src', 'trades', 3000, 5100, { i: 'C' }),
+  ]);
+  // The re-delivered trade keeps its exchange id (source_id) but the worker
+  // assigns a fresh ingest_seq, so a byte comparison alone would miss it.
+  const reDelivered = (ingestSeq) => ({
+    ...lateEnvelope('late_src', 'trades', 2500, 9000, { i: 'T1' }),
+    source_id: 'T1',
+    raw_line: JSON.stringify({
+      event_ts_ms: 2500, ingest_seq: ingestSeq, source_id: 'T1', payload: { i: 'T1' },
+    }),
+  });
+  await writer.append([reDelivered(41)]);
+  await writer.append([reDelivered(99)]);
+  await writer.close();
+
+  const row = query(path.join(root, 'late_src.sqlite'),
+    'SELECT row_count, raw_gzip FROM raw_batches ORDER BY batch_id')[0];
+  assert.equal(Number(row.row_count), 3);
+  const lines = gunzipSync(row.raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(lines.map((line) => line.ingest_seq), [undefined, 41, undefined],
+    'only the first delivery of the trade id may be kept');
+  assert.equal(writer.lateEventSummary()['late_src.trades'].duplicatesSkipped, 1);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('RawSqliteWriter de-duplicates a re-queued late row that forms a mini-batch (R-03)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-gap-idem-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([lateEnvelope('gap_idem', 'trades', 10_000, 10_050, { i: 'base' })]);
+  // Both copies fall before the only batch range and are re-queued together.
+  const gap = () => ({
+    ...lateEnvelope('gap_idem', 'trades', 5_000, 20_000, { i: 'G1' }),
+    source_id: 'G1',
+  });
+  await writer.append([gap(), gap()]);
+  await writer.close();
+
+  const rows = query(path.join(root, 'gap_idem.sqlite'),
+    'SELECT batch_id, row_count, raw_gzip FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 2, 'the gap event still gets its own mini-batch');
+  assert.equal(Number(rows[0].row_count), 1, 'the original batch must stay intact');
+  assert.equal(Number(rows[1].row_count), 1, 'the mini-batch must hold the event once');
+  const gapLines = gunzipSync(rows[1].raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(gapLines.map((line) => line.payload.i), ['G1']);
+  assert.equal(writer.lateEventSummary()['gap_idem.trades'].duplicatesSkipped, 1);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('late merge keys a source-less row by ts+seq+session so a restart cannot drop a real event (R-03)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-sqlite-late-session-'));
+  const writer = await new RawSqliteWriter({ databaseDir: root }).open();
+  await writer.append([
+    lateEnvelope('sess_idem', 'book_updates', 1000, 5000, { i: 'A' }),
+    lateEnvelope('sess_idem', 'book_updates', 3000, 5100, { i: 'C' }),
+  ]);
+  // book_updates carries no source_id, so the identity key is (ts, seq, session).
+  const reQueued = (session) => ({
+    ...lateEnvelope('sess_idem', 'book_updates', 2000, 9000, { i: 'D' }),
+    ingest_seq: 4321,
+    writer_session_id: session,
+  });
+  await writer.append([reQueued('w1')]);
+  await writer.append([reQueued('w1')]); // the very same envelope re-queued after a flush failure
+  await writer.append([reQueued('w2')]); // new process: same ts+seq is a different event
+  await writer.close();
+
+  const rows = query(path.join(root, 'sess_idem.sqlite'),
+    'SELECT row_count, raw_gzip FROM raw_batches ORDER BY batch_id');
+  assert.equal(rows.length, 1);
+  assert.equal(Number(rows[0].row_count), 4,
+    'a fresh writer session must never be mistaken for a re-delivery');
+  const lines = gunzipSync(rows[0].raw_gzip).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(lines.map((line) => line.writer_session_id),
+    ['test:sqlite', 'w1', 'w2', 'test:sqlite']);
+  assert.equal(writer.lateEventSummary()['sess_idem.book_updates'].duplicatesSkipped, 1);
   await fs.rm(root, { recursive: true, force: true });
 });
