@@ -32,6 +32,7 @@ import { RawSqliteWriter } from './lib/raw-sqlite-writer.mjs';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
 import { getOICapability, openInterestEventTimestamp } from './lib/oi-schema.mjs';
 import {
+  accumulatePostDrainCanonicalDrops,
   admitPendingEnvelopes,
   buildRawDbDropReport,
   drainPendingQueueWithBoundedRetry,
@@ -299,6 +300,20 @@ let rawDbRetentionTimer = null;
 const canonicalDbPending = [];
 let canonicalDbFlushPromise = Promise.resolve();
 const CANONICAL_DB_FLUSH_MAX_EVENTS = 16_384;
+/**
+ * O-02: canonical frames that arrived AFTER the shutdown drain had run.
+ *
+ * Until the drain there is still a recovery path — drainRawDbPendingOnShutdown()
+ * retries the canonical queue regardless of the latch — so a frame received
+ * after the latch belongs in the queue (and is then either written or counted by
+ * the R-13/R14 accounting). Once the drain is done no further attempt exists, so
+ * those frames are counted explicitly instead of vanishing the way the pre-fix
+ * guard let them.
+ * @type {{frames: number, first_ts_ms: number|null, last_ts_ms: number|null}}
+ */
+const canonicalPostDrainDrops = { frames: 0, first_ts_ms: null, last_ts_ms: null };
+/** Set once drainRawDbPendingOnShutdown() has run: no drain remains after it. */
+let rawDbDrainComplete = false;
 const derivativesHelper = rawDbWriter
   ? new DerivativesHelper(outputBase, {
     intervalMs: 30_000,
@@ -419,8 +434,28 @@ function flushCanonicalDbQueue() {
 }
 
 function enqueueCanonicalFrames(envelopes) {
-  if (!rawDbWriter || rawDbFailure) return;
+  if (!rawDbWriter) return;
   if (rawDbWriter.appendCanonical === undefined) return; // duckdb path: no canonical table
+  // O-02: the `rawDbFailure` latch must NOT short-circuit this path. Pre-fix the
+  // guard read `if (!rawDbWriter || rawDbFailure) return;`, so a frame that
+  // arrived after the latch was discarded BEFORE the queue admission and before
+  // any counter — invisible in health.jsonl and in the drop report, exactly like
+  // a genuine quiet interval. Admitting it instead keeps the frame recoverable:
+  // the R-13 shutdown drain retries the canonical queue regardless of the latch,
+  // so the frame is either written or counted by the existing R-13/R14 fields
+  // (cap rejections via recordPendingQueueOverflow, drain failures via
+  // `queues.canonical.dropped_events`). Only a frame that arrives after the drain
+  // has run has no recovery left and is counted here.
+  if (rawDbDrainComplete) {
+    const frames = (envelopes ?? []).length;
+    accumulatePostDrainCanonicalDrops(canonicalPostDrainDrops, frames);
+    healthMonitor.noteRawDbPostDrainDroppedEvents(canonicalPostDrainDrops.frames, canonicalPostDrainDrops);
+    console.error(
+      `[main] canonical raw frame(s) arrived after the shutdown drain: ${frames} DROPPED `
+      + `(total=${canonicalPostDrainDrops.frames}): no drain remains to write them`,
+    );
+    return;
+  }
   const result = admitPendingEnvelopes({
     pending: canonicalDbPending,
     envelopes,
@@ -546,6 +581,9 @@ async function closeRawDb() {
   // R-13: bounded retry + explicit counted drop for whatever the latched
   // failure blocked above. Must run before rawDbWriter.close().
   await drainRawDbPendingOnShutdown();
+  // O-02: the drain above is the last recovery attempt, so from this point a
+  // canonical frame that still arrives must be counted (no drain can reach it).
+  rawDbDrainComplete = true;
   await rawDbWriter.close();
 }
 

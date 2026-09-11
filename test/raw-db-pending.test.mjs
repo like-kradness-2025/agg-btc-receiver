@@ -18,6 +18,7 @@ import {
   RAW_DB_DROP_REPORT_SCHEMA,
   RAW_DB_PENDING_DEFAULT_MAX_EVENTS,
   RAW_DB_SHUTDOWN_RETRY_ATTEMPTS,
+  accumulatePostDrainCanonicalDrops,
   admitPendingEnvelopes,
   buildRawDbDropReport,
   drainPendingQueueWithBoundedRetry,
@@ -340,5 +341,49 @@ describe('R14: pending-queue cap accounting (dropped envelopes are counted)', ()
     assert.equal(buildRawDbDropReport({
       queues: {}, overflow: { ...overflow, dropped_events: 0 },
     }).pending_queue_overflow_events, undefined, 'a zero overflow adds no fields');
+  });
+});
+
+describe('O-02: canonical frames that arrive after the shutdown drain', () => {
+  // Regression target: enqueueCanonicalFrames() started with
+  // `if (!rawDbWriter || rawDbFailure) return;`, so a canonical frame delivered
+  // after the latch was discarded before admitPendingEnvelopes() and before any
+  // counter — the one loss population neither the R-13 drain accounting nor the
+  // R14 cap counter can see (no queue ever held the frame, no drain is left).
+
+  it('accumulates the frames and timestamps the first and the last arrival', () => {
+    const state = { frames: 0, first_ts_ms: null, last_ts_ms: null };
+    accumulatePostDrainCanonicalDrops(state, 2, 1_000);
+    accumulatePostDrainCanonicalDrops(state, 1, 2_500);
+    assert.deepEqual(state, { frames: 3, first_ts_ms: 1_000, last_ts_ms: 2_500 });
+  });
+
+  it('ignores an empty or invalid count so nothing is armed for no loss', () => {
+    const state = { frames: 0, first_ts_ms: null, last_ts_ms: null };
+    for (const bad of [0, -3, Number.NaN, undefined, null]) {
+      accumulatePostDrainCanonicalDrops(state, bad, 42);
+    }
+    assert.deepEqual(state, { frames: 0, first_ts_ms: null, last_ts_ms: null });
+  });
+
+  it('throws on a missing state instead of dropping the count silently', () => {
+    assert.throws(() => accumulatePostDrainCanonicalDrops(null, 1), /state must be an object/);
+  });
+
+  it('keeps the three loss populations in separate fields', () => {
+    // They are disjoint by construction: a drain loss was queued, a cap
+    // rejection was refused by the queue, a post-drain arrival was never queued
+    // and has no drain left. A consumer summing them must not double count.
+    const dropReport = buildRawDbDropReport({
+      queues: { canonical: { remaining: 4, flushed: 10, attempts: 3 } },
+      reason: 'ENOSPC',
+      overflow: { dropped_events: 5, cap_events: 64, mode: 'count', canonical: 5 },
+      nowMs: 1_000,
+    });
+    assert.equal(dropReport.dropped_events, 4, 'drain loss stays its own field');
+    assert.equal(dropReport.pending_queue_overflow_events, 5, 'cap loss stays its own field');
+    assert.equal(dropReport.post_drain_canonical_dropped_events, undefined,
+      'the post-drain count has no report field: the report is written at drain time, '
+      + 'and a frame counted here arrives after that write');
   });
 });

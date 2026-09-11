@@ -337,3 +337,63 @@ describe('R14: pending-queue overflow is durable in health.jsonl', () => {
     await fs.rm(`${file}.manifest.json`, { force: true });
   });
 });
+
+describe('O-02: post-drain canonical drops are durable in health.jsonl', () => {
+  // Regression: enqueueCanonicalFrames() returned on the `rawDbFailure` latch
+  // before any counter, so canonical frames that arrived after the shutdown
+  // drain had run were lost with no trace in health.jsonl or the drop report.
+  it('writes an extra final row carrying the counted post-drain frames', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+
+    monitor.noteRawDbPostDrainDroppedEvents(2, { first_ts_ms: 1789000000000, last_ts_ms: 1789000000500 });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 2, 'one periodic row + one final post-drain row');
+    assert.equal(rows[0].raw_db_post_drain_dropped_events, 2);
+    assert.deepEqual(rows[0].raw_db_post_drain_drop, {
+      dropped_events: 2, frames: 2, first_ts_ms: 1789000000000, last_ts_ms: 1789000000500,
+    });
+    assert.equal(rows[1].raw_db_post_drain_dropped_events, 2, 'the final row keeps the count');
+    assert.equal(validateHealthGenerations(file).ok, true, 'manifest stays valid after the extra row');
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('keeps the field at 0, adds no object and no row when nothing arrived late', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    monitor.noteRawDbPostDrainDroppedEvents(0, null);
+    monitor.noteRawDbPostDrainDroppedEvents(-3, null);
+    monitor.noteRawDbPostDrainDroppedEvents(Number.NaN, null);
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1, 'a clean shutdown keeps the previous row count');
+    assert.equal(rows[0].raw_db_post_drain_dropped_events, 0);
+    assert.ok(!('raw_db_post_drain_drop' in rows[0]));
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('keeps the three raw-DB loss fields independent on the same row', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    monitor.noteRawDbDroppedEvents(7, { reason: 'ENOSPC' });
+    monitor.noteRawDbPendingOverflow(5, { cap_events: 64, mode: 'count', raw: 5 });
+    monitor.noteRawDbPostDrainDroppedEvents(2, { first_ts_ms: 1, last_ts_ms: 2 });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.at(-1).raw_db_dropped_events, 7);
+    assert.equal(rows.at(-1).raw_db_pending_overflow_events, 5);
+    assert.equal(rows.at(-1).raw_db_post_drain_dropped_events, 2);
+    assert.equal(rows.at(-1).raw_db_post_drain_drop.frames, 2);
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+});
