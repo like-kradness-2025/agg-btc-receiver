@@ -16,6 +16,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   RAW_DB_DROP_REPORT_SCHEMA,
+  RAW_DB_LOSS_CANONICAL_SURFACE,
+  RAW_DB_LOSS_POPULATIONS,
   RAW_DB_PENDING_DEFAULT_MAX_EVENTS,
   RAW_DB_SHUTDOWN_RETRY_ATTEMPTS,
   accumulatePostDrainCanonicalDrops,
@@ -25,6 +27,7 @@ import {
   ingestSeqRange,
   resolveRawDbPendingMaxEvents,
   resolveRawDbPendingOverflowMode,
+  sumRawDbLoss,
   writeRawDbDropReport,
 } from '../lib/raw-db-pending.mjs';
 
@@ -385,5 +388,102 @@ describe('O-02: canonical frames that arrive after the shutdown drain', () => {
     assert.equal(dropReport.post_drain_canonical_dropped_events, undefined,
       'the post-drain count has no report field: the report is written at drain time, '
       + 'and a frame counted here arrives after that write');
+  });
+});
+
+describe('O-03: the loss surfaces are mirrors, each population counted once', () => {
+  // Regression target: the same counted loss is published on two surfaces under
+  // different names (final health.jsonl row + raw-db-drop-report.json). Cycle 13
+  // summed both and produced a NEGATIVE identity (gap=-425 on a 14-market leg):
+  // the drain and cap populations were counted twice. sumRawDbLoss() is the one
+  // supported total; RAW_DB_LOSS_POPULATIONS is the map it reads.
+
+  const overflow = {
+    dropped_events: 812, cap_events: 64, mode: 'count', raw: 700, canonical: 100,
+    open_interest: 12, first_ts_ms: 1789000000000,
+  };
+  /** The real shape: same numbers on both surfaces, as orderflow_monitor writes them. */
+  const surfaces = () => {
+    const dropReport = buildRawDbDropReport({
+      queues: { canonical: { remaining: 4, flushed: 10, attempts: 3 } },
+      reason: 'raw DB pending queue limit exceeded',
+      overflow,
+      nowMs: 1_000,
+    });
+    const healthRow = {
+      raw_db_dropped_events: dropReport.dropped_events,
+      raw_db_drop: { dropped_events: dropReport.dropped_events, reason: dropReport.reason },
+      raw_db_pending_overflow_events: dropReport.pending_queue_overflow_events,
+      raw_db_pending_overflow: { ...overflow },
+      raw_db_post_drain_dropped_events: 2,
+      raw_db_post_drain_drop: { dropped_events: 2, frames: 2, first_ts_ms: 500, last_ts_ms: 900 },
+    };
+    return { dropReport, healthRow };
+  };
+
+  it('counts each population exactly once from the health row', () => {
+    const { healthRow } = surfaces();
+    assert.deepEqual(sumRawDbLoss({ healthRow }), {
+      total: 818, drain: 4, capRejected: 812, postDrain: 2, from: 'health',
+    });
+  });
+
+  it('falls back to the drop report when the health row is gone', () => {
+    const { dropReport } = surfaces();
+    // The report cannot carry the post-drain population (it is written at drain
+    // time), so a report-only analysis totals 0 for it — documented, not silent.
+    assert.deepEqual(sumRawDbLoss({ dropReport }), {
+      total: 816, drain: 4, capRejected: 812, postDrain: 0, from: 'report',
+    });
+  });
+
+  it('never double counts the mirrored totals (the cycle-13 gap=-425 defect)', () => {
+    const { healthRow, dropReport } = surfaces();
+    const correct = sumRawDbLoss({ healthRow, dropReport });
+    const naive = healthRow.raw_db_dropped_events + healthRow.raw_db_pending_overflow_events
+      + healthRow.raw_db_post_drain_dropped_events
+      + dropReport.dropped_events + dropReport.pending_queue_overflow_events;
+
+    assert.equal(correct.total, 818);
+    assert.equal(naive, 1634, 'the naive sum over-counts by exactly the mirrored values');
+    assert.equal(naive - correct.total, healthRow.raw_db_dropped_events + healthRow.raw_db_pending_overflow_events);
+    assert.equal(correct.from, 'health', 'the row is canonical whenever it carries the field');
+  });
+
+  it('reports where each population came from, and mixes surfaces without double counting', () => {
+    const { dropReport } = surfaces();
+    assert.deepEqual(sumRawDbLoss({ dropReport, healthRow: { raw_db_post_drain_dropped_events: 3 } }), {
+      total: 819, drain: 4, capRejected: 812, postDrain: 3, from: 'mixed',
+    });
+    assert.deepEqual(sumRawDbLoss(), { total: 0, drain: 0, capRejected: 0, postDrain: 0, from: 'none' });
+    assert.deepEqual(sumRawDbLoss({ healthRow: { raw_db_dropped_events: 0 } }), {
+      total: 0, drain: 0, capRejected: 0, postDrain: 0, from: 'health',
+    }, 'an explicit 0 is data, not a missing field');
+  });
+
+  it('treats missing or non-numeric fields as 0 instead of NaN', () => {
+    const junk = {
+      raw_db_dropped_events: '840', raw_db_pending_overflow_events: Number.NaN,
+      raw_db_post_drain_dropped_events: null,
+    };
+    assert.deepEqual(sumRawDbLoss({ healthRow: junk, dropReport: { dropped_events: undefined } }), {
+      total: 0, drain: 0, capRejected: 0, postDrain: 0, from: 'none',
+    });
+    assert.equal(sumRawDbLoss({ healthRow: null, dropReport: 'not a report' }).total, 0);
+    assert.equal(sumRawDbLoss({ healthRow: { raw_db_dropped_events: 6 } }).total, 6);
+  });
+
+  it('registers every loss field the health row publishes', async () => {
+    // Structural guard: a fourth loss population added to the row without being
+    // registered here would silently escape sumRawDbLoss() — the O-03 class of
+    // bug again. The three fields are the only `raw_db_*_events` fields the
+    // health row builder writes.
+    const source = await fsp.readFile(new URL('../lib/health-monitor.mjs', import.meta.url), 'utf8');
+    const published = [...new Set(source.match(/raw_db_[a-z_]*_events/g) ?? [])].sort();
+    const registered = Object.values(RAW_DB_LOSS_POPULATIONS).map((p) => p.healthField).sort();
+    assert.deepEqual(published, registered);
+    assert.equal(RAW_DB_LOSS_CANONICAL_SURFACE, 'health');
+    assert.deepEqual(Object.values(RAW_DB_LOSS_POPULATIONS).filter((p) => p.reportField === null).map((p) => p.id),
+      ['postDrain'], 'only the post-drain population has no report field');
   });
 });

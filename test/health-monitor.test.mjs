@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { HealthMonitor } from '../lib/health-monitor.mjs';
+import { buildRawDbDropReport, sumRawDbLoss } from '../lib/raw-db-pending.mjs';
 import { validateHealthGenerations } from '../scripts/verify-health-generations.mjs';
 
 async function tempHealth() {
@@ -393,6 +394,52 @@ describe('O-02: post-drain canonical drops are durable in health.jsonl', () => {
     assert.equal(rows.at(-1).raw_db_pending_overflow_events, 5);
     assert.equal(rows.at(-1).raw_db_post_drain_dropped_events, 2);
     assert.equal(rows.at(-1).raw_db_post_drain_drop.frames, 2);
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+});
+
+describe('O-03: the two loss surfaces are mirrors (count each population once)', () => {
+  // Regression target: orderflow_monitor.mjs writes the same counted losses to
+  // both surfaces — the report's `dropped_events` / `pending_queue_overflow_events`
+  // and the row's `raw_db_dropped_events` / `raw_db_pending_overflow_events` — and
+  // the row additionally carries a population the report cannot express. Summing
+  // the two surfaces counts the mirrored populations twice (cycle 13: gap=-425).
+  it('publishes the drop report totals under the registered row names', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const overflow = {
+      dropped_events: 7, cap_events: 64, mode: 'count', raw: 4, canonical: 3,
+      open_interest: 0, first_ts_ms: 1789000000000,
+    };
+    const report = buildRawDbDropReport({
+      queues: { canonical: { remaining: 5, flushed: 2, attempts: 3 } },
+      reason: 'raw DB pending queue limit exceeded',
+      overflow,
+      nowMs: 1789000001000,
+    });
+    monitor.noteRawDbDroppedEvents(5, report);
+    monitor.noteRawDbPendingOverflow(overflow.dropped_events, overflow);
+    monitor.noteRawDbPostDrainDroppedEvents(2, { first_ts_ms: 1, last_ts_ms: 2 });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    const row = rows.at(-1);
+    // The alias invariant: same numbers, different names, on the two surfaces.
+    assert.equal(row.raw_db_dropped_events, report.dropped_events);
+    assert.equal(row.raw_db_pending_overflow_events, report.pending_queue_overflow_events);
+
+    const counted = sumRawDbLoss({ healthRow: row, dropReport: report });
+    assert.deepEqual(counted, { total: 14, drain: 5, capRejected: 7, postDrain: 2, from: 'health' });
+
+    // The defect this pins: adding the surfaces together double counts both
+    // mirrored populations (5 + 7 = 12 extra).
+    const naive = row.raw_db_dropped_events + row.raw_db_pending_overflow_events
+      + row.raw_db_post_drain_dropped_events + report.dropped_events + report.pending_queue_overflow_events;
+    assert.equal(naive, 26);
+    assert.equal(naive - counted.total, 12);
+
     await fs.rm(file, { force: true });
     await fs.rm(`${file}.manifest.json`, { force: true });
   });
