@@ -32,9 +32,12 @@ import { RawSqliteWriter } from './lib/raw-sqlite-writer.mjs';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
 import { getOICapability, openInterestEventTimestamp } from './lib/oi-schema.mjs';
 import {
+  admitPendingEnvelopes,
   buildRawDbDropReport,
   drainPendingQueueWithBoundedRetry,
   ingestSeqRange,
+  resolveRawDbPendingMaxEvents,
+  resolveRawDbPendingOverflowMode,
   writeRawDbDropReport,
 } from './lib/raw-db-pending.mjs';
 
@@ -269,7 +272,21 @@ let shutdownHandler = null;
 let pendingRuntimeFailure = null;
 const MODULE_RESTART_REQUEST = path.join(process.env.XDG_RUNTIME_DIR || `/run/user/${os.userInfo().uid}`, 'agg-btc-receiver-module-restart.json');
 const rawDbPending = [];
-const RAW_DB_PENDING_MAX_EVENTS = 65536;
+const RAW_DB_PENDING_MAX_EVENTS = resolveRawDbPendingMaxEvents();
+/**
+ * R14: how envelopes rejected at the pending-queue cap are accounted for.
+ * `count` (default) counts every rejected envelope; `legacy` reproduces the
+ * pre-fix silent drop and exists only for A/B measurement and rollback.
+ */
+const RAW_DB_PENDING_OVERFLOW_MODE = resolveRawDbPendingOverflowMode();
+/**
+ * R14: envelopes rejected at the cap. Pre-fix these were dropped with no counter
+ * anywhere — reportRawDbFailure latched on the first one and every later
+ * rejection short-circuited on that latch — so an overflow looked exactly like a
+ * genuine no-trade interval downstream. Counted per queue, surfaced at shutdown
+ * in health.jsonl + the drop report.
+ */
+const rawDbPendingOverflow = { raw: 0, canonical: 0, open_interest: 0, first_ts_ms: null };
 let rawIngestSeq = 0;
 const RAW_DB_FLUSH_INTERVAL_MS = 10_000;
 const RAW_DB_FLUSH_MAX_EVENTS = 16_384;
@@ -286,18 +303,23 @@ const derivativesHelper = rawDbWriter
   ? new DerivativesHelper(outputBase, {
     intervalMs: 30_000,
     onRow: (row) => {
-      if (rawDbPending.length >= RAW_DB_PENDING_MAX_EVENTS) return reportRawDbFailure(new Error('raw DB pending queue limit exceeded'));
-      rawDbPending.push({
-        schema: rawEnvelopeSchema,
-        market: row.market,
-        stream: 'open_interest',
-        event_ts_ms: openInterestEventTimestamp(row),
-        recv_ts_ms: row.ts,
-        writer_session_id: `main:${process.pid}:oi`,
-        ingest_seq: ++rawIngestSeq,
-        source_id: row.source ?? row.source_id ?? null,
-        payload: row,
+      const result = admitPendingEnvelopes({
+        pending: rawDbPending,
+        envelopes: [{
+          schema: rawEnvelopeSchema,
+          market: row.market,
+          stream: 'open_interest',
+          event_ts_ms: openInterestEventTimestamp(row),
+          recv_ts_ms: row.ts,
+          writer_session_id: `main:${process.pid}:oi`,
+          source_id: row.source ?? row.source_id ?? null,
+          payload: row,
+        }],
+        maxEvents: RAW_DB_PENDING_MAX_EVENTS,
+        mode: RAW_DB_PENDING_OVERFLOW_MODE,
+        prepare: (envelope) => { envelope.ingest_seq = ++rawIngestSeq; },
       });
+      recordPendingQueueOverflow('open_interest', result);
       if (rawDbPending.length >= RAW_DB_FLUSH_MAX_EVENTS) void flushRawDbQueue();
     },
   })
@@ -314,6 +336,48 @@ function reportRawDbFailure(error) {
   startupFailed = true;
   pendingRuntimeFailure = reason;
   if (shutdownHandler) void shutdownHandler(1, reason);
+}
+
+/**
+ * R14: account for a pending-queue admission result and keep the fail-closed
+ * latch the pre-fix code had. Every rejected envelope is counted (the label says
+ * which queue), the first overflow of the process timestamps itself, and the
+ * failure is reported once — later rejections only add to the count.
+ *
+ * @param {'raw'|'canonical'|'open_interest'} queue
+ * @param {{admitted: number, rejected: number, overflowed: boolean}} result
+ */
+function recordPendingQueueOverflow(queue, result) {
+  if (!result?.overflowed) return;
+  if (result.rejected > 0) {
+    rawDbPendingOverflow[queue] += result.rejected;
+    if (rawDbPendingOverflow.first_ts_ms === null) rawDbPendingOverflow.first_ts_ms = Date.now();
+  }
+  const label = queue === 'canonical' ? 'canonical raw' : queue === 'open_interest' ? 'open-interest raw' : 'raw DB';
+  // Keep the pre-fix message prefix so existing log parsers still match, and
+  // append the counted loss (0 in legacy mode, where nothing is counted).
+  const counted = result.rejected > 0
+    ? `: ${result.rejected} envelope(s) counted as dropped at the ${RAW_DB_PENDING_MAX_EVENTS}-event cap`
+    : ` (cap=${RAW_DB_PENDING_MAX_EVENTS}, mode=${result.mode})`;
+  reportRawDbFailure(new Error(`${label} pending queue limit exceeded${counted}`));
+}
+
+/**
+ * R14: totals for the queues whose envelopes were rejected at the cap, or null
+ * when nothing overflowed. `dropped_events` is the exact counted loss.
+ */
+function pendingQueueOverflowSummary() {
+  const total = rawDbPendingOverflow.raw + rawDbPendingOverflow.canonical + rawDbPendingOverflow.open_interest;
+  if (total <= 0) return null;
+  return {
+    dropped_events: total,
+    cap_events: RAW_DB_PENDING_MAX_EVENTS,
+    mode: RAW_DB_PENDING_OVERFLOW_MODE,
+    raw: rawDbPendingOverflow.raw,
+    canonical: rawDbPendingOverflow.canonical,
+    open_interest: rawDbPendingOverflow.open_interest,
+    first_ts_ms: rawDbPendingOverflow.first_ts_ms,
+  };
 }
 
 function flushRawDbQueue() {
@@ -357,26 +421,26 @@ function flushCanonicalDbQueue() {
 function enqueueCanonicalFrames(envelopes) {
   if (!rawDbWriter || rawDbFailure) return;
   if (rawDbWriter.appendCanonical === undefined) return; // duckdb path: no canonical table
-  for (const envelope of envelopes ?? []) {
-    if (canonicalDbPending.length >= RAW_DB_PENDING_MAX_EVENTS) {
-      reportRawDbFailure(new Error('canonical raw pending queue limit exceeded'));
-      return;
-    }
-    canonicalDbPending.push(envelope);
-  }
+  const result = admitPendingEnvelopes({
+    pending: canonicalDbPending,
+    envelopes,
+    maxEvents: RAW_DB_PENDING_MAX_EVENTS,
+    mode: RAW_DB_PENDING_OVERFLOW_MODE,
+  });
+  recordPendingQueueOverflow('canonical', result);
   if (canonicalDbPending.length >= CANONICAL_DB_FLUSH_MAX_EVENTS) void flushCanonicalDbQueue();
 }
 
 function enqueueRawEnvelopes(envelopes) {
   if (!rawDbWriter) return;
-  for (const envelope of envelopes ?? []) {
-    if (rawDbPending.length >= RAW_DB_PENDING_MAX_EVENTS) {
-      reportRawDbFailure(new Error('raw DB pending queue limit exceeded'));
-      return;
-    }
-    envelope.ingest_seq = ++rawIngestSeq;
-    rawDbPending.push(envelope);
-  }
+  const result = admitPendingEnvelopes({
+    pending: rawDbPending,
+    envelopes,
+    maxEvents: RAW_DB_PENDING_MAX_EVENTS,
+    mode: RAW_DB_PENDING_OVERFLOW_MODE,
+    prepare: (envelope) => { envelope.ingest_seq = ++rawIngestSeq; },
+  });
+  recordPendingQueueOverflow('raw', result);
   if (rawDbPending.length >= RAW_DB_FLUSH_MAX_EVENTS) void flushRawDbQueue();
 }
 
@@ -393,6 +457,10 @@ function enqueueRawEnvelopes(envelopes) {
  * original failure may have been transient) and, when events still cannot be
  * written, counts them explicitly in a durable drop report plus the final
  * health row.
+ *
+ * R14: the same report/row also carry the envelopes the pending queues rejected
+ * at their cap during the run (see recordPendingQueueOverflow), because those
+ * never reached a queue and would otherwise be lost without a trace.
  *
  * @returns {Promise<Object|null>} the drop report, or null when nothing was lost
  */
@@ -422,7 +490,8 @@ async function drainRawDbPendingOnShutdown() {
   }
 
   const remaining = rawResult.remaining + canonicalResult.remaining;
-  if (remaining === 0) return null;
+  const overflow = pendingQueueOverflowSummary();
+  if (remaining === 0 && !overflow) return null;
 
   const report = buildRawDbDropReport({
     queues: {
@@ -434,15 +503,29 @@ async function drainRawDbPendingOnShutdown() {
       canonical: canonicalResult,
     },
     reason: rawDbFailure ? rawDbFailure.message : null,
+    overflow,
   });
 
-  // Explicit counted drop: durable report file + final health row + stderr.
-  healthMonitor.noteRawDbDroppedEvents(remaining, report);
-  console.error(
-    `[main] raw DB shutdown drain failed after bounded retries: ${remaining} event(s) ` +
-    `DROPPED (raw=${rawResult.remaining}, canonical=${canonicalResult.remaining}); ` +
-    `reason=${report.reason ?? 'unknown'}; report=${RAW_DB_DROP_REPORT_PATH}`,
-  );
+  // Explicit counted drops, each durable in the same report file:
+  //   - R-13 `remaining`: queued events the bounded drain could not write;
+  //   - R14 `overflow`:  envelopes the pending queue rejected at the cap.
+  if (remaining > 0) {
+    healthMonitor.noteRawDbDroppedEvents(remaining, report);
+    console.error(
+      `[main] raw DB shutdown drain failed after bounded retries: ${remaining} event(s) ` +
+      `DROPPED (raw=${rawResult.remaining}, canonical=${canonicalResult.remaining}); ` +
+      `reason=${report.reason ?? 'unknown'}; report=${RAW_DB_DROP_REPORT_PATH}`,
+    );
+  }
+  if (overflow) {
+    healthMonitor.noteRawDbPendingOverflow(overflow.dropped_events, overflow);
+    console.error(
+      `[main] raw DB pending queue overflow: ${overflow.dropped_events} envelope(s) ` +
+      `DROPPED at the ${overflow.cap_events}-event cap ` +
+      `(raw=${overflow.raw}, canonical=${overflow.canonical}, open_interest=${overflow.open_interest}); ` +
+      `report=${RAW_DB_DROP_REPORT_PATH}`,
+    );
+  }
   try {
     await writeRawDbDropReport(RAW_DB_DROP_REPORT_PATH, report);
   } catch (error) {

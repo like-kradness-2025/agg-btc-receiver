@@ -16,10 +16,14 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   RAW_DB_DROP_REPORT_SCHEMA,
+  RAW_DB_PENDING_DEFAULT_MAX_EVENTS,
   RAW_DB_SHUTDOWN_RETRY_ATTEMPTS,
+  admitPendingEnvelopes,
   buildRawDbDropReport,
   drainPendingQueueWithBoundedRetry,
   ingestSeqRange,
+  resolveRawDbPendingMaxEvents,
+  resolveRawDbPendingOverflowMode,
   writeRawDbDropReport,
 } from '../lib/raw-db-pending.mjs';
 
@@ -172,5 +176,169 @@ describe('R-13 raw-DB shutdown drain', () => {
     await writeRawDbDropReport(target, second);
     assert.equal(JSON.parse(await fsp.readFile(target, 'utf8')).dropped_events, 9);
     await fsp.rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe('R14: pending-queue cap accounting (dropped envelopes are counted)', () => {
+  // Regression target: the pre-fix loop hit the cap, called
+  // reportRawDbFailure() and `return`ed — the rest of the batch and every later
+  // envelope were dropped with no counter anywhere (every later rejection
+  // short-circuited on the latched failure), so a queue overflow was
+  // indistinguishable from "the exchange sent nothing".
+
+  it('counts every envelope the cap rejects (count mode)', () => {
+    const pending = [];
+    const envelopes = Array.from({ length: 5 }, (_, i) => ({ id: i + 1 }));
+
+    // cap = 3, already 1 queued → 2 admitted, 3 counted as dropped.
+    pending.push({ id: 0 });
+    const result = admitPendingEnvelopes({ pending, envelopes, maxEvents: 3 });
+
+    assert.deepEqual(result, { admitted: 2, rejected: 3, overflowed: true, mode: 'count' });
+    assert.deepEqual(pending.map((e) => e.id), [0, 1, 2], 'queue keeps order and stops at the cap');
+  });
+
+  it('is exact for a single batch: admitted + rejected = offered', () => {
+    for (const [queued, offered, cap] of [[0, 10, 4], [3, 1, 4], [4, 7, 4], [0, 1, 1]]) {
+      const pending = Array.from({ length: queued }, (_, i) => ({ i }));
+      const result = admitPendingEnvelopes({
+        pending, envelopes: Array.from({ length: offered }, (_, i) => ({ i })), maxEvents: cap,
+      });
+      assert.equal(result.admitted + result.rejected, offered, `queued=${queued} offered=${offered} cap=${cap}`);
+      assert.equal(pending.length, Math.min(cap, queued + offered));
+    }
+  });
+
+  it('never hands a rejected envelope an ingest_seq (prepare runs on admit only)', () => {
+    const pending = [];
+    let seq = 0;
+    const result = admitPendingEnvelopes({
+      pending,
+      envelopes: Array.from({ length: 5 }, (_, i) => ({ id: i })),
+      maxEvents: 2,
+      prepare: (envelope) => { envelope.ingest_seq = ++seq; },
+    });
+
+    assert.equal(result.rejected, 3);
+    assert.equal(seq, 2, 'no sequence number is consumed by a dropped envelope');
+    assert.deepEqual(pending.map((e) => e.ingest_seq), [1, 2]);
+  });
+
+  it('reproduces the pre-fix silent drop in legacy mode', () => {
+    const pending = [{ id: 0 }, { id: 1 }];
+    const rest = Array.from({ length: 4 }, (_, i) => ({ id: i + 2 }));
+
+    const result = admitPendingEnvelopes({ pending, envelopes: rest, maxEvents: 2, mode: 'legacy' });
+
+    assert.deepEqual(result, { admitted: 0, rejected: 0, overflowed: true, mode: 'legacy' });
+    assert.deepEqual(pending.map((e) => e.id), [0, 1], 'the rest of the batch is abandoned, nothing is counted');
+  });
+
+  it('reports no overflow when the cap is not reached', () => {
+    const pending = [];
+    const result = admitPendingEnvelopes({ pending, envelopes: [{ id: 1 }], maxEvents: 4 });
+    assert.deepEqual(result, { admitted: 1, rejected: 0, overflowed: false, mode: 'count' });
+  });
+
+  it('admits exactly the same envelopes as the pre-fix loop (equivalence)', () => {
+    // Literal transcription of the pre-fix admission loop: on the first
+    // rejection it calls reportRawDbFailure() and `return`s, abandoning the rest
+    // of the batch and counting nothing. The counted replacement must produce a
+    // byte-identical queue for the same input — the change is accounting only.
+    const preFixAdmit = (pending, envelopes, maxEvents) => {
+      for (const envelope of envelopes ?? []) {
+        if (pending.length >= maxEvents) return true; // reportRawDbFailure(...); return;
+        pending.push(envelope);
+      }
+      return false;
+    };
+
+    let seed = 987654321;
+    const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    for (let i = 0; i < 300; i += 1) {
+      const maxEvents = 1 + rnd(6);
+      const queued = rnd(maxEvents + 3);
+      const offered = rnd(12);
+      const base = Array.from({ length: queued }, (_, k) => ({ k }));
+      const envelopes = Array.from({ length: offered }, (_, k) => ({ k }));
+      const preFix = base.map((e) => ({ ...e }));
+      const counted = base.map((e) => ({ ...e }));
+
+      const preFixOverflowed = preFixAdmit(preFix, envelopes, maxEvents);
+      const result = admitPendingEnvelopes({ pending: counted, envelopes, maxEvents });
+
+      assert.deepEqual(counted, preFix, `queue differs (cap=${maxEvents} queued=${queued} offered=${offered})`);
+      assert.equal(result.overflowed, preFixOverflowed, 'the latch trigger is unchanged');
+      assert.equal(result.admitted + result.rejected, offered, 'every offered envelope is admitted or counted');
+    }
+  });
+
+  it('rejects invalid arguments instead of guessing', () => {
+    assert.throws(() => admitPendingEnvelopes({ pending: null, envelopes: [], maxEvents: 4 }), TypeError);
+    assert.throws(() => admitPendingEnvelopes({ pending: [], envelopes: [], maxEvents: 0 }), TypeError);
+    assert.throws(() => admitPendingEnvelopes({ pending: [], envelopes: [], maxEvents: 4, mode: 'nope' }), TypeError);
+    assert.deepEqual(
+      admitPendingEnvelopes({ pending: [], envelopes: undefined, maxEvents: 4 }),
+      { admitted: 0, rejected: 0, overflowed: false, mode: 'count' },
+    );
+  });
+
+  it('resolves the cap from the environment with the production default', () => {
+    assert.equal(resolveRawDbPendingMaxEvents({}), RAW_DB_PENDING_DEFAULT_MAX_EVENTS);
+    assert.equal(resolveRawDbPendingMaxEvents({ RECEIVER_RAW_DB_PENDING_MAX_EVENTS: '16' }), 16);
+    // Invalid values are reported and ignored, never coerced to 0 (a 0 cap would
+    // drop every envelope on the first admission).
+    for (const bad of ['0', '-4', '1.5', 'abc']) {
+      assert.equal(
+        resolveRawDbPendingMaxEvents({ RECEIVER_RAW_DB_PENDING_MAX_EVENTS: bad }),
+        RAW_DB_PENDING_DEFAULT_MAX_EVENTS,
+        bad,
+      );
+    }
+  });
+
+  it('resolves the accounting mode from the environment', () => {
+    assert.equal(resolveRawDbPendingOverflowMode({}), 'count');
+    assert.equal(resolveRawDbPendingOverflowMode({ RECEIVER_RAW_DB_PENDING_OVERFLOW_MODE: 'legacy' }), 'legacy');
+    assert.equal(resolveRawDbPendingOverflowMode({ RECEIVER_RAW_DB_PENDING_OVERFLOW_MODE: 'count' }), 'count');
+    assert.equal(resolveRawDbPendingOverflowMode({ RECEIVER_RAW_DB_PENDING_OVERFLOW_MODE: 'silent' }), 'count');
+  });
+
+  it('adds the overflow counts to the drop report without changing the no-overflow shape', () => {
+    const overflow = {
+      dropped_events: 812,
+      cap_events: 64,
+      mode: 'count',
+      raw: 700,
+      canonical: 100,
+      open_interest: 12,
+      first_ts_ms: 1789000000000,
+    };
+    const report = buildRawDbDropReport({
+      queues: { raw: { remaining: 0, flushed: 64, attempts: 1 } },
+      reason: 'raw DB pending queue limit exceeded',
+      nowMs: 1789000001000,
+      overflow,
+    });
+
+    assert.equal(report.dropped_events, 0, 'a drained queue is not a drain loss');
+    assert.equal(report.pending_queue_overflow_events, 812);
+    assert.deepEqual(report.pending_queue_overflow, {
+      cap_events: 64,
+      mode: 'count',
+      raw: 700,
+      canonical: 100,
+      open_interest: 12,
+      first_ts_ms: 1789000000000,
+    });
+
+    // Nothing overflowed → byte-identical v1 document (no new keys).
+    const clean = buildRawDbDropReport({
+      queues: { raw: { remaining: 2, flushed: 0, attempts: 3 } }, reason: 'ENOSPC', nowMs: 1,
+    });
+    assert.deepEqual(Object.keys(clean), ['schema', 'ts_ms', 'dropped_events', 'reason', 'queues']);
+    assert.equal(buildRawDbDropReport({
+      queues: {}, overflow: { ...overflow, dropped_events: 0 },
+    }).pending_queue_overflow_events, undefined, 'a zero overflow adds no fields');
   });
 });

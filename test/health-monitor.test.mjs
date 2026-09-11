@@ -261,3 +261,79 @@ describe('R-13: counted raw-DB drop is durable in health.jsonl', () => {
     await fs.rm(`${file}.manifest.json`, { force: true });
   });
 });
+
+describe('R14: pending-queue overflow is durable in health.jsonl', () => {
+  // Regression: envelopes rejected at the pending-queue cap were dropped with no
+  // counter at all, so the loss looked like a genuine no-trade interval.
+  it('writes an extra final row carrying the counted overflow', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+
+    monitor.noteRawDbPendingOverflow(812, {
+      cap_events: 64, mode: 'count', raw: 700, canonical: 100, open_interest: 12,
+      first_ts_ms: 1789000000000,
+    });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 2, 'one periodic row + one final overflow row');
+    assert.equal(rows[0].raw_db_pending_overflow_events, 812);
+    assert.deepEqual(rows[0].raw_db_pending_overflow, {
+      dropped_events: 812, cap_events: 64, mode: 'count', raw: 700, canonical: 100,
+      open_interest: 12, first_ts_ms: 1789000000000,
+    });
+    assert.equal(rows[1].raw_db_pending_overflow_events, 812, 'the final row keeps the count');
+    assert.equal(validateHealthGenerations(file).ok, true, 'manifest stays valid after the extra row');
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('keeps the field at 0 and adds no object on a normal row', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1, 'an overflow-free shutdown keeps the previous row count');
+    assert.equal(rows[0].raw_db_pending_overflow_events, 0);
+    assert.ok(!('raw_db_pending_overflow' in rows[0]));
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('treats a drain loss and an overflow as separate, coexisting counts', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+
+    monitor.noteRawDbDroppedEvents(40, { reason: 'unable to open database file' });
+    monitor.noteRawDbPendingOverflow(7, { cap_events: 65536, mode: 'count', raw: 7 });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 2, 'one final row covers both losses');
+    assert.equal(rows[1].raw_db_dropped_events, 40);
+    assert.equal(rows[1].raw_db_pending_overflow_events, 7);
+    assert.equal(rows[1].raw_db_pending_overflow.canonical, 0);
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('ignores non-positive or non-finite overflow counts', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    monitor.noteRawDbPendingOverflow(0, null);
+    monitor.noteRawDbPendingOverflow(-3, null);
+    monitor.noteRawDbPendingOverflow(Number.NaN, null);
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].raw_db_pending_overflow_events, 0);
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+});
