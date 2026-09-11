@@ -195,3 +195,69 @@ describe('HealthMonitor setCompleteness merge + fail-visible state promotion', (
     await fs.rm(file, { force: true });
   });
 });
+
+describe('R-13: counted raw-DB drop is durable in health.jsonl', () => {
+  // Regression: a shutdown drain that could not write queued raw events left
+  // NO marker at all — the lost events were indistinguishable from a genuine
+  // no-trade interval. The count must reach health.jsonl (and the drop report
+  // file written by the caller).
+  it('writes an extra final row carrying the drop when events were dropped', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const report = {
+      schema: 'receiver-raw-db-drop-report/v1',
+      ts_ms: 1789000000000,
+      dropped_events: 1234,
+      reason: 'unable to open database file',
+      queues: { raw: { dropped_events: 1234, flushed_events: 0, attempts: 3 } },
+    };
+
+    monitor.noteRawDbDroppedEvents(1234, report);
+    monitor._tick();               // last periodic row
+    await monitor.close();         // must append the drop-report row
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 2, 'one periodic row + one final drop-report row');
+    assert.equal(rows[0].raw_db_dropped_events, 1234);
+    assert.deepEqual(rows[0].raw_db_drop, {
+      dropped_events: 1234,
+      reason: 'unable to open database file',
+      schema: 'receiver-raw-db-drop-report/v1',
+      ts_ms: 1789000000000,
+    });
+    assert.equal(rows[1].raw_db_dropped_events, 1234, 'the final row keeps the counted drop');
+    assert.equal(validateHealthGenerations(file).ok, true, 'manifest stays valid after the extra row');
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('adds no extra row and reports 0 drops on a clean shutdown', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1, 'clean shutdown keeps the previous row count');
+    assert.equal(rows[0].raw_db_dropped_events, 0);
+    assert.ok(!('raw_db_drop' in rows[0]), 'no drop object on a normal row');
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+
+  it('ignores non-positive or non-finite drop counts', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    monitor.noteRawDbDroppedEvents(0, null);
+    monitor.noteRawDbDroppedEvents(-5, null);
+    monitor.noteRawDbDroppedEvents(Number.NaN, null);
+    monitor._tick();
+    await monitor.close();
+
+    const rows = (await fs.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].raw_db_dropped_events, 0);
+    await fs.rm(file, { force: true });
+    await fs.rm(`${file}.manifest.json`, { force: true });
+  });
+});

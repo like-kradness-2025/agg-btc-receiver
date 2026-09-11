@@ -1254,3 +1254,38 @@ describe('Market alias connectors', () => {
     assert.strictEqual(btcusdc.getState(), 'reconnecting');
   });
 });
+
+describe('R-11: COIN-M invalid price/contracts is counted, never silently dropped', () => {
+  // The BinanceCoinmPerpConnector _handleTrade override had the same
+  // `if (!price || !contracts) return;` early exit, so its invalid trades were
+  // invisible in droppedTradeCount as well (same class as the spot/perp fix).
+  it('counts each invalid COIN-M trade and emits nothing', () => {
+    const coinm = new BinanceCoinmPerpConnector({});
+    coinm._ws = null;
+    coinm._setState('running');
+
+    const emitted = [];
+    coinm.on('trade', (ev) => emitted.push(ev));
+    coinm._handleTrade({ p: '0', q: '10', m: false, T: 1700000000000, t: 1 });
+    coinm._handleTrade({ p: '65000', q: '0', m: false, T: 1700000000001, t: 2 });
+    coinm._handleTrade({ p: 'bad', q: '10', m: false, T: 1700000000002, t: 3 });
+
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(coinm._stats.droppedTradeCount, 3,
+      'a rejected COIN-M trade must be counted in droppedTradeCount');
+  });
+
+  it('still emits valid COIN-M trades with the contract→BTC normalization (control)', () => {
+    const coinm = new BinanceCoinmPerpConnector({});
+    coinm._ws = null;
+    coinm._setState('running');
+
+    const emitted = [];
+    coinm.on('trade', (ev) => emitted.push(ev));
+    coinm._handleTrade({ p: '65000', q: '20', m: false, T: 1700000000000, t: 123 });
+
+    assert.strictEqual(emitted.length, 1);
+    assert.strictEqual(emitted[0].qty, 20 * 100 / 65000);
+    assert.strictEqual(coinm._stats.droppedTradeCount, 0);
+  });
+});

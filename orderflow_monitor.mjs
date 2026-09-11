@@ -31,6 +31,12 @@ import { RawDbWriter, DEFAULT_RAW_RETENTION_DAYS } from './lib/raw-db-writer.mjs
 import { RawSqliteWriter } from './lib/raw-sqlite-writer.mjs';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
 import { getOICapability, openInterestEventTimestamp } from './lib/oi-schema.mjs';
+import {
+  buildRawDbDropReport,
+  drainPendingQueueWithBoundedRetry,
+  ingestSeqRange,
+  writeRawDbDropReport,
+} from './lib/raw-db-pending.mjs';
 
 // ====== Market grouping ======
 
@@ -130,6 +136,8 @@ const outputDefault = rawStorage === 'duckdb'
   : rawStorage === 'sqlite' ? 'data/live_sqlite'
   : rawLayoutArg === 'v4' ? 'data/live_v4' : config.output.base_path;
 const outputBase = arg('output', outputDefault);
+/** R-13: durable report for raw-DB events the shutdown drain could not write. */
+const RAW_DB_DROP_REPORT_PATH = path.join(outputBase, 'raw-db-drop-report.json');
 const effectiveOutput = {
   ...config.output,
   ...(rawLayoutArg ? { raw_layout: rawLayoutArg } : {}),
@@ -372,6 +380,77 @@ function enqueueRawEnvelopes(envelopes) {
   if (rawDbPending.length >= RAW_DB_FLUSH_MAX_EVENTS) void flushRawDbQueue();
 }
 
+/**
+ * R-13: shutdown drain of the raw-DB pending queues.
+ *
+ * flushRawDbQueue()/flushCanonicalDbQueue() both short-circuit once
+ * `rawDbFailure` is latched, so closeRawDb() previously reached
+ * rawDbWriter.close() with up to RAW_DB_PENDING_MAX_EVENTS (65,536) events per
+ * queue still pending — dropped at process exit with no marker, which is
+ * indistinguishable downstream from a genuine no-trade interval.
+ *
+ * This runs a bounded retry (the latch does not block a shutdown retry: the
+ * original failure may have been transient) and, when events still cannot be
+ * written, counts them explicitly in a durable drop report plus the final
+ * health row.
+ *
+ * @returns {Promise<Object|null>} the drop report, or null when nothing was lost
+ */
+async function drainRawDbPendingOnShutdown() {
+  if (!rawDbWriter) return null;
+
+  const rawRange = ingestSeqRange(rawDbPending);
+  const rawResult = await drainPendingQueueWithBoundedRetry({
+    pending: rawDbPending,
+    append: (batch) => rawDbWriter.append(batch),
+    maxBatch: RAW_DB_FLUSH_MAX_EVENTS,
+    onAttemptError: (error, attempt) => console.error(
+      `[main] raw DB shutdown drain attempt ${attempt} failed: ${error.message} (${rawDbPending.length} event(s) still pending)`,
+    ),
+  });
+
+  let canonicalResult = { flushed: 0, remaining: 0, attempts: 0 };
+  if (canonicalDbPending.length > 0 && rawDbWriter.appendCanonical !== undefined) {
+    canonicalResult = await drainPendingQueueWithBoundedRetry({
+      pending: canonicalDbPending,
+      append: (batch) => rawDbWriter.appendCanonical(batch),
+      maxBatch: CANONICAL_DB_FLUSH_MAX_EVENTS,
+      onAttemptError: (error, attempt) => console.error(
+        `[main] canonical raw shutdown drain attempt ${attempt} failed: ${error.message} (${canonicalDbPending.length} event(s) still pending)`,
+      ),
+    });
+  }
+
+  const remaining = rawResult.remaining + canonicalResult.remaining;
+  if (remaining === 0) return null;
+
+  const report = buildRawDbDropReport({
+    queues: {
+      raw: {
+        ...rawResult,
+        firstIngestSeq: rawRange.first,
+        lastIngestSeq: rawRange.last,
+      },
+      canonical: canonicalResult,
+    },
+    reason: rawDbFailure ? rawDbFailure.message : null,
+  });
+
+  // Explicit counted drop: durable report file + final health row + stderr.
+  healthMonitor.noteRawDbDroppedEvents(remaining, report);
+  console.error(
+    `[main] raw DB shutdown drain failed after bounded retries: ${remaining} event(s) ` +
+    `DROPPED (raw=${rawResult.remaining}, canonical=${canonicalResult.remaining}); ` +
+    `reason=${report.reason ?? 'unknown'}; report=${RAW_DB_DROP_REPORT_PATH}`,
+  );
+  try {
+    await writeRawDbDropReport(RAW_DB_DROP_REPORT_PATH, report);
+  } catch (error) {
+    console.error(`[main] raw DB drop report write failed: ${error.message}`);
+  }
+  return report;
+}
+
 async function closeRawDb() {
   if (!rawDbWriter) return;
   if (derivativesHelper) await derivativesHelper.close();
@@ -381,6 +460,9 @@ async function closeRawDb() {
   rawDbRetentionTimer = null;
   await flushRawDbQueue();
   await flushCanonicalDbQueue();
+  // R-13: bounded retry + explicit counted drop for whatever the latched
+  // failure blocked above. Must run before rawDbWriter.close().
+  await drainRawDbPendingOnShutdown();
   await rawDbWriter.close();
 }
 
@@ -773,9 +855,16 @@ async function main() {
     }
     await Promise.allSettled(workerExitPromises);
 
-    // Flush main-thread components
+    // Flush main-thread components. closeRawDb() is awaited FIRST: its R-13
+    // shutdown drain can note a counted raw-DB drop that HealthMonitor.close()
+    // then persists in its final health.jsonl row (parallel closes would race
+    // that final write). Each step keeps its own failure isolated.
+    try {
+      await closeRawDb();
+    } catch (error) {
+      console.error(`[main] raw DB close failed: ${error.message}`);
+    }
     const promises = [];
-    promises.push(closeRawDb());
     promises.push(healthMonitor.close());
     // Last market-status.json write (e.g. the P1-2 crash degradation view) is
     // flushed before exit so the file never outlives the process claiming a

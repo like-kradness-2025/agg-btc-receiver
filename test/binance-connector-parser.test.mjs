@@ -839,3 +839,70 @@ describe('Binance spot maxLevels from config.depthLimit', () => {
     assert.strictEqual(conn.book._maxLevels, 1000);
   });
 });
+
+describe('R-11: invalid price/qty is counted, never silently dropped', () => {
+  // Regression: _handleTrade had `if (!price || !qty) return;` before the
+  // fail-closed guard, so a zero/NaN price or qty disappeared without ever
+  // incrementing droppedTradeCount — the loss was invisible in health.jsonl.
+  function spot() {
+    const conn = new BinanceSpotConnector({});
+    conn._ws = null;
+    conn._setState('running');
+    return conn;
+  }
+
+  function perp() {
+    const conn = new BinancePerpConnector({});
+    conn._ws = null;
+    conn._setState('running');
+    return conn;
+  }
+
+  const badTrades = [
+    { p: '0', q: '1.5' },        // zero price
+    { p: '65000', q: '0' },      // zero qty
+    { p: 'not-a-price', q: '1' }, // NaN price
+    { p: '65000', q: '' },       // NaN qty
+  ];
+
+  it('spot: each invalid trade increments droppedTradeCount and emits nothing', () => {
+    const conn = spot();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    badTrades.forEach((t, i) => {
+      conn._handleTrade({ e: 'trade', t: String(i), m: false, T: 1700000000000 + i, ...t });
+    });
+
+    assert.strictEqual(emitted.length, 0, 'nothing may be emitted for invalid price/qty');
+    assert.strictEqual(conn._stats.droppedTradeCount, badTrades.length,
+      'every invalid trade must be counted (observable), not silently skipped');
+  });
+
+  it('perp (aggTrade): each invalid trade increments droppedTradeCount', () => {
+    const conn = perp();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    conn._handleTrade({ e: 'aggTrade', t: '1', p: '0', q: '2.0', m: false, T: 1700000000000 });
+    conn._handleTrade({ e: 'aggTrade', t: '2', p: '65200', q: '0', m: false, T: 1700000000001 });
+
+    assert.strictEqual(emitted.length, 0);
+    assert.strictEqual(conn._stats.droppedTradeCount, 2);
+  });
+
+  it('valid trades still emit and do not inflate droppedTradeCount (control)', () => {
+    const conn = spot();
+    const emitted = [];
+    conn.on('trade', (ev) => emitted.push(ev));
+
+    conn._handleTrade({ e: 'trade', t: '7', p: '65000.00', q: '1.5', m: false, T: 1700000000000 });
+    conn._handleTrade({ e: 'trade', t: '8', p: '65100.00', q: '0.3', m: true, T: 1700000000001 });
+
+    assert.strictEqual(emitted.length, 2);
+    assert.strictEqual(emitted[0].price, 65000);
+    assert.strictEqual(emitted[0].qty, 1.5);
+    assert.strictEqual(emitted[1].side, 'sell');
+    assert.strictEqual(conn._stats.droppedTradeCount, 0);
+  });
+});
