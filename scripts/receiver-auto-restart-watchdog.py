@@ -3,6 +3,11 @@
 
 Read-only checks are performed against health.jsonl. A restart is requested
 only after repeated evidence, with cooldown and a rolling restart budget.
+A single-market problem requests a module restart (SIGUSR2 to the owning
+worker); a whole-fleet outage requests a full service restart, because the
+fleet-wide case is invisible through the per-market state alone (the receiver
+reports a boot-time connect failure as `degraded`, which used to match no
+reason at all).
 Use --dry-run for inspection without receiver side effects.
 """
 from __future__ import annotations
@@ -20,6 +25,11 @@ COOLDOWN_S = int(os.environ.get("RECEIVER_RESTART_COOLDOWN_S", "600"))
 MAX_RESTARTS = int(os.environ.get("RECEIVER_MAX_RESTARTS", "3"))
 WINDOW_S = int(os.environ.get("RECEIVER_RESTART_WINDOW_S", "3600"))
 BAD_BATCHES = int(os.environ.get("RECEIVER_BAD_BATCHES", "3"))
+# Receiver states that mean "this market is not delivering". `degraded` and
+# `unavailable` are what a failed initial connect looks like (e.g. a boot-time
+# resolver race), so omitting them made a whole-fleet outage invisible.
+UNHEALTHY_MARKET_STATES = {"error", "reconnecting", "degraded", "unavailable"}
+FLEET_REASON_PREFIXES = ("fleet_degraded", "data_incomplete")
 
 
 def read_json(path: Path):
@@ -39,12 +49,18 @@ def evaluate(now_ms: int):
         age = now_ms - int(health.get("ts", 0))
         if age > STALE_MS:
             reasons.append(f"health_stale:{age}ms")
+        running = len(health.get("running_markets") or [])
+        expected = len(health.get("expected_markets") or [])
+        if expected and running < expected:
+            reasons.append(f"fleet_degraded:{running}of{expected}")
+        if health.get("data_complete") is False:
+            reasons.append("data_incomplete")
         for market in REQUIRED:
             m = health.get("markets", {}).get(market, {})
             last = int(m.get("lastDepthMsgAt", 0) or 0)
             if last and now_ms - last > STALE_MS:
                 reasons.append(f"depth_stale:{market}:{now_ms-last}ms")
-            if m.get("state") in {"error", "reconnecting"}:
+            if m.get("state") in UNHEALTHY_MARKET_STATES:
                 reasons.append(f"market_state:{market}:{m['state']}")
             if m.get("ioFailure"):
                 reasons.append(f"writer_io_failure:{market}")
@@ -61,6 +77,11 @@ def save_state(state):
     tmp = STATE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
     os.replace(tmp, STATE)
+
+
+def restart_service(reason: str):
+    """Whole-fleet recovery: every market reconnects when the service starts."""
+    subprocess.check_call(["systemctl", "--user", "restart", SERVICE])
 
 
 def restart_market(market: str, reason: str):
@@ -93,12 +114,18 @@ def main():
             action = "cooldown"
         elif len(state["restarts"]) >= MAX_RESTARTS:
             action = "restart_budget_exhausted"
-        elif not args.dry_run:
-            market = next((m for m in REQUIRED if any(f"{prefix}:{m}:" in item for prefix in ("depth_stale", "market_state", "writer_io_failure") for item in reasons)), REQUIRED[0])
-            restart_market(market, ";".join(reasons))
-            state["restarts"].append(now); state["failures"] = 0; action = f"module_restarted:{market}"
         else:
-            action = "would_restart"
+            fleet_wide = any(item.startswith(FLEET_REASON_PREFIXES) for item in reasons)
+            if not args.dry_run:
+                if fleet_wide:
+                    restart_service(";".join(reasons))
+                    state["restarts"].append(now); state["failures"] = 0; action = "service_restarted"
+                else:
+                    market = next((m for m in REQUIRED if any(f"{prefix}:{m}:" in item for prefix in ("depth_stale", "market_state", "writer_io_failure") for item in reasons)), REQUIRED[0])
+                    restart_market(market, ";".join(reasons))
+                    state["restarts"].append(now); state["failures"] = 0; action = f"module_restarted:{market}"
+            else:
+                action = "would_restart_service" if fleet_wide else "would_restart"
     save_state(state)
     print(json.dumps({"action": action, "failures": state["failures"], "reasons": reasons}, ensure_ascii=False))
     return 0
