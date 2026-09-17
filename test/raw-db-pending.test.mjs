@@ -25,6 +25,7 @@ import {
   buildRawDbDropReport,
   drainPendingQueueWithBoundedRetry,
   ingestSeqRange,
+  resolveCanonicalRawEnabled,
   resolveRawDbPendingMaxEvents,
   resolveRawDbPendingOverflowMode,
   sumRawDbLoss,
@@ -306,6 +307,17 @@ describe('R14: pending-queue cap accounting (dropped envelopes are counted)', ()
     assert.equal(resolveRawDbPendingOverflowMode({ RECEIVER_RAW_DB_PENDING_OVERFLOW_MODE: 'legacy' }), 'legacy');
     assert.equal(resolveRawDbPendingOverflowMode({ RECEIVER_RAW_DB_PENDING_OVERFLOW_MODE: 'count' }), 'count');
     assert.equal(resolveRawDbPendingOverflowMode({ RECEIVER_RAW_DB_PENDING_OVERFLOW_MODE: 'silent' }), 'count');
+  });
+
+  it('resolves the canonical raw copy switch from the environment', () => {
+    assert.equal(resolveCanonicalRawEnabled({}), true);
+    assert.equal(resolveCanonicalRawEnabled({ RECEIVER_CANONICAL_RAW: '1' }), true);
+    assert.equal(resolveCanonicalRawEnabled({ RECEIVER_CANONICAL_RAW: 'true' }), true);
+    assert.equal(resolveCanonicalRawEnabled({ RECEIVER_CANONICAL_RAW: '0' }), false);
+    assert.equal(resolveCanonicalRawEnabled({ RECEIVER_CANONICAL_RAW: 'false' }), false);
+    assert.equal(resolveCanonicalRawEnabled({ RECEIVER_CANONICAL_RAW: '' }), true);
+    // an unrecognized value must keep the historic (enabled) behavior
+    assert.equal(resolveCanonicalRawEnabled({ RECEIVER_CANONICAL_RAW: 'no' }), true);
   });
 
   it('adds the overflow counts to the drop report without changing the no-overflow shape', () => {

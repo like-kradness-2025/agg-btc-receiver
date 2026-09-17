@@ -37,6 +37,7 @@ import {
   buildRawDbDropReport,
   drainPendingQueueWithBoundedRetry,
   ingestSeqRange,
+  resolveCanonicalRawEnabled,
   resolveRawDbPendingMaxEvents,
   resolveRawDbPendingOverflowMode,
   writeRawDbDropReport,
@@ -275,6 +276,13 @@ const MODULE_RESTART_REQUEST = path.join(process.env.XDG_RUNTIME_DIR || `/run/us
 const rawDbPending = [];
 const RAW_DB_PENDING_MAX_EVENTS = resolveRawDbPendingMaxEvents();
 /**
+ * Operator switch for the immutable full-history copy (`canonical_frames`).
+ * Turned off with RECEIVER_CANONICAL_RAW=0: the canonical layer is TTL-exempt
+ * by design and grows without bound, and no downstream consumer reads it
+ * (agg-btc-downstream parses raw_batches). raw_batches keeps every event.
+ */
+const CANONICAL_RAW_ENABLED = resolveCanonicalRawEnabled();
+/**
  * R14: how envelopes rejected at the pending-queue cap are accounted for.
  * `count` (default) counts every rejected envelope; `legacy` reproduces the
  * pre-fix silent drop and exists only for A/B measurement and rollback.
@@ -436,6 +444,12 @@ function flushCanonicalDbQueue() {
 function enqueueCanonicalFrames(envelopes) {
   if (!rawDbWriter) return;
   if (rawDbWriter.appendCanonical === undefined) return; // duckdb path: no canonical table
+  // Operator switch (RECEIVER_CANONICAL_RAW=0): the canonical layer is an
+  // immutable, TTL-exempt full-history copy that nothing downstream reads.
+  // Skipping admission here leaves the canonical queue and its R13/R14/O-02
+  // counters untouched (they account for the queue, not for the archive), so
+  // the loss surfaces keep reporting the truth for the bytes we do persist.
+  if (!CANONICAL_RAW_ENABLED) return;
   // O-02: the `rawDbFailure` latch must NOT short-circuit this path. Pre-fix the
   // guard read `if (!rawDbWriter || rawDbFailure) return;`, so a frame that
   // arrived after the latch was discarded BEFORE the queue admission and before
