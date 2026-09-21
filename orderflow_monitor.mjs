@@ -29,7 +29,10 @@ import {
 import { validateConfig } from './lib/config-validator.mjs';
 import { acquireOutputRootLock, releaseOutputRootLock } from './lib/lock.mjs';
 import { RawDbWriter, DEFAULT_RAW_RETENTION_DAYS } from './lib/raw-db-writer.mjs';
-import { RawSqliteWriter } from './lib/raw-sqlite-writer.mjs';
+import {
+  RawSqliteWriter,
+  DEFAULT_SLOW_APPEND_MS,
+} from './lib/raw-sqlite-writer.mjs';
 import { DerivativesHelper } from './lib/derivatives-helper.mjs';
 import { getOICapability, openInterestEventTimestamp } from './lib/oi-schema.mjs';
 import {
@@ -249,13 +252,31 @@ const stallLog = createStallLog({
   filePath: path.join(outputBase, 'stall-events.jsonl'),
   fsModule: fs,
 });
+function resolveSlowAppendMs() {
+  const raw = process.env.RECEIVER_SLOW_APPEND_MS;
+  if (raw === undefined || raw === '') return DEFAULT_SLOW_APPEND_MS;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : DEFAULT_SLOW_APPEND_MS;
+}
+
 const stallProbe = new StallProbe({
   label: 'main',
   // 既定 1500ms。検証や調整のために env で上書きできる (RECEIVER_STALL_LAG_MS)。
   lagThresholdMs: Number(process.env.RECEIVER_STALL_LAG_MS) || 1500,
   sampleMs: 250,
+  // 遅い append の内訳は 1 回で数十 span になるため、リングを広めに取る。
+  ringSize: 2000,
   onAnomaly: (record) => {
     stallLog.write(record);
+    if (record.kind === 'slow_append') {
+      const top = [...record.spans].sort((a, b) => b.dur_ms - a.dur_ms).slice(0, 4)
+        .map((s) => `${s.name}:${Math.round(s.dur_ms)}ms`).join(',');
+      console.error(
+        `[stall] slow_append #${record.append} total=${Math.round(record.total_ms)}ms `
+        + `events=${record.events} queue=${Math.round(record.queue_wait_ms)}ms top=${top}`,
+      );
+      return;
+    }
     const detail = record.kind === 'stall'
       ? `max_lag=${record.max_lag_ms}ms spans=${record.spans.map((s) => `${s.name}:${s.dur_ms}ms`).join(',') || 'none'}`
       : `duration=${record.duration_ms}ms`;
@@ -270,7 +291,14 @@ const healthMonitor = new HealthMonitor(path.join(outputBase, 'health.jsonl'), {
 const rawDbWriter = rawStorage === 'duckdb'
   ? await new RawDbWriter({ databasePath: rawDatabasePath, retentionDays: rawRetentionDays }).open()
   : rawStorage === 'sqlite'
-    ? await new RawSqliteWriter({ databaseDir: rawDatabaseDir, retentionDays: rawRetentionDays }).open()
+    ? await new RawSqliteWriter({
+      databaseDir: rawDatabaseDir,
+      retentionDays: rawRetentionDays,
+      // 遅い append の内訳を観測ログ (stall-events.jsonl) へ出す。
+      observer: stallProbe,
+      // 閾値の既定は 1000ms。検証・調整用に env で上書きできる。
+      slowAppendMs: resolveSlowAppendMs(),
+    }).open()
   : null;
 if (rawDbWriter) await stallProbe.wrap('raw.pruneExpired', () => rawDbWriter.pruneExpired());
 
