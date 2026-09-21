@@ -287,6 +287,10 @@ stallProbe.start();
 
 const healthMonitor = new HealthMonitor(path.join(outputBase, 'health.jsonl'), {
   intervalMs: 1000,
+  // 記録は異常時のみを基本にし、正常時は状態変化 + 生存行 (既定30秒) だけ書く。
+  // 監視 (watchdog) は最終行の鮮度90秒で再起動を判断するため完全な0にはできない。
+  healthyWriteIntervalMs: Number(process.env.RECEIVER_HEALTH_HEALTHY_INTERVAL_MS ?? 30_000),
+  staleMarketWriteMs: Number(process.env.RECEIVER_HEALTH_STALE_MARKET_MS ?? 60_000),
 });
 const rawDbWriter = rawStorage === 'duckdb'
   ? await new RawDbWriter({ databasePath: rawDatabasePath, retentionDays: rawRetentionDays }).open()

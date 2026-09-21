@@ -15,7 +15,7 @@ async function tempHealth() {
 describe('HealthMonitor generation retention and acceptance', () => {
   it('rotates at the configured limit, preserves dashboard JSONL, and writes a manifest', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 220 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 220 });
     for (let i = 0; i < 12; i++) {
       monitor.updateConnector('binance_spot', {
         state: 'running', connectedAt: 1, lastDepthMsgAt: i, lastTradeMsgAt: i,
@@ -40,7 +40,7 @@ describe('HealthMonitor generation retention and acceptance', () => {
 
   it('keeps buffered memory bounded while retaining data quality', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     const heapBefore = process.memoryUsage().heapUsed;
     for (let i = 0; i < 2000; i++) monitor._tick();
     assert.ok(monitor._writer.getStats().bufferedBytes < 1024 * 1024);
@@ -57,7 +57,7 @@ describe('HealthMonitor setCompleteness merge + fail-visible state promotion', (
   /** Build a monitor over a throwaway path; getHealthSummary is pure-ish. */
   async function freshMonitor() {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     return { monitor, file };
   }
 
@@ -204,7 +204,7 @@ describe('R-13: counted raw-DB drop is durable in health.jsonl', () => {
   // file written by the caller).
   it('writes an extra final row carrying the drop when events were dropped', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     const report = {
       schema: 'receiver-raw-db-drop-report/v1',
       ts_ms: 1789000000000,
@@ -234,7 +234,7 @@ describe('R-13: counted raw-DB drop is durable in health.jsonl', () => {
 
   it('adds no extra row and reports 0 drops on a clean shutdown', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     monitor._tick();
     await monitor.close();
 
@@ -248,7 +248,7 @@ describe('R-13: counted raw-DB drop is durable in health.jsonl', () => {
 
   it('ignores non-positive or non-finite drop counts', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     monitor.noteRawDbDroppedEvents(0, null);
     monitor.noteRawDbDroppedEvents(-5, null);
     monitor.noteRawDbDroppedEvents(Number.NaN, null);
@@ -268,7 +268,7 @@ describe('R14: pending-queue overflow is durable in health.jsonl', () => {
   // counter at all, so the loss looked like a genuine no-trade interval.
   it('writes an extra final row carrying the counted overflow', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
 
     monitor.noteRawDbPendingOverflow(812, {
       cap_events: 64, mode: 'count', raw: 700, canonical: 100, open_interest: 12,
@@ -292,7 +292,7 @@ describe('R14: pending-queue overflow is durable in health.jsonl', () => {
 
   it('keeps the field at 0 and adds no object on a normal row', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     monitor._tick();
     await monitor.close();
 
@@ -306,7 +306,7 @@ describe('R14: pending-queue overflow is durable in health.jsonl', () => {
 
   it('treats a drain loss and an overflow as separate, coexisting counts', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
 
     monitor.noteRawDbDroppedEvents(40, { reason: 'unable to open database file' });
     monitor.noteRawDbPendingOverflow(7, { cap_events: 65536, mode: 'count', raw: 7 });
@@ -324,7 +324,7 @@ describe('R14: pending-queue overflow is durable in health.jsonl', () => {
 
   it('ignores non-positive or non-finite overflow counts', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     monitor.noteRawDbPendingOverflow(0, null);
     monitor.noteRawDbPendingOverflow(-3, null);
     monitor.noteRawDbPendingOverflow(Number.NaN, null);
@@ -345,7 +345,7 @@ describe('O-02: post-drain canonical drops are durable in health.jsonl', () => {
   // drain had run were lost with no trace in health.jsonl or the drop report.
   it('writes an extra final row carrying the counted post-drain frames', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
 
     monitor.noteRawDbPostDrainDroppedEvents(2, { first_ts_ms: 1789000000000, last_ts_ms: 1789000000500 });
     monitor._tick();
@@ -365,7 +365,7 @@ describe('O-02: post-drain canonical drops are durable in health.jsonl', () => {
 
   it('keeps the field at 0, adds no object and no row when nothing arrived late', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     monitor.noteRawDbPostDrainDroppedEvents(0, null);
     monitor.noteRawDbPostDrainDroppedEvents(-3, null);
     monitor.noteRawDbPostDrainDroppedEvents(Number.NaN, null);
@@ -382,7 +382,7 @@ describe('O-02: post-drain canonical drops are durable in health.jsonl', () => {
 
   it('keeps the three raw-DB loss fields independent on the same row', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     monitor.noteRawDbDroppedEvents(7, { reason: 'ENOSPC' });
     monitor.noteRawDbPendingOverflow(5, { cap_events: 64, mode: 'count', raw: 5 });
     monitor.noteRawDbPostDrainDroppedEvents(2, { first_ts_ms: 1, last_ts_ms: 2 });
@@ -407,7 +407,7 @@ describe('O-03: the two loss surfaces are mirrors (count each population once)',
   // the two surfaces counts the mirrored populations twice (cycle 13: gap=-425).
   it('publishes the drop report totals under the registered row names', async () => {
     const { file } = await tempHealth();
-    const monitor = new HealthMonitor(file, { rotateBytes: 1024 * 1024 });
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 0, rotateBytes: 1024 * 1024 });
     const overflow = {
       dropped_events: 7, cap_events: 64, mode: 'count', raw: 4, canonical: 3,
       open_interest: 0, first_ts_ms: 1789000000000,
@@ -444,3 +444,115 @@ describe('O-03: the two loss surfaces are mirrors (count each population once)',
     await fs.rm(`${file}.manifest.json`, { force: true });
   });
 });
+
+describe('HealthMonitor write policy (異常時のみ + 生存行)', () => {
+  function runningStats(extra = {}) {
+    return {
+      state: 'running', connectedAt: 1, lastDepthMsgAt: Date.now(), lastTradeMsgAt: Date.now(),
+      depthMsgCount: 1, tradeMsgCount: 1, droppedDepthCount: 0, droppedTradeCount: 0,
+      droppedLiquidationCount: 0, reconnectCount: 0, resyncCount: 0, lastSeq: 1, ...extra,
+    };
+  }
+
+  function completeness(dataComplete = true) {
+    return {
+      expected_markets: ['binance_spot'],
+      running_markets: ['binance_spot'],
+      degraded_markets: {},
+      data_complete: dataComplete,
+      transitions: [],
+    };
+  }
+
+  // _tick の書き込みは非同期チェーンなので、読む前に必ず確定させる。
+  async function settled(monitor) {
+    await monitor._tickPromise;
+  }
+
+  async function rowsOf(file) {
+    try {
+      return (await fs.readFile(file, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
+    } catch {
+      return [];
+    }
+  }
+
+  it('正常時は生存行の間隔まで書かない (行スキーマは不変)', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 60_000, staleMarketWriteMs: 0 });
+    monitor.updateConnector('binance_spot', runningStats());
+    monitor.setCompleteness(completeness());
+
+    monitor._tick();
+    monitor._tick();
+    monitor._tick();
+    await settled(monitor);
+    await monitor.close();
+
+    const rows = await rowsOf(file);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].state, 'normal');
+    assert.equal(rows[0].data_complete, true);
+    assert.equal(rows[0].markets.binance_spot.state, 'running');
+    assert.equal(typeof rows[0].ts, 'number');
+  });
+
+  it('生存行の間隔が過ぎたら書く (監視の鮮度90秒を切らさない)', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 10_000, staleMarketWriteMs: 0 });
+    monitor.updateConnector('binance_spot', runningStats());
+    monitor.setCompleteness(completeness());
+    monitor._tick();
+    monitor._tick();
+    await settled(monitor);
+    assert.equal((await rowsOf(file)).length, 1);
+
+    monitor._lastWriteAtMs = Date.now() - 11_000;
+    monitor._tick();
+    await settled(monitor);
+    await monitor.close();
+    assert.equal((await rowsOf(file)).length, 2);
+  });
+
+  it('異常時は毎 tick 書く (監視の depth_stale 精度を落とさない)', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 600_000, staleMarketWriteMs: 0 });
+    monitor.updateConnector('binance_spot', runningStats({ state: 'reconnecting' }));
+    monitor.setCompleteness(completeness(false));
+    monitor._tick();
+    monitor._tick();
+    monitor._tick();
+    await settled(monitor);
+    await monitor.close();
+    const rows = await rowsOf(file);
+    assert.equal(rows.length, 3);
+    assert.equal(rows.every((row) => row.state !== 'normal'), true);
+    assert.equal(rows[0].markets.binance_spot.state, 'reconnecting');
+  });
+
+  it('正常→異常の遷移と静かな市場は即座に書く', async () => {
+    const { file } = await tempHealth();
+    const monitor = new HealthMonitor(file, { healthyWriteIntervalMs: 600_000, staleMarketWriteMs: 60_000 });
+    monitor.updateConnector('binance_spot', runningStats());
+    monitor.setCompleteness(completeness());
+    monitor._tick();
+    await settled(monitor);
+    assert.equal((await rowsOf(file)).length, 1);
+
+    // 状態遷移 (market が reconnecting) は間隔を待たずに書く。
+    monitor.updateConnector('binance_spot', runningStats({ state: 'reconnecting' }));
+    monitor._tick();
+    await settled(monitor);
+    assert.equal((await rowsOf(file)).length, 2);
+
+    // 静かな市場 (depth が 60 秒超届かない) も間隔を待たずに書く。
+    monitor.updateConnector('binance_spot', runningStats({ lastDepthMsgAt: Date.now() - 120_000 }));
+    monitor._tick();
+    await settled(monitor);
+    await monitor.close();
+    const rows = await rowsOf(file);
+    assert.equal(rows.length, 3);
+    assert.equal(rows[2].markets.binance_spot.lastDepthMsgAt <= Date.now() - 119_000, true);
+  });
+});
+
