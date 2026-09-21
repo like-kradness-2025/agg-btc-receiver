@@ -36,6 +36,7 @@ const EXPECTED_FRESH_SPANS = [
   'writer.market',
   'writer.lockWait',
   'writer.insert',
+  'writer.remember_fresh',
 ];
 
 test('slow append は区間内訳つきで observer へ報告される', async () => {
@@ -116,6 +117,7 @@ test('遅着マージ (backfill) の内訳も報告される', async () => {
   assert.equal(reports.length, 1);
   const names = reports[0].spans.map((span) => span.name);
   for (const expected of [
+    'writer.backfill',
     'writer.backfill.lockWait',
     'writer.backfill.select',
     'writer.backfill.match',
@@ -153,4 +155,22 @@ test('report() は probe 経由で onAnomaly へ届く', async () => {
   assert.equal(seen[0].ts, '2023-11-14T22:13:20.000Z');
   assert.equal(returned.total_ms, 1234);
   probe.stop();
+});
+
+test('遅くない append でも計測器を解放する (Astra P1 回帰)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-slow-leak-'));
+  const { observer } = collector();
+  // 閾値 -1 = 報告しない。それでもタイマーは解放されなければならない。
+  const writer = await new RawSqliteWriter({ databaseDir: root, observer, slowAppendMs: -1 }).open();
+  const timeoutsBefore = process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+  const reportsBefore = [];
+  for (let i = 0; i < 20; i++) {
+    await writer.append([trade('m1', 1_000 + i, 2_000 + i)]);
+  }
+  const timeoutsAfter = process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+  assert.equal(timeoutsAfter <= timeoutsBefore + 1, true,
+    `Timeout resources grew: ${timeoutsBefore} -> ${timeoutsAfter}`);
+  assert.deepEqual(reportsBefore, []);
+  await writer.close();
+  await fs.rm(root, { recursive: true, force: true });
 });
