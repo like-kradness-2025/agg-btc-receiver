@@ -19,6 +19,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { Worker } from 'node:worker_threads';
 import { HealthMonitor } from './lib/health-monitor.mjs';
+import { StallProbe, createStallLog } from './lib/stall-probe.mjs';
 import {
   MarketStatusTracker,
   defaultStatusFilePath,
@@ -239,6 +240,30 @@ function logCompletenessChange(snap, reason = '') {
 
 // ====== Initialize main-thread components ======
 
+// ====== Stall observer (2026-09-21) ======
+// 目的: プロセスが数秒〜20 秒ブロックする事象 (health.jsonl に最大 19.3 秒の穴、
+// 各市場が同時に "no message for ~30s" で再接続) の「どこで止まっているか」を
+// 記録する。**挙動は変えない** (タイムアウトや書き込み経路には触らない)。
+// 記録は異常時のみ: 通常運転ではファイルを 1 バイトも書かない。
+const stallLog = createStallLog({
+  filePath: path.join(outputBase, 'stall-events.jsonl'),
+  fsModule: fs,
+});
+const stallProbe = new StallProbe({
+  label: 'main',
+  // 既定 1500ms。検証や調整のために env で上書きできる (RECEIVER_STALL_LAG_MS)。
+  lagThresholdMs: Number(process.env.RECEIVER_STALL_LAG_MS) || 1500,
+  sampleMs: 250,
+  onAnomaly: (record) => {
+    stallLog.write(record);
+    const detail = record.kind === 'stall'
+      ? `max_lag=${record.max_lag_ms}ms spans=${record.spans.map((s) => `${s.name}:${s.dur_ms}ms`).join(',') || 'none'}`
+      : `duration=${record.duration_ms}ms`;
+    console.error(`[stall] ${record.kind} label=${record.label} ${detail}`);
+  },
+});
+stallProbe.start();
+
 const healthMonitor = new HealthMonitor(path.join(outputBase, 'health.jsonl'), {
   intervalMs: 1000,
 });
@@ -247,7 +272,7 @@ const rawDbWriter = rawStorage === 'duckdb'
   : rawStorage === 'sqlite'
     ? await new RawSqliteWriter({ databaseDir: rawDatabaseDir, retentionDays: rawRetentionDays }).open()
   : null;
-if (rawDbWriter) await rawDbWriter.pruneExpired();
+if (rawDbWriter) await stallProbe.wrap('raw.pruneExpired', () => rawDbWriter.pruneExpired());
 
 // ====== Worker management ======
 
@@ -409,7 +434,7 @@ function flushRawDbQueue() {
     while (rawDbPending.length) {
       const batch = rawDbPending.splice(0, RAW_DB_FLUSH_MAX_EVENTS);
       try {
-        await rawDbWriter.append(batch);
+        await stallProbe.wrap('raw.append', () => rawDbWriter.append(batch), { events: batch.length });
       } catch (error) {
         rawDbPending.unshift(...batch);
         throw error;
@@ -429,7 +454,7 @@ function flushCanonicalDbQueue() {
     while (canonicalDbPending.length) {
       const batch = canonicalDbPending.splice(0, CANONICAL_DB_FLUSH_MAX_EVENTS);
       try {
-        await rawDbWriter.appendCanonical(batch);
+        await stallProbe.wrap('canonical.append', () => rawDbWriter.appendCanonical(batch), { frames: batch.length });
       } catch (error) {
         canonicalDbPending.unshift(...batch);
         throw error;
@@ -519,7 +544,7 @@ async function drainRawDbPendingOnShutdown() {
   const rawRange = ingestSeqRange(rawDbPending);
   const rawResult = await drainPendingQueueWithBoundedRetry({
     pending: rawDbPending,
-    append: (batch) => rawDbWriter.append(batch),
+    append: (batch) => stallProbe.wrap('raw.append.shutdown', () => rawDbWriter.append(batch), { events: batch.length }),
     maxBatch: RAW_DB_FLUSH_MAX_EVENTS,
     onAttemptError: (error, attempt) => console.error(
       `[main] raw DB shutdown drain attempt ${attempt} failed: ${error.message} (${rawDbPending.length} event(s) still pending)`,
@@ -530,7 +555,7 @@ async function drainRawDbPendingOnShutdown() {
   if (canonicalDbPending.length > 0 && rawDbWriter.appendCanonical !== undefined) {
     canonicalResult = await drainPendingQueueWithBoundedRetry({
       pending: canonicalDbPending,
-      append: (batch) => rawDbWriter.appendCanonical(batch),
+      append: (batch) => stallProbe.wrap('canonical.append.shutdown', () => rawDbWriter.appendCanonical(batch), { frames: batch.length }),
       maxBatch: CANONICAL_DB_FLUSH_MAX_EVENTS,
       onAttemptError: (error, attempt) => console.error(
         `[main] canonical raw shutdown drain attempt ${attempt} failed: ${error.message} (${canonicalDbPending.length} event(s) still pending)`,
@@ -655,6 +680,20 @@ function createWorker(workerId, groupMarkets) {
       case 'rawQueueFailure':
         reportRawDbFailure(new Error(`worker raw queue failure: ${msg.reason}`));
         break;
+
+      // Stall observer: ワーカースレッド側の停止を main が集約して 1 ファイルに書く
+      // (worker ごとにファイルを持たせない = 記録は異常時のみ、単一ライター)。
+      case 'stallAnomaly': {
+        const record = msg.record;
+        if (record && typeof record === 'object') {
+          stallLog.write(record);
+          const detail = record.kind === 'stall'
+            ? `max_lag=${record.max_lag_ms}ms spans=${(record.spans ?? []).map((sp) => `${sp.name}:${sp.dur_ms}ms`).join(',') || 'none'}`
+            : `duration=${record.duration_ms}ms`;
+          console.error(`[stall] ${record.kind} label=${record.label} ${detail}`);
+        }
+        break;
+      }
 
       case 'liquidation':
         // Log liquidation events
@@ -1030,13 +1069,18 @@ async function main() {
       }
     }
     derivativesHelper.start();
+    const stallGaugeTimer = setInterval(() => {
+      stallProbe.note('rawDbPending', rawDbPending.length);
+      stallProbe.note('canonicalDbPending', canonicalDbPending.length);
+    }, 1000);
+    stallGaugeTimer.unref?.();
     rawDbFlushTimer = setInterval(() => {
       void flushRawDbQueue();
       void flushCanonicalDbQueue();
     }, RAW_DB_FLUSH_INTERVAL_MS);
     rawDbRetentionTimer = setInterval(() => {
       void Promise.all([flushRawDbQueue(), flushCanonicalDbQueue()])
-        .then(() => rawDbWriter.pruneExpired())
+        .then(() => stallProbe.wrap('raw.pruneExpired', () => rawDbWriter.pruneExpired()))
         .catch(reportRawDbFailure);
     }, 6 * 60 * 60 * 1000);
     rawDbFlushTimer.unref?.();
