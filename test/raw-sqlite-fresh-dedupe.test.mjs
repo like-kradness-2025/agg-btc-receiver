@@ -248,3 +248,42 @@ test('a failed commit does not poison the window (retry still persists the rows)
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+// Astra P1 (2026-09-22): sweep をグループ毎(28回)から append 1回へ変えたので、
+// TTL/上限の意味が変わっていないかを境界で直接比較する。
+test('sweep 1回化で窓の TTL/上限の意味は変わらない', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { RawSqliteWriter } = await import('../lib/raw-sqlite-writer.mjs');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fresh-sweep-boundary-'));
+  const writer = await new RawSqliteWriter({
+    databaseDir: root, freshDedupeMaxKeys: 3, freshDedupeWindowMs: 60_000,
+  }).open();
+  const row = (id) => ({ market: 'm1', stream: 'trades', source_id: String(id), event_ts_ms: 1_000 + id });
+  const key = 'm1\u0000trades';
+  const now = Date.now();
+
+  // 旧挙動: グループ毎に sweep
+  for (const id of [1, 2, 3, 4, 5]) writer._rememberFreshIdentities(key, [row(id)], now, { sweep: true });
+  const perGroup = [...writer.freshDedupe.keys()];
+
+  // 新挙動: 登録はためて append 最後に 1 回 sweep
+  writer.freshDedupe.clear();
+  for (const id of [1, 2, 3, 4, 5]) writer._rememberFreshIdentities(key, [row(id)], now, { sweep: false });
+  writer._sweepFreshDedupe(now);
+  const perAppend = [...writer.freshDedupe.keys()];
+
+  assert.deepEqual(perAppend, perGroup, '上限での残存集合が一致しない');
+  assert.equal(perAppend.length, 3, '上限3で3件に収まっていない');
+
+  // TTL: 期限切れはどちらの経路でも落ちる
+  writer.freshDedupe.clear();
+  for (const id of [1, 2]) writer._rememberFreshIdentities(key, [row(id)], now - 120_000, { sweep: false });
+  writer._sweepFreshDedupe(now);
+  assert.equal(writer.freshDedupe.size, 0, '期限切れが残っている');
+
+  await writer.close();
+  await fs.rm(root, { recursive: true, force: true });
+});
+
