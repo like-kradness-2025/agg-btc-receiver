@@ -50,6 +50,16 @@ test('await 中に世代が進んだら running に戻さない (close と競合
   assert.notEqual(c._state, 'running', '古い世代の同期を成功扱いにしない');
 });
 
+test('失効した同期の失敗は、新しい世代の状態を error に落とさない (Astra 最終監査 P1)', async () => {
+  const c = new TestConnector();
+  c.on('error', () => {});
+  c._wsGeneration = 3;
+  c._ringBuf = [];
+  c._fetchSnapshot = async () => { c._wsGeneration = 4; throw new Error('stale REST failure'); };
+  await c._syncBook({ keepBuffer: true }); // 新世代を巻き込まない: error にせず throw もしない
+  assert.notEqual(c._state, 'error', '旧世代の失敗で新接続を error にしない');
+});
+
 test('失効が無ければ従来どおり running へ戻る', async () => {
   const c = new TestConnector();
   c._wsGeneration = 2;
