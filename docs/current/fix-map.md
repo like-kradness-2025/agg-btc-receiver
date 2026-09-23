@@ -84,8 +84,11 @@ systemd (agg-btc-receiver.service)
 3. commit → `git branch -f fix/<topic> HEAD && git push origin fix/<topic>`（公式記録は `master`）。
 4. `systemctl --user restart agg-btc-receiver`。
 5. **確認（4点すべてを見るまで「反映した」と言わない）**:
-   1. **変更が本番ツリーに入っているか**: `git -C ~/Tool/agg-btc-receiver log --oneline -1`
-      （対象コミット、またはその子孫であること。稼働確認だけでは反映の証明にならない）
+   1. **変更が本番ツリーの実体に入っているか**（履歴関係では判定しない）:
+      `git -C ~/Tool/agg-btc-receiver status --porcelain` が空（取り残しなし）**かつ**
+      変更した識別子が実コードにある（例: `grep -n '<変更した識別子>' /home/weed420/Tool/agg-btc-receiver/<file>`）。
+      `git log --oneline -1` だけでは祖先関係も適用も確認できない（cherry-pick 後は元コミットの
+      子孫とは限らない）。
    2. `systemctl --user is-active agg-btc-receiver` が `active`
    3. `systemctl --user show agg-btc-receiver -p NRestarts --value` が増えていない
    4. 稼働の健全性（**絶対パスで**）:
@@ -107,11 +110,11 @@ systemd (agg-btc-receiver.service)
 5. 個別事例: 遅着候補SELECTが索引選択で全履歴走査になった（本番DBコピーで 12.7秒→0.1ms、
    `INDEXED BY` で固定し結果同一を確認）。窓の sweep は **Map 反復中の delete** が高コストだった
    （実測833ms、削除対象を集めてから削除する形に変更）。
-6. **`systemctl restart` 後は待って §5-5 を確認**。起動失敗ループ時は `NRestarts` が増える。
+6. **`systemctl restart` 後は待って §5-5 の確認を実施**。起動失敗ループ時は `NRestarts` が増える。
 
 ## 7. 変更後チェックリスト
 
 - [ ] 変更した経路を実際に実行するテストがある（無ければ追加）
 - [ ] `npm test` が fail 0
 - [ ] 不変条件 1〜7 を壊していない
-- [ ] §5-5 の3点を確認した
+- [ ] §5-5 の4点を確認した
