@@ -87,7 +87,9 @@ systemd (agg-btc-receiver.service)
    1. **変更したファイルの実体が対象コミットと一致しているか**（履歴関係でも識別子の有無でも判定しない）:
       `git -C ~/Tool/agg-btc-receiver diff <commit> -- <file>` が**空**（＝そのコミットの内容がそのまま
       実体。識別子の存在では既存関数への修正適用を証明できない）。加えて
-      `git -C ~/Tool/agg-btc-receiver status --porcelain` が空（未コミットの取り残しなし）。
+      `git -C ~/Tool/agg-btc-receiver status --porcelain --untracked-files=no` が空
+      （未コミットの取り残しなし。このリポジトリには `.research-tmp/` `.serena/` の未追跡ディレクトリが
+      常時あるため `--untracked-files=no` を付ける）。
       `git log --oneline -1` では祖先関係も適用も確認できない（cherry-pick 後は元コミットの子孫とは限らない）。
    2. `systemctl --user is-active agg-btc-receiver` が `active`
    3. `systemctl --user show agg-btc-receiver -p NRestarts --value` が増えていない
