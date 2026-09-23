@@ -94,10 +94,13 @@ systemd (agg-btc-receiver.service)
    4. 稼働の健全性（**絶対パス**、かつ**プロセス起動時刻より新しいこと**。実機で確認済み）:
       ```
       START_MS=$(date -d "$(systemctl --user show agg-btc-receiver -p ExecMainStartTimestamp --value)" +%s%3N)
-      python3 -c "import json;d=json.load(open('/home/weed420/Tool/agg-btc-receiver/data/market-status.json'));print(d['process_ready'],d['data_complete'],d['ts_ms']>${START_MS})"
+      python3 -c "import json,time;d=json.load(open('/home/weed420/Tool/agg-btc-receiver/data/market-status.json'));print(d['process_ready'],d['data_complete'],d['ts_ms']>${START_MS},(time.time()*1000-d['ts_ms'])<120000)"
       ```
-      が `True True True`。**「120秒以内」では不十分**（再起動直前の JSON も通ってしまう）。相対パスは
-      worktree側の別ファイルを読み、古い JSON は再起動前の状態を「正常」と見せる（この誤読を実際にした）。
+      が `True True True True`。**両方必要**:
+      `ts_ms > START_MS` = 起動後に書かれた（**更新が止まった起動後JSON**を弾くには鮮度も要る）、
+      `now - ts_ms < 120秒` = 生きている（health は正常時30秒間隔なので4倍の余裕）。
+      片方だけでは不十分（「120秒以内」だけでは再起動直前の JSON が通り、起動時刻だけでは更新停止を見逃す）。
+      相対パスは worktree側の別ファイルを読み、古い JSON は再起動前の状態を「正常」と見せる。
 6. 失敗時の戻し: `git -C ~/Tool/agg-btc-receiver revert <sha>` → restart → 5 の確認。
 
 ## 6. 実際に踏んだ罠
