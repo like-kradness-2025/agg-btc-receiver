@@ -67,6 +67,7 @@
       "wsUrl": "wss://stream.bybit.com/v5/public/spot",
       "restUrl": "https://api.bybit.com/v5/market/orderbook?category=spot&symbol=BTCUSDT&limit=1000",
       "depthLimit": 0,
+      "raw_snapshot_interval_ms": 60000,
       "marketData": {
         "ohlcv": "https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval=1&limit=1",
         "ticker": "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT"
