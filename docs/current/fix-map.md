@@ -42,10 +42,10 @@ systemd (agg-btc-receiver.service)
 | 重複行 | `_dropFreshRedeliveries` / `_rememberFreshIdentities` / `_sweepFreshDedupe` | `test/raw-sqlite-fresh-dedupe.test.mjs` |
 | 遅着イベントの取り込み | `_backfillLateGroup`（`INDEXED BY raw_batches_stream_last_event_idx`） | `test/raw-sqlite-late-candidates.test.mjs` |
 | IPC送信の不具合 | `lib/ipc-flush.mjs`（+ worker の `flushRawIpc`/`flushCanonicalIpc`） | `test/ipc-flush.test.mjs` |
-| 欠落・無音・再接続 | `lib/base-connector.mjs`, `lib/orderflow-worker.mjs` | `test/base-connector.test.mjs`, `*connector*.test.mjs` |
+| 欠落・無音・再接続 | `lib/base-connector.mjs`, `lib/orderflow-worker.mjs` | `test/base-connector.test.mjs`, `test/connector-parser.test.mjs`, `test/additional-markets-connector.test.mjs` |
 | health/監視 | `lib/health-monitor.mjs` + `scripts/receiver-auto-restart-watchdog.py` | `test/health-monitor.test.mjs` |
 | market状態/完了判定 | `lib/market-status.mjs`, main の readiness 出力 | `test/market-status-file.test.mjs`, `test/market-status-tracker.test.mjs` |
-| 保持・prune | `lib/raw-sqlite-writer.mjs`(`retentionDays`) | `test/raw-sqlite-*.test.mjs` |
+| 保持・prune | `lib/raw-sqlite-writer.mjs`(`retentionDays`) | `test/raw-sqlite-prune-resilience.test.mjs`, `test/raw-sqlite-writer.test.mjs` |
 
 集中テスト: `node --test test/<file>.test.mjs` / 全件: `npm test`（`node --test 'test/**/*.test.mjs'`）
 
@@ -67,8 +67,8 @@ systemd (agg-btc-receiver.service)
     `worker.writeBatch` = worker側writer。
   - `cpu_ms`（process.cpuUsage 差）, `loop_ticks`（50ms間隔カウンタの更新回数）, `gc_count`/`gc_ms`,
     `gc_supported`（**false なら `gc_ms=0` は「GCなし」の証明にならない**）, `heap_delta_mb`。
-  - `loop_ticks` は「計測区間内にカウンタ更新が観測されなかった」ことを示す。**区間長と併せて見る**
-    （0 かつ区間が秒単位なら、ほぼ連続ブロックと判断できる）。
+  - **`loop_ticks=0`** は「その計測区間内にカウンタ更新が観測されなかった」ことを示す（カウンタの
+    説明ではない）。**区間長と併せて見る**（区間が秒単位で 0 なら、ほぼ連続ブロックと判断できる）。
   - `spans` 合計と wall の差を「未計測時間」と決めつけない（計測点の外側がある）。
 - `health.jsonl` … 異常時は毎秒／状態変化・静かな市場(60秒)は即／正常時は30秒の生存行のみ。
 - `../market-status.json` … `process_ready` / `data_complete` / markets（`state: running` 等）。監視が参照。
@@ -83,18 +83,23 @@ systemd (agg-btc-receiver.service)
 2. 全テスト: `npm test`（fail 0 が条件）。集中確認は §2 の表のファイル指定で。
 3. commit → `git branch -f fix/<topic> HEAD && git push origin fix/<topic>`（公式記録は `master`）。
 4. `systemctl --user restart agg-btc-receiver`。
-5. **確認（この3点を見るまで「反映した」と言わない）**:
-   `systemctl --user is-active agg-btc-receiver` が `active`／`NRestarts` が増えていない／
-   `python3 -c "import json;d=json.load(open('data/market-status.json'));print(d['process_ready'],d['data_complete'])"`
-   が `True True`。
+5. **確認（4点すべてを見るまで「反映した」と言わない）**:
+   1. **変更が本番ツリーに入っているか**: `git -C ~/Tool/agg-btc-receiver log --oneline -1`
+      （対象コミット、またはその子孫であること。稼働確認だけでは反映の証明にならない）
+   2. `systemctl --user is-active agg-btc-receiver` が `active`
+   3. `systemctl --user show agg-btc-receiver -p NRestarts --value` が増えていない
+   4. 稼働の健全性（**絶対パスで**）:
+      `python3 -c "import json;d=json.load(open('/home/weed420/Tool/agg-btc-receiver/data/market-status.json'));print(d['process_ready'],d['data_complete'])"`
+      が `True True`（相対パスだとworktree側の別ファイルを読んでしまう）
 6. 失敗時の戻し: `git -C ~/Tool/agg-btc-receiver revert <sha>` → restart → 5 の確認。
 
 ## 6. 実際に踏んだ罠
 
 1. **`StallProbe.begin()` は `{ end() }` を返す**（コールバックではない）。戻り値を関数として呼ぶと
    `end is not a function` で**起動失敗ループ**（2026-09-23、約85秒停止）。`lib/ipc-flush.mjs` が正しい形。
-2. **テストが通っていない経路 = 本番で初めて動く経路**。`flushRawIpc` を集中テストが通らず、
-   上記バグは本番でしか出なかった。送信/書き込み経路を変えたら実経路のテストを足す。
+2. **この事例では**集中テストが `flushRawIpc` を通らなかったため、不具合が**本番で初めて顕在化**した
+   （「未テスト経路は必ず本番で初めて動く」と一般化はしない）。送信/書き込み経路を変えたら
+   実経路のテストを足す。
 3. **全suite一斉実行は負荷依存のflakeがある**（`test/burst-reducer/tfp-lock-integration.test.mjs` は
    分離実行で pass、並列の全suiteで落ちることがある）。まず分離実行で切り分ける。
 4. **ベンチは対象分岐を実際に通す**。fresh-dedupe の窓を「上限ちょうど」まで埋めたベンチは削除が
