@@ -91,10 +91,13 @@ systemd (agg-btc-receiver.service)
       `git log --oneline -1` では祖先関係も適用も確認できない（cherry-pick 後は元コミットの子孫とは限らない）。
    2. `systemctl --user is-active agg-btc-receiver` が `active`
    3. `systemctl --user show agg-btc-receiver -p NRestarts --value` が増えていない
-   4. 稼働の健全性（**絶対パスで**）:
-      `python3 -c "import json;d=json.load(open('/home/weed420/Tool/agg-btc-receiver/data/market-status.json'));print(d['process_ready'],d['data_complete'])"`
-      が `True True` で、**かつ `ts_ms` が現在時刻の120秒以内**（絶対パスでも、古い JSON を読むと
-      再起動前の状態を見て「正常」と誤判定する。相対パスはworktree側の別ファイルを読む）
+   4. 稼働の健全性（**絶対パス**、かつ**プロセス起動時刻より新しいこと**。実機で確認済み）:
+      ```
+      START_MS=$(date -d "$(systemctl --user show agg-btc-receiver -p ExecMainStartTimestamp --value)" +%s%3N)
+      python3 -c "import json;d=json.load(open('/home/weed420/Tool/agg-btc-receiver/data/market-status.json'));print(d['process_ready'],d['data_complete'],d['ts_ms']>${START_MS})"
+      ```
+      が `True True True`。**「120秒以内」では不十分**（再起動直前の JSON も通ってしまう）。相対パスは
+      worktree側の別ファイルを読み、古い JSON は再起動前の状態を「正常」と見せる（この誤読を実際にした）。
 6. 失敗時の戻し: `git -C ~/Tool/agg-btc-receiver revert <sha>` → restart → 5 の確認。
 
 ## 6. 実際に踏んだ罠
