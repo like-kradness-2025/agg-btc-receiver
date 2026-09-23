@@ -84,16 +84,17 @@ systemd (agg-btc-receiver.service)
 3. commit → `git branch -f fix/<topic> HEAD && git push origin fix/<topic>`（公式記録は `master`）。
 4. `systemctl --user restart agg-btc-receiver`。
 5. **確認（4点すべてを見るまで「反映した」と言わない）**:
-   1. **変更が本番ツリーの実体に入っているか**（履歴関係では判定しない）:
-      `git -C ~/Tool/agg-btc-receiver status --porcelain` が空（取り残しなし）**かつ**
-      変更した識別子が実コードにある（例: `grep -n '<変更した識別子>' /home/weed420/Tool/agg-btc-receiver/<file>`）。
-      `git log --oneline -1` だけでは祖先関係も適用も確認できない（cherry-pick 後は元コミットの
-      子孫とは限らない）。
+   1. **変更したファイルの実体が対象コミットと一致しているか**（履歴関係でも識別子の有無でも判定しない）:
+      `git -C ~/Tool/agg-btc-receiver diff <commit> -- <file>` が**空**（＝そのコミットの内容がそのまま
+      実体。識別子の存在では既存関数への修正適用を証明できない）。加えて
+      `git -C ~/Tool/agg-btc-receiver status --porcelain` が空（未コミットの取り残しなし）。
+      `git log --oneline -1` では祖先関係も適用も確認できない（cherry-pick 後は元コミットの子孫とは限らない）。
    2. `systemctl --user is-active agg-btc-receiver` が `active`
    3. `systemctl --user show agg-btc-receiver -p NRestarts --value` が増えていない
    4. 稼働の健全性（**絶対パスで**）:
       `python3 -c "import json;d=json.load(open('/home/weed420/Tool/agg-btc-receiver/data/market-status.json'));print(d['process_ready'],d['data_complete'])"`
-      が `True True`（相対パスだとworktree側の別ファイルを読んでしまう）
+      が `True True` で、**かつ `ts_ms` が現在時刻の120秒以内**（絶対パスでも、古い JSON を読むと
+      再起動前の状態を見て「正常」と誤判定する。相対パスはworktree側の別ファイルを読む）
 6. 失敗時の戻し: `git -C ~/Tool/agg-btc-receiver revert <sha>` → restart → 5 の確認。
 
 ## 6. 実際に踏んだ罠
