@@ -126,3 +126,63 @@
 - 未確認3件（Binance USD-M / Coinbase Exchange / Kraken の切断条件）は、
   ① 並行調査（codex luna）の結果と突合、② ブラウザ（CDP）でJS描画ページを読む、の両方で埋める。
 - 突合結果が揃ったら **Astra の最終監査**を受け、そのうえで実装（Byteb のアプリping／Bitfinex の info 対応など）に入る。
+
+## 7. 突合で確定した「完全対応に必要な項目」（2026-09-23 / 一次資料で検証済み）
+
+luna（codex gpt-6-luna, efflow high）の並行調査と私の調査を突合し、**食い違いは一次資料で決着**させた。
+以下はすべて公式文書の文言を確認済み。
+
+### 7-1. Bitfinex の info コード（検証済み・実装対象）
+公式 `docs.bitfinex.com/docs/ws-general` の Info Codes:
+- **20051**: Stop/Restart Websocket Server (please reconnect)
+- **20060**: Entering in Maintenance mode. Please pause any activity and resume after receiving the info
+  message **20061** (it should take 120 seconds at most)
+- **20061**: Maintenance ended. You can resume normal activity. **It is advised to unsubscribe/subscribe again
+  all channels.**
+→ 対応: **20051 で再接続 / 20060 で処理抑制 / 20061 で全チャンネル再購読**。
+  現状は `lib/bitfinex-connector.mjs:92` で `info` を**一律無視**している（＝未対応）。
+
+### 7-2. Binance の `serverShutdown`（検証済み・実装対象）
+公式 spot docs の General WSS information:
+- 「A **`serverShutdown`** event will be sent when the server is about to shutdown, resulting in disconnection.
+  **Please establish a new connection as soon as possible** to prevent interruption.」
+- 「When you receive a ping, **you must send a pong with a copy of ping's payload** as soon as possible.」
+  （`ws` の autoPong は payload をそのまま返す実装なので満たす。テストで担保する）
+→ 対応: **`serverShutdown` を受けたら自分から新規接続**（現状は未対応の見込み）。
+  24時間制限についても「24時間前に計画再接続」が推奨運用。
+
+### 7-3. Hyperliquid の 60秒ルール（検証済み・実装対象）
+公式 `.../websocket/timeouts-and-heartbeats`:
+- 「The server will close any connection if it hasn't sent a message to it in the last **60 seconds**.」
+- 「If you are subscribing to a channel that doesn't receive messages every 60 seconds, you can send
+  heartbeat messages... `{ "method": "ping" }` → `{ "channel": "pong" }`」
+→ 対応: **無送信が近づいたら JSON ping を送る**（現状は未対応）。
+
+### 7-4. Bybit のアプリ層 ping（検証済み・実装対象）
+公式 v5/ws/connect: ハートビートは **アプリ層** `{"op":"ping"}`。ping-pong もデータも無ければ **10分で切断**。
+→ 対応: **20秒周期で送信**（`lib/bitmex-connector.mjs:74` に同型の前例あり）。
+
+### 7-5. OKX のアイドル条件（検証済み・設計に反映）
+公式 docs-v5: 「data has not been pushed for more than **30 seconds**」でサーバーが切断。
+→ 対応: 受信ごとに更新するタイマーを持ち、**期限前にアプリ層 `ping`**。データ停滞の検知は30秒より短く。
+
+### 7-6. Coinbase Exchange（検証済み・実装対象）
+公式 `exchange/websocket-feed/overview`: 「**To receive feed messages, you must send a subscribe message or
+you are disconnected in 5 seconds.**」／`heartbeat` チャンネルあり／公式サンプルはクライアントpingを無効化。
+→ 対応: 購読は即時送信（実装済み）。**`heartbeat` チャンネルの要否は要検討**、seq/`last_trade_id` 監視を確認。
+
+### 7-7. Kraken（未確認を明示）
+v2 の ping/heartbeat は存在（アプリ層 `ping`→`pong`）。**サーバー側の無音切断条件は公式から確定できず**。
+v1 の仕様を v2 に流用しない（luna の指摘）。
+
+### 7-8. Bitstamp（一次資料は私の取得分で確定）
+サーバー心拍は無い（実測 2026-08-16）／購読 1024 上限（1025件目で silent close）／
+`bts:request_reconnect` を受ける仕様 → **受け取ったら再接続する必要がある**（実装の実効性を確認する）。
+
+## 8. 次に実装する（確定分のみ）
+1. Bitfinex: 20051/20060/20061 の分岐（再接続・抑制・再購読）
+2. Binance: `serverShutdown` の受信で新規接続（+ payload付きpongのテスト）
+3. Hyperliquid: 60秒対策の JSON ping
+4. Bybit: アプリ層 `{"op":"ping"}` 20秒周期
+5. OKX: アプリ層 `ping` + データ停滞検知
+6. Bitstamp: `bts:request_reconnect` の実効性確認
