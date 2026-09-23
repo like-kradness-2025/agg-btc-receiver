@@ -105,3 +105,24 @@
    周期が読めれば、**切られる前に張り直す**運用が可能か判断できる。
 3. 30秒無音クラスの生存確認（`no message for ... (pings=...)`）を取得して、venue別の閾値設計に進む。
 4. 変更をまとめたら **Astra の最終監査**（1回）。
+
+## 6. 全venue 対応表（2026-09-23 時点・調査進行中）
+
+「サーバーの挙動」「クライアントの義務」「切断/回復」「出典」を1行に集約。**未確認は未確認と書く**。
+
+| venue | サーバー ping/hb | クライアントの義務 | 切断・寿命 | 回復手段 | 出典 |
+|---|---|---|---|---|---|
+| Binance Spot | protocol ping **20秒毎** | 1分以内に pong（`ws` の autoPong が実施） | **24時間で切断**／受信5msg/秒超過で切断・IP BAN | 購読の再開＋RESTスナップショット | 公式 docs（web-socket-streams） |
+| Binance USD-M | **未確認**（新docsがJS描画） | 未確認 | 未確認（Spotと同種の可能性はあるが**転用しない**） | 未確認 | — |
+| Bybit v5 | protocol ping（応答必須）／アプリ層 heartbeat を送る仕様 | アプリ層 `{"op":"ping"}`（**未実装**） | ping-pong もデータも無ければ**10分で切断** | 再購読（ack確認が無い） | 公式 docs（v5/ws/connect） |
+| OKX v5 | アプリ層 ping（`ping`→`pong`） | ping を送る／**データが30秒 push されないとサーバーが切る** | 接続要求3req/秒（IP）、購読要求数に上限、接続数上限30/チャンネル | snapshot（`books`）+ seq 突合 | 公式 docs（docs-v5） |
+| Coinbase Exchange | **未確認** | 未確認 | 未確認 | 未確認 | — |
+| Kraken WS v2 | heartbeat チャンネル（データ無し）／サーバー側の切断条件は**未確認** | アプリ層 ping 可（`ping`→`pong`） | set heartbeat（自動解除）等 | snapshot + checksum | 公式 APIリファレンス |
+| Bitstamp | **サーバー心拍は無いと実測済み**（2026-08-16） | 自前 ping（実装済み） | 購読**1024上限**／1025件目で silent close／auth 60秒 | diff + snapshot の **microtimestamp** 突合／`event_id`/`pre_event_id`（**未使用**） | 公式 websocket v2 |
+| Bitfinex | **15秒毎に heartbeat** | 再購読・snapshot 取り込み（実装あり） | サーバーが**「Stop/Restart Websocket Server (please reconnect)」**を送る＝定期再起動 | 再購読＋snapshot（既存） | 公式 docs（ws-general） |
+| Hyperliquid | **未確認**（アプリ層 ping の要否） | 「切断を前提に graceful に再接続」 | 「**予告なく周期的に切断**」 | **再接続時の欠落は snapshot ack に入る**（ack は設計上無視している） | 公式 docs（websocket） |
+
+### 進め方（調査の残り）
+- 未確認3件（Binance USD-M / Coinbase Exchange / Kraken の切断条件）は、
+  ① 並行調査（codex luna）の結果と突合、② ブラウザ（CDP）でJS描画ページを読む、の両方で埋める。
+- 突合結果が揃ったら **Astra の最終監査**を受け、そのうえで実装（Byteb のアプリping／Bitfinex の info 対応など）に入る。
