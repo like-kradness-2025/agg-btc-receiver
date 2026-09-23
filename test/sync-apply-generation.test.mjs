@@ -39,6 +39,26 @@ test('失効が無ければ全件を到着順に適用し true を返す', () =>
   assert.deepEqual(c.applied, ['m1', 'm2']);
 });
 
+test('await 中に世代が進んだら running に戻さない (close と競合した同期を失効させる)', async () => {
+  const c = new TestConnector();
+  c.on('error', () => {});
+  c._wsGeneration = 7;
+  c._ringBuf = ['m1'];
+  c._fetchSnapshot = async () => { c._wsGeneration = 8; return { lastUpdateId: 1 }; };
+  await c._syncBook({ keepBuffer: true });
+  assert.deepEqual(c.applied, [], '失効した同期ではバッファを適用しない');
+  assert.notEqual(c._state, 'running', '古い世代の同期を成功扱いにしない');
+});
+
+test('失効が無ければ従来どおり running へ戻る', async () => {
+  const c = new TestConnector();
+  c._wsGeneration = 2;
+  c._ringBuf = ['m1'];
+  await c._syncBook({ keepBuffer: true });
+  assert.deepEqual(c.applied, ['m1']);
+  assert.equal(c._state, 'running');
+});
+
 test('同期成功の確定直前に失効していたら running に戻さない', async () => {
   const c = new TestConnector();
   c.on('error', () => {});
