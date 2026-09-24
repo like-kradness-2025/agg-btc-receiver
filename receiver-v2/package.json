@@ -1,0 +1,13 @@
+{
+  "name": "agg-receiver-v2",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "description": "Receiver v2: reception, organization and book update as three processes forming one structure. Zero-based implementation; the v1 receiver is reference only.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
