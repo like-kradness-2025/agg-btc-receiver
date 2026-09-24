@@ -167,4 +167,26 @@
 ### 15.4 これで閉じる範囲
 - §9-1（stage 境界）は「**冪等な派生 ＋ 単一 tx（跨ぐ場合は §15.1〜15.3 の印）**」として**定義完了** ✓
 
+## 16. WS仕様 完全対応マトリクス（設計が各venue仕様をどう扱うか）
+
+出典: `docs/current/ws-specs.md`（§7-8 は Astra 監査済み）。「未確認」は**推測で埋めない** ✓
+
+| venue | 接続寿命・計画再接続・保守通知 | keep-alive（送る側） | 無音/切断期限 | 購読 ack・上限 | 欠落回復 | 設計での扱い |
+|---|---|---|---|---|---|---|
+| Binance (spot/perp) | `serverShutdown` 受信で**新規接続を先行** ✓／24時間の扱いは未確認 | こちら(5s ping)／**payload付きpong** | 明示なし（こちら側の15秒pong途絶で判断 ✓） | 購読ackあり／上限未確認 | snapshot(seq)＋再購読 ✓ | **Receiver**: 保守通知は受信ループ外の制御として隔離 ✓ |
+| Bybit v5 | 明示なし | **アプリ層 `{"op":"ping"}` 20秒** ✓ | ping もデータも無ければ10分 | ack を購読単位で記録 ✓ | snapshot＋再購読 ✓ | Receiver ✓ |
+| OKX v5 | 切替予告（受信したら先行再接続）✓ | **アプリ ping 20秒** ✓＋生 `pong` は消費 ✓ | データ30秒で切断 | ack あり ✓ | snapshot＋再購読 ✓ | Receiver ✓ |
+| Coinbase | 明示なし | heartbeat チャンネル ✓ | 購読は**接続後5秒以内** ✓ | 購読上限（別途） | sequence 監視＋再購読 ✓ | Receiver ✓ |
+| Kraken | **サーバー切断条件が未確認** ✗（v1仕様を流用しない ✓） | こちら(5s ping) | 未確認 ✗ | ack あり ✓ | snapshot＋再購読 ✓ | Receiver（**未確認を前提に閾値を保守側へ** ✓） |
+| Bitstamp v2 | `bts:request_reconnect` で**再接続** ✓ | サーバー心拍なし（実測 ✓） | 実測ベース（15秒pong途絶 ✓） | 購読上限 1024 ✓ | 再購読＋REST ✓ | Receiver ✓ |
+| Bitfinex v2 | **20051=再接続／20060=保守(受信継続・復旧保留)／20061=全ch再購読** ✓ | こちら(5s ping) | 明示なし | info で制御 ✓ | **chanId 厳密化＋`_resyncRequested`** ✓ | Receiver ✓ |
+| Hyperliquid | 明示なし | **`{"method":"ping"}` 30秒** ✓ | サーバーから60秒送信が無ければ閉じる ✓ | ack あり ✓ | snapshot＋再購読 ✓ | Receiver ✓ |
+
+**設計上の帰結**:
+
+- **venue固有の差は Receiver 内に閉じ込める** ✓（Downstream は仕様差を知らない ✓＝役割分割 ✓）
+- **「未確認」は設計判断として残す** ✓（Kraken の切断条件・Binance の24時間など）→ 保守側の閾値＋計測で観測してから詰める ✓
+- **隔離対象（Step 1）** = 上記のうち**接続制御（保守通知・計画再接続・境界証明）** ✓ ／受信I/Oと raw 追記は触らない ✓
+
+
 
