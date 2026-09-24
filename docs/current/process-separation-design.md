@@ -202,3 +202,37 @@ spool は溢れ時の退避でしかなく、**受信が突然死した場合に
 - **整理だけが watermark・遅着・backfill を所有** ✓／**板は並び替えしない** ✓
 - **最小構成＝3プロセス＋共通管理** ✓（2プロセス／スレッドでは目標を満たさない ✗）
 - **最初の一歩＝本設計書の責務・引継ぎ契約の訂正**（＝ v6 ✓）
+
+## 18. 実装に必要な具体設計（**実装前の最後の詰め**）
+
+### 18.1 プロセス構成と共通管理
+- 実行単位: **`receiver-ingest` / `receiver-organize` / `receiver-book`** の3ユニット（systemd user unit）＋ 共通の監視役（既存の stall/health 機構を拡張 ✓）
+- 障害時の再起動: **各プロセス独立** ✓（依存の強制なし ✓＝受信は整理の ACK を待たないため受信が先でも成立 ✓）
+- 停止順: **受信 → 整理 → 板更新** ✓（受信を先に止めて末尾を確定させ、整理が全ACKを確認してから正常終了マーカーを書く ✓ §6.1.2）
+
+### 18.2 プロセス間の受け渡し（IPC）
+- **受信 → 整理**: **UNIX domain socket** に長さプレフィクス付きフレーム（canonical envelope のシリアライズ）✓／**バッチ単位**（既定 512 件 or 100ms ✓）
+- **整理 → 受信**: **非同期 ACK**（耐久化済み範囲 `receive_seq` の上限 ＋ 失敗/容量状態 ✓）
+- **受信 → 板更新**: **受信順のストリーム**（snapshot/diff も同経路 ✓）
+- **バックプレッシャ**: 送信側の有界キューが満杯 → **§6 のラダー**（メモリ → spool → 停止＋欠測記録 → 記録不能なら非ゼロ exit ✓）
+
+### 18.3 spool の具体
+- 形式: **追記専用セグメントファイル**（market ごと・既定 64MB/セグメント ✓）／内容は canonical envelope のシリアライズ（**受信時刻・接続ID・連番を保持** ✓）
+- 書き込み: `O_APPEND` ＋ **定期 fsync**（既定 1秒 ✓）／読み出しは**古いセグメントから順に**流して耐久化 ✓
+- 上限（既定）: **空き容量の5% か 2GB の小さい方** ✓（到達で §6-3 ✓）
+
+### 18.4 永続化テーブル（具体）
+- `pending_boundary(market, stream, boundary_seq, boundary_ts_ms, run_id, created_at_ms, state)` ← §5.3/§15（watermark 前進と**同一 tx** で INSERT ✓／fsync ✓）
+- `received_tail(connection_id, market, last_received_seq, last_recv_mono_ns, updated_at_ms)` ← §6.1.1（**1秒 or 1000件ごと**に更新 ✓／下限のみ ✓）
+- `run_marker(run_id, state, at_ms)` ← §6.1.2（起動時に旧世代を `invalidated` へ ✓／終了時に現世代を `complete` へ ✓）
+
+### 18.5 Step 1 の変更対象（具体）
+- `connectMarket()` の購読・接続制御は**受信**に残す ✓
+- **`_syncBook()` の呼び出しと同期境界の判定を「板更新」プロセスへ移す** ✓（受信は snapshot/diff を流すだけ ✓）
+- **世代判定・fail-closed 判定の所有者を「板更新」に一本化** ✓（§7.1 の4条件を維持 ✓）
+- 既存の永続化・cursor 経路は**触らない** ✓（Astra 条件 ✓）
+
+### 18.6 移行の単位とロールバック
+- 単一の環境変数で切替: **`RECEIVER_SPLIT_MODE = mono | split-book | split-organize | split-all`** ✓（既定 `mono` ＝現行 ✓）
+- 各モードは**旧経路を残したまま**切替可能 ✓（問題時は `mono` に戻すだけ ✓）
+
