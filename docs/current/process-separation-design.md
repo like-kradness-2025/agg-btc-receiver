@@ -173,7 +173,7 @@
 
 | venue | 接続寿命・計画再接続・保守通知 | keep-alive（送る側） | 無音/切断期限 | 購読 ack・上限 | 欠落回復 | 設計での扱い |
 |---|---|---|---|---|---|---|
-| **Binance Spot** | **24時間寿命**（公式確認済 ✓）／`serverShutdown` は **Spot の仕様** ✓ | こちら(5s ping)／**payload付きpong** ✓ | **pong は1分以内**（公式 ✓） | **1024 streams** ✓／購読ackあり ✓ | snapshot(seq)＋再購読 ✓ | Receiver ✓ |
+| **Binance Spot** | **24時間寿命**（公式確認済 ✓）／`serverShutdown` は **Spot の仕様** ✓ | こちら(5s ping)／**payload付きpong** ✓ | **pong は1分以内**（公式 ✓） | **1024 streams** ✓／**送信は5 msg/秒**（公式 ✓・購読/ping/pong を含む）／購読ackあり ✓ | snapshot(seq)＋再購読 ✓ | Receiver ✓ |
 | **Binance perp** | **`serverShutdown` を Spot と共通化する根拠なし** ✗（perp側は未確認 ✓） | こちら(5s ping) ✓ | 未確認 ✗ | 未確認 ✗ | snapshot(seq)＋再購読 ✓ | Receiver（未確認は保守側＋計測 ✓） |
 | Bybit v5 | 明示なし | **アプリ層 `{"op":"ping"}` 20秒** ✓ | ping もデータも無ければ10分 ✓ | ack を購読単位で記録 ✓ | 再購読＋snapshot（**trades の完全回復は未保証** ✗） | Receiver ✓ |
 | OKX v5 | 切替予告（受信したら先行再接続）✓ | **アプリ ping 20秒** ✓＋生 `pong` は消費 ✓ | データ30秒で切断 ✓ | ack あり ✓ | 再購読＋snapshot（**trades の完全回復は未保証** ✗） | Receiver ✓ |
@@ -189,6 +189,8 @@
 - **未確認は未確認のまま残す** ✓（Kraken の切断条件・Binance perp・Hyperliquid の snapshot ack など）✓
 - **ただし「保守側の閾値」だけでは完全対応の根拠にならない** ✗ → **確認済みの公式期限に基づいて閾値を決める** ✓（例: **Binance Spot は pong 1分以内** ✓ → こちらの15秒判定は公式より保守的 ✓）
 - **欠落回復は「再購読＋snapshot」で trades の完全回復を保証しない** ✗ → **回復不能な欠測は §6 に従い記録し fail-closed** ✓（`event_id`/`pre_event_id` 未使用も既知の穴として明記 ✓）
+- **送信レートの上限は設計要件** ✓: Binance Spot は **5 msg/秒**（購読・ping・pong を含む ✓）
+  → **「購読フレームを送らない」だけでは根拠として不十分** ✗ → **送信側に1秒窓のレート制限**を置き、再接続時の購読送信は**スロットルして送る** ✓（上限未確認の venue も保守側の既定値で同じ制限を通す ✓）
 - **隔離対象（Step 1）** = **接続制御（保守通知・計画再接続・境界証明）** ✓ ／受信I/Oと raw 追記は触らない ✓
 
 
