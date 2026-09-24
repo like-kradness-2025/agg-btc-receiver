@@ -91,3 +91,31 @@
 - **Astra**: 境界・不変条件・引継ぎ契約の妥当性（対象ファイル限定・effort low）
 - **luna**: 代替案との比較（3分割 vs 2分割 vs 現状維持）
 - 承認が出たら Step 1 から着手（承認後はオートで進行）
+
+## 11. 既存契約との突合（2026-09-24 実測・§9 の答え合わせ）
+
+設計を進める前に `docs/current/data-contract.md`（312行）と `canonical-pipeline.md` を読んだ。
+**提案している「3プロセス構造」は既に Tier として存在している**:
+
+- `canonical-pipeline.md` の **3-Tier 構成**: **Receiver**（`agg-btc-receiver.service`・market別 SQLite ✓）→ **Downstream**（`agg-btc-downstream-live.service`・stage別 SQLite `runtime/output-final/<stage>/<market>.sqlite` ✓）
+- Receiver は **raw SQLite のみ**を生成し、Parquet/DuckDB/JSONL は作らない ✓
+
+**引継ぎ契約は、少なくとも ingress と板同期境界については既に文書化・実装済み**:
+
+| 保証 | 現行の実装根拠 |
+|---|---|
+| 受信時刻の固定 | `recv_ts_ms` は socket message 境界で確定し **buffer/replay 後も不変**、worker は再採番しない ✓ |
+| 接続内の順序 | `recv_mono_ns`（monotonic・ナノ秒）が**同一コネクション内で厳密単調増加** ✓ |
+| 重複排除 | **append-safe**: `(connection_id, receive_seq)` が既存なら **skip**（既存行を UPDATE しない ✓）。REST等 `receive_seq=NULL` は常に追記 ✓ |
+| 板同期の境界 | **source time（microtimestamp）で証明**。証明できなければ **fail-closed**（`running` に遷移しない ✓ 3回失敗で `error` ✓） |
+| 再試行の不変条件 | 再試行中に buffer された diff は**失われず・二重適用もされない** ✓ |
+
+### §9 未確定事項の更新
+
+1. **受信側の板を消せるか → 消せないが「隔離」は可能** ✓
+   受信側の板が要る理由は、**接続時に同期境界を証明する**こと（snapshot + diff の fail-closed 判定 ✓）。
+   これは契約そのものなので削除不可 ✗ → **Step 1 の具体案は「境界証明を受信I/Oループから隔離」**（同一プロセス内の別worker／別スレッドでも成立 ✓ 契約は現行のまま維持 ✓）
+2. **有界メモリの条件 → 現行の期限粒度が基準**（同じバッチ内で最大10秒または16,384件 ✓ data-contract.md:44 ✓）
+3. **引継ぎ契約の現行保証範囲 → ingress と板同期境界は文書化済み** ✓
+   残るのは **stage 境界（watermark と派生の原子 commit）の表現方法** ✓ ← ここだけ設計を詰める
+
