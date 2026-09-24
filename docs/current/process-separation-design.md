@@ -173,20 +173,24 @@
 
 | venue | 接続寿命・計画再接続・保守通知 | keep-alive（送る側） | 無音/切断期限 | 購読 ack・上限 | 欠落回復 | 設計での扱い |
 |---|---|---|---|---|---|---|
-| Binance (spot/perp) | `serverShutdown` 受信で**新規接続を先行** ✓／24時間の扱いは未確認 | こちら(5s ping)／**payload付きpong** | 明示なし（こちら側の15秒pong途絶で判断 ✓） | 購読ackあり／上限未確認 | snapshot(seq)＋再購読 ✓ | **Receiver**: 保守通知は受信ループ外の制御として隔離 ✓ |
-| Bybit v5 | 明示なし | **アプリ層 `{"op":"ping"}` 20秒** ✓ | ping もデータも無ければ10分 | ack を購読単位で記録 ✓ | snapshot＋再購読 ✓ | Receiver ✓ |
-| OKX v5 | 切替予告（受信したら先行再接続）✓ | **アプリ ping 20秒** ✓＋生 `pong` は消費 ✓ | データ30秒で切断 | ack あり ✓ | snapshot＋再購読 ✓ | Receiver ✓ |
+| **Binance Spot** | **24時間寿命**（公式確認済 ✓）／`serverShutdown` は **Spot の仕様** ✓ | こちら(5s ping)／**payload付きpong** ✓ | **pong は1分以内**（公式 ✓） | **1024 streams** ✓／購読ackあり ✓ | snapshot(seq)＋再購読 ✓ | Receiver ✓ |
+| **Binance perp** | **`serverShutdown` を Spot と共通化する根拠なし** ✗（perp側は未確認 ✓） | こちら(5s ping) ✓ | 未確認 ✗ | 未確認 ✗ | snapshot(seq)＋再購読 ✓ | Receiver（未確認は保守側＋計測 ✓） |
+| Bybit v5 | 明示なし | **アプリ層 `{"op":"ping"}` 20秒** ✓ | ping もデータも無ければ10分 ✓ | ack を購読単位で記録 ✓ | 再購読＋snapshot（**trades の完全回復は未保証** ✗） | Receiver ✓ |
+| OKX v5 | 切替予告（受信したら先行再接続）✓ | **アプリ ping 20秒** ✓＋生 `pong` は消費 ✓ | データ30秒で切断 ✓ | ack あり ✓ | 再購読＋snapshot（**trades の完全回復は未保証** ✗） | Receiver ✓ |
 | Coinbase | 明示なし | heartbeat チャンネル ✓ | 購読は**接続後5秒以内** ✓ | 購読上限（別途） | sequence 監視＋再購読 ✓ | Receiver ✓ |
-| Kraken | **サーバー切断条件が未確認** ✗（v1仕様を流用しない ✓） | こちら(5s ping) | 未確認 ✗ | ack あり ✓ | snapshot＋再購読 ✓ | Receiver（**未確認を前提に閾値を保守側へ** ✓） |
-| Bitstamp v2 | `bts:request_reconnect` で**再接続** ✓ | サーバー心拍なし（実測 ✓） | 実測ベース（15秒pong途絶 ✓） | 購読上限 1024 ✓ | 再購読＋REST ✓ | Receiver ✓ |
+| Kraken | **サーバー切断条件が未確認** ✗（v1仕様を流用しない ✓） | こちら(5s ping) | 未確認 ✗ | ack あり ✓ | 再購読＋snapshot（**trades の完全回復は未保証** ✗） | Receiver（未確認は保守側＋計測 ✓） |
+| Bitstamp v2 | `bts:request_reconnect` で**再接続** ✓ | サーバー心拍なし（実測 ✓） | 実測ベース（15秒pong途絶 ✓） | 購読上限 **1024** ✓ | **`event_id`/`pre_event_id` は未使用** ✗ → 再購読＋snapshot だけでは **trades の欠落回復を保証できない** ✗ | Receiver ✓ |
 | Bitfinex v2 | **20051=再接続／20060=保守(受信継続・復旧保留)／20061=全ch再購読** ✓ | こちら(5s ping) | 明示なし | info で制御 ✓ | **chanId 厳密化＋`_resyncRequested`** ✓ | Receiver ✓ |
-| Hyperliquid | 明示なし | **`{"method":"ping"}` 30秒** ✓ | サーバーから60秒送信が無ければ閉じる ✓ | ack あり ✓ | snapshot＋再購読 ✓ | Receiver ✓ |
+| Hyperliquid | 明示なし | **`{"method":"ping"}` 30秒** ✓ | サーバーから60秒送信が無ければ閉じる ✓ | ack あり ✓ | **snapshot ack の扱いは要確認** ✗／再購読＋snapshot | Receiver ✓ |
 
-**設計上の帰結**:
+**設計上の帰結（Astra 指摘反映）**:
 
 - **venue固有の差は Receiver 内に閉じ込める** ✓（Downstream は仕様差を知らない ✓＝役割分割 ✓）
-- **「未確認」は設計判断として残す** ✓（Kraken の切断条件・Binance の24時間など）→ 保守側の閾値＋計測で観測してから詰める ✓
-- **隔離対象（Step 1）** = 上記のうち**接続制御（保守通知・計画再接続・境界証明）** ✓ ／受信I/Oと raw 追記は触らない ✓
+- **未確認は未確認のまま残す** ✓（Kraken の切断条件・Binance perp・Hyperliquid の snapshot ack など）✓
+- **ただし「保守側の閾値」だけでは完全対応の根拠にならない** ✗ → **確認済みの公式期限に基づいて閾値を決める** ✓（例: **Binance Spot は pong 1分以内** ✓ → こちらの15秒判定は公式より保守的 ✓）
+- **欠落回復は「再購読＋snapshot」で trades の完全回復を保証しない** ✗ → **回復不能な欠測は §6 に従い記録し fail-closed** ✓（`event_id`/`pre_event_id` 未使用も既知の穴として明記 ✓）
+- **隔離対象（Step 1）** = **接続制御（保守通知・計画再接続・境界証明）** ✓ ／受信I/Oと raw 追記は触らない ✓
+
 
 
 
