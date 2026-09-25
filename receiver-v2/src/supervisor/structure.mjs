@@ -1,0 +1,154 @@
+/**
+ * The structure: reception, organization and book update assembled into one thing that runs.
+ *
+ * Each role is its own module with its own contract, and this is the wiring that feeds them in the
+ * only order that is safe:
+ *
+ *   reception stamps a frame  ->  organization makes it durable and says what may be acknowledged
+ *      ->  the book applies it and keeps its position, or refuses it and waits for the hole
+ *
+ * Two things this wiring is responsible for, and they are the reason it is a module rather than a
+ * few lines in an entry point:
+ *
+ *  - the ladder. When the queue in front of organization is full, the frame goes to the spool rather
+ *    than being dropped, and if the spool is full too, reception stops and the gap is recorded. No
+ *    step of that decision belongs to a buffer.
+ *  - keeping the roles from lying to each other. The book's refusal to apply out of order ("waiting
+ *    for a sequence") is not swallowed: the frame is handed back to the book later, in order, by the
+ *    book itself, and the acknowledgement the book's caller sees is the organizer's, not a guess.
+ *
+ * The process split is a deployment matter: the same contracts run over sockets between three
+ * processes or, as here, in one for a test or a dry run against a replaying adapter.
+ */
+
+import { openBook } from '../book/state.mjs';
+import { openOrganizer } from '../organize/watermark.mjs';
+import { createSpool } from '../spool.mjs';
+import { createReceiveConnection } from '../ingest/connection.mjs';
+
+export function createStructure({
+  market,
+  stream = 'trades',
+  adapter,
+  durability,
+  webSocketImpl,
+  rawWriter,
+  spoolDir = null,
+  maxQueuedFrames = 5_000,
+  onAck = () => {},
+  onGap = () => {},
+  onStop = () => {},
+  ...receiveOptions
+}) {
+  if (!durability?.db) throw new TypeError('the structure needs the durability store');
+  if (typeof rawWriter !== 'function') throw new TypeError('the structure needs a raw writer');
+
+  const book = openBook({ market, stream, durability });
+  const spool = spoolDir ? createSpool({ dir: spoolDir }) : null;
+
+  // Backpressure is decided here rather than inside a buffer. In one process the roles are called
+  // synchronously, so the pressure shows up as the raw writer refusing: the frame then goes to the
+  // spool, and only if the spool cannot hold it either does reception stop. (Across processes the
+  // same decision is made when the channel reports a full queue.)
+  let stopped = false;
+  let spooledFrames = 0;
+  let refusedFrames = 0;
+
+  const organizer = openOrganizer({
+    market,
+    stream,
+    durability,
+    writeRaw: (envelope) => {
+      const written = rawWriter(envelope);
+      return written === true; // only a durable write may be acknowledged
+    },
+    capacity: () => (stopped ? 'stopped' : 'ok'),
+  });
+
+  function feed(envelope) {
+    if (stopped) {
+      // Reception is stopped, so anything still arriving is recorded as a hole rather than lost
+      // silently or applied out of order.
+      refusedFrames += 1;
+      onGap({ market, reason: 'reception stopped: nothing more can be held', seq: envelope.receive_seq });
+      return { accepted: false, reason: 'stopped' };
+    }
+    try {
+      const note = organizer.note(envelope);
+      if (note.ack) onAck(note.ack);
+      if (note.accepted === false) return note;
+
+      if (note.durable) {
+        const applied = book.apply({
+          envelope: { ...envelope, generation: envelope.generation },
+          changes: adapter.changesFor ? adapter.changesFor(envelope) : [],
+        });
+        // A refused apply is not an error: the book is holding it until its hole is filled, and it
+        // will apply it itself when that happens.
+        return { ...note, ...applied };
+      }
+
+      // The raw writer refused: the frame is spilled rather than dropped.
+      if (spool && spool.append(envelope) && !spool.failed) {
+        spooledFrames += 1;
+        return { ...note, spooled: true };
+      }
+      // Nothing could hold it. Reception stops and the gap is written down, which is the only honest
+      // outcome left: continuing would mean pretending the frame was handled.
+      stopped = true;
+      onGap({ market, reason: 'raw refused and the spool could not hold it', seq: envelope.receive_seq });
+      onStop({ market, reason: 'nothing could hold the frame' });
+      return { ...note, stopped: true };
+    } catch (error) {
+      // An exception anywhere in the path is not swallowed: reception stops and the caller hears
+      // about it, rather than the structure carrying on with a frame whose fate is unknown.
+      stopped = true;
+      onGap({ market, reason: `failure while handling a frame: ${error.message}`, seq: envelope.receive_seq });
+      onStop({ market, reason: error.message });
+      return { accepted: false, reason: 'failure', error };
+    }
+  }
+
+  const connection = createReceiveConnection({
+    adapter,
+    market,
+    webSocketImpl,
+    onEnvelope: feed,
+    ...receiveOptions,
+  });
+
+  return {
+    market,
+    stream,
+    book,
+    organizer,
+    connection,
+    spool,
+    start: () => connection.start(),
+    stop: () => {
+      connection.stop();
+      spool?.close();
+    },
+    /** A frame handed in directly, for a replay adapter or a dry run. */
+    feed,
+    applyHeld: () => {
+      // The book applies what it held as soon as a hole fills; this exposes that for a caller that
+      // wants to drive a replay rather than wait for the next arrival.
+      return book.openGaps();
+    },
+    get stats() {
+      return {
+        market,
+        generation: connection.generation,
+        state: connection.state,
+        subscriptionState: connection.subscriptionState,
+        receiveSeq: connection.receiveSeq,
+        applied: book.appliedBoundary.upToSeq,
+        gaps: book.openGaps().length,
+        spooledFrames,
+        refusedFrames,
+        stopped,
+      };
+    },
+  };
+}
