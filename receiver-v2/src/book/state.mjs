@@ -168,12 +168,15 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
   }
 
   function closeGaps(upTo) {
+    // C7: a hole belongs to the connection that opened it. Closing by sequence alone lets a new
+    // connection's numbering fill a hole a dead one left behind, which reads as "the missing data
+    // arrived" when nothing of the sort happened.
     durability.db
       .prepare(
         `UPDATE book_gap SET filled_at_ms = ?
-         WHERE market = ? AND stream = ? AND filled_at_ms IS NULL AND waiting_for <= ?`,
+         WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL AND waiting_for <= ?`,
       )
-      .run(nowMs(), market, stream, upTo);
+      .run(nowMs(), market, stream, applied.connectionId, upTo);
   }
 
   /**
