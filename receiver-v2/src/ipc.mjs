@@ -40,26 +40,61 @@ export const DEFAULT_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
  * arrives (a resend), and a duplicate is absorbed without moving it.
  */
 export function contiguousCeiling(state, envelope) {
-  const { connectionId, upToSeq } = state;
+  const { connectionId, firstSeq, upToSeq } = state;
   const seq = envelope.receive_seq;
   if (envelope.connection_id !== connectionId) return state;
+  // Before anything is acknowledged there is no baseline, and only the connection's first sequence
+  // may start one - starting anywhere else would acknowledge a range whose beginning was never seen.
+  if (upToSeq === null) {
+    if (seq < firstSeq) return state; // below this connection's range: not ours to track
+    if (seq > firstSeq) {
+      // Frames that arrived before the first one are remembered, not dropped: they are real
+      // positions, and forgetting them would stall the ceiling once the baseline opens.
+      if (state.outOfOrder.includes(seq)) return state;
+      return {
+        connectionId,
+        firstSeq,
+        upToSeq: null,
+        outOfOrder: [...state.outOfOrder, seq].sort((a, b) => a - b),
+      };
+    }
+    let next = seq;
+    let rest = state.outOfOrder;
+    while (rest.length > 0 && rest[0] === next + 1) {
+      next = rest[0];
+      rest = rest.slice(1);
+    }
+    return { connectionId, firstSeq, upToSeq: next, outOfOrder: rest };
+  }
   if (seq === upToSeq + 1) {
     let next = seq;
-    let head = 0;
-    while (head < state.outOfOrder.length && state.outOfOrder[head] === next + 1) {
-      next = state.outOfOrder[head];
-      head += 1;
+    let rest = state.outOfOrder;
+    while (rest.length > 0 && rest[0] === next + 1) {
+      next = rest[0];
+      rest = rest.slice(1);
     }
-    return { connectionId, upToSeq: next, outOfOrder: state.outOfOrder.slice(head) };
+    return { connectionId, firstSeq, upToSeq: next, outOfOrder: rest };
   }
-  if (seq <= upToSeq) return state; // a resend of something already covered: nothing changes.
-  const outOfOrder = [...state.outOfOrder, seq].sort((a, b) => a - b);
-  return { connectionId, upToSeq, outOfOrder };
+  if (seq <= upToSeq) return state; // already covered: a resend changes nothing.
+  // A repeat of a frame that is genuinely out of order must not be recorded twice: a stale copy
+  // would then sit in the list and block the release of everything after the hole.
+  if (state.outOfOrder.includes(seq)) return state;
+  return {
+    connectionId,
+    firstSeq,
+    upToSeq,
+    outOfOrder: [...state.outOfOrder, seq].sort((a, b) => a - b),
+  };
 }
 
-/** A fresh ceiling for a connection. Nothing is durable yet, so it acknowledges nothing. */
-export function newCeiling(connectionId) {
-  return { connectionId, upToSeq: 0, outOfOrder: [] };
+/**
+ * A fresh ceiling for a connection. upToSeq null means "nothing acknowledged yet", which is not the
+ * same as acknowledging 0: a connection whose first sequence is 1 has acknowledged nothing until a
+ * frame actually arrives, and treating 0 as a starting point would let the first durable frame
+ * acknowledge over a hole.
+ */
+export function newCeiling(connectionId, { firstSeq = 1 } = {}) {
+  return { connectionId, firstSeq, upToSeq: null, outOfOrder: [] };
 }
 
 function framePayload(tag, body) {
@@ -107,11 +142,29 @@ export function createChannel(socket, options = {}) {
     if (batch.length === 0 || closed) return;
     const payload = Buffer.concat(batch);
     batch = [];
+    bufferedBytes = Math.max(0, bufferedBytes - payload.length);
     const ok = socket.write(payload);
     if (!ok) socket.once('drain', () => {
       backpressured = false;
       onDrain();
     });
+  }
+
+  /**
+   * A stream whose framing is broken cannot be resynchronised, so the channel stops rather than
+   * continuing: the peer's next chunk is never reinterpreted as a boundary, and the caller
+   * reconnects. Anything already read from a desynchronised stream is not treated as data.
+   */
+  function fail(error) {
+    closed = true;
+    bufferedBytes = 0;
+    batch = [];
+    onError(error);
+    try {
+      socket.destroy();
+    } catch {
+      /* the socket may already be gone */
+    }
   }
 
   function scheduleBatch() {
@@ -130,18 +183,21 @@ export function createChannel(socket, options = {}) {
     // partial read is a state it can hold rather than an error. Without this the peer sees a tag
     // byte where it expects a length.
     const framed = frame(payload);
+    // Only our own outgoing bytes count. Incoming traffic must never make the queue look emptier
+    // than it is, and the bound is checked before anything is accepted - false means the caller
+    // keeps or spools this frame, it never means the frame was taken and dropped.
+    const wouldHold = bufferedBytes + framed.length + socket.writableLength;
+    if (wouldHold > maxBufferedBytes) {
+      if (!backpressured) {
+        backpressured = true;
+        onBackpressure({ bufferedBytes: wouldHold, maxBufferedBytes });
+      }
+      return false;
+    }
     batch.push(framed);
     bufferedBytes += framed.length;
     if (batch.length >= batchFrames) flushBatch();
     else scheduleBatch();
-    // The queue is reported, never absorbed: the caller decides whether to spool or stop.
-    if (bufferedBytes > maxBufferedBytes) {
-      if (!backpressured) {
-        backpressured = true;
-        onBackpressure({ bufferedBytes, maxBufferedBytes });
-      }
-      return false;
-    }
     return true;
   }
 
@@ -165,12 +221,12 @@ export function createChannel(socket, options = {}) {
     try {
       payloads = decoder.push(chunk);
     } catch (error) {
-      onError(error);
+      fail(error);
       return;
     }
     for (const payload of payloads) {
       if (payload.length < 1) {
-        onError(new TypeError('empty payload'));
+        fail(new TypeError('empty payload'));
         continue;
       }
       const tag = payload[0];
@@ -178,15 +234,13 @@ export function createChannel(socket, options = {}) {
       try {
         if (tag === TAG_ENVELOPE) onEnvelope(decodeEnvelope(body), payload);
         else if (tag === TAG_CONTROL) onControl(JSON.parse(body.toString('utf8')), payload);
-        else onError(new TypeError(`unknown tag ${tag}`));
+        else fail(new TypeError(`unknown tag ${tag}`));
       } catch (error) {
-        onError(error);
+        const protocol = error instanceof TypeError || error instanceof SyntaxError;
+        if (protocol) fail(error);
+        else onError(error);
       }
-    }
-    bufferedBytes = Math.max(0, bufferedBytes - chunk.length);
-    if (backpressured && bufferedBytes <= maxBufferedBytes && socket.writableLength === 0) {
-      backpressured = false;
-      onDrain();
+      if (closed) return;
     }
   });
 

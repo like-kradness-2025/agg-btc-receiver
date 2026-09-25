@@ -1,32 +1,24 @@
 /**
  * The raw envelope and the frame format that carry it between the three processes.
  *
- * This is the contract everything else is built on, so it is deliberately small and total: one
- * shape for every venue, one framing for every hop, and the receive metadata that the rest of the
- * structure trusts without ever re-deriving it.
+ * Contract (docs/spec-v2.md):
+ *  - recv_ts_ms     wall clock at the socket boundary, immutable; replay never changes it.
+ *  - recv_mono_ns   monotonic clock, strictly increasing within one connection; ordering inside a
+ *                   connection comes from this, never from the venue's own timestamps.
+ *  - connection_id / receive_seq   the dedupe key: a resend is a no-op, not a duplicate.
+ *  - raw            the bytes as received. The canonical record everything else is derived from.
  *
- * Design (docs/current/process-separation-design.md, receiver v2):
- *  - recv_ts_ms  - wall clock at the socket boundary. Immutable once written; replay never changes it.
- *  - recv_mono_ns - monotonic clock, strictly increasing within one connection. Ordering inside a
- *                  connection is decided from this, never from the venue's own timestamps.
- *  - connection_id / receive_seq - the dedupe key. A resend after a reconnect is absorbed by
- *                  (connection_id, receive_seq), which is how every retry path stays idempotent.
- *  - raw         - the bytes as received, unmodified. This is the canonical record; everything
- *                  downstream is derived and may be rebuilt from it.
- *
- * Nothing here reads a clock, opens a socket or touches a file: the caller stamps, this module
- * validates and encodes. That keeps it testable without a venue and without waiting.
+ * The canonical bytes are held privately and handed out as a copy, so nothing outside can edit what
+ * will be sent or stored. Framing is a uint32 length prefix; a reader holds a partial read and
+ * refuses a bad length before any of that frame's bytes are retained.
  */
 
-/** Frames larger than this are refused rather than buffered. A single venue message never needs more. */
 export const FRAME_MAX_BYTES = 8 * 1024 * 1024;
-
-/** Bytes of length prefix per frame (uint32, big endian). */
 export const FRAME_HEADER_BYTES = 4;
 
 const MAX_UINT32 = 0xffffffff;
+const EMPTY = Buffer.alloc(0);
 
-/** Fields every envelope must carry, in the order they are serialized. */
 const REQUIRED_FIELDS = Object.freeze([
   'market',
   'stream',
@@ -60,9 +52,9 @@ function assertSafePositiveInteger(value, name) {
 /**
  * Build one canonical envelope.
  *
- * The caller owns the clocks and the counters; this only refuses to build something the rest of the
- * structure could not trust. raw may be a string (already-decoded text) or a Buffer (bytes exactly
- * as received) - both are stored as-is.
+ * raw is copied into private storage and exposed through a getter that returns a fresh copy, so the
+ * canonical bytes cannot be edited after the fact by whoever holds the envelope. Callers that need
+ * the bytes pay for a copy; callers that only forward the envelope pay nothing.
  */
 export function makeEnvelope({
   market,
@@ -83,6 +75,7 @@ export function makeEnvelope({
   if (typeof raw !== 'string' && !Buffer.isBuffer(raw)) {
     throw new TypeError('raw must be a string or a Buffer');
   }
+  const rawBytes = Buffer.isBuffer(raw) ? Buffer.from(raw) : Buffer.from(raw, 'utf8');
   return Object.freeze({
     market,
     stream,
@@ -90,22 +83,22 @@ export function makeEnvelope({
     receive_seq: receiveSeq,
     recv_ts_ms: recvTsMs,
     recv_mono_ns: recvMonoNs,
-    raw: Buffer.isBuffer(raw) ? Buffer.from(raw) : Buffer.from(raw, 'utf8'),
+    get raw() {
+      return Buffer.from(rawBytes);
+    },
     ...(meta && typeof meta === 'object' ? { meta: Object.freeze({ ...meta }) } : {}),
   });
 }
 
-/** The dedupe key for a resend. Append-safe: writing the same key twice is a no-op, never a duplicate. */
+/** The dedupe key for a resend. Append-safe: writing the same key twice is a no-op. */
 export function dedupeKey(envelope) {
   return `${envelope.connection_id}:${envelope.receive_seq}`;
 }
 
 /**
- * True when two envelopes from the same connection are in receive order.
- *
- * Ordering is decided from recv_mono_ns (a monotonic clock within the connection), never from the
- * venue's own timestamps, which are only ever metadata. Equal nanoseconds are refused: two frames
- * cannot share one instant on one connection, and accepting that would hide a clock that stepped.
+ * True when two envelopes from the same connection are in receive order. Equal nanoseconds are
+ * refused: two frames cannot share one instant on one connection, and accepting that would hide a
+ * clock that stepped.
  */
 export function isAfter(previous, next) {
   if (!previous) return true;
@@ -124,12 +117,12 @@ export function encodeEnvelope(envelope) {
   const headerBytes = Buffer.from(JSON.stringify(header), 'utf8');
   const headerLength = Buffer.alloc(FRAME_HEADER_BYTES);
   headerLength.writeUInt32BE(headerBytes.length, 0);
-  return Buffer.concat([headerLength, headerBytes, Buffer.from(envelope.raw)]);
+  return Buffer.concat([headerLength, headerBytes, envelope.raw]);
 }
 
 /** Inverse of encodeEnvelope. Throws on anything malformed rather than guessing a default. */
 export function decodeEnvelope(frameBytes) {
-  if (!Buffer.isBuffer(frameBytes) || frameBytes.length < FRAME_HEADER_BYTES * 2) {
+  if (!Buffer.isBuffer(frameBytes) || frameBytes.length < FRAME_HEADER_BYTES + 2) {
     throw new TypeError('frame too short to contain a header');
   }
   const headerLength = frameBytes.readUInt32BE(0);
@@ -148,12 +141,7 @@ export function decodeEnvelope(frameBytes) {
   });
 }
 
-/**
- * Frame one payload for a stream socket: uint32 length prefix, then the payload.
- *
- * The prefix is what lets a reader take whole frames off a socket without knowing the venue, and it
- * is why a partial read is a state the reader can hold rather than an error.
- */
+/** Frame one payload for a stream socket: uint32 length prefix, then the payload. */
 export function frame(payload) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   if (body.length > FRAME_MAX_BYTES) {
@@ -167,35 +155,56 @@ export function frame(payload) {
 /**
  * Incremental frame decoder for a stream socket.
  *
- * push() returns every complete frame now available and keeps the remainder, so a message split
- * across two reads is normal, not an error. A frame larger than FRAME_MAX_BYTES is refused at the
- * prefix - before any of it is buffered - so a corrupt length cannot make the process grow.
+ * push() returns every complete frame now available and keeps the remainder. The declared length is
+ * checked before any of those bytes are retained: when nothing is buffered the check reads the
+ * prefix straight out of the arriving chunk, so an oversized or corrupt length costs no allocation.
+ * A length that disagrees with the stream desynchronises it, and the caller must reconnect rather
+ * than resynchronise - therefore nothing from that frame is kept and the reader is unusable after.
  */
 export function createFrameDecoder({ maxBytes = FRAME_MAX_BYTES } = {}) {
-  let pending = Buffer.alloc(0);
+  let pending = EMPTY;
+  let failed = null;
+
+  function fail(message) {
+    pending = EMPTY;
+    failed = new RangeError(message);
+    throw failed;
+  }
+
   return {
     push(chunk) {
-      pending = pending.length === 0 ? Buffer.from(chunk) : Buffer.concat([pending, chunk]);
+      if (failed) throw failed;
+      // Fast path: nothing buffered, so the prefix of the arriving chunk can be judged on its own,
+      // before it is copied anywhere.
+      if (pending.length === 0 && chunk.length >= FRAME_HEADER_BYTES) {
+        const declared = chunk.readUInt32BE(0);
+        if (declared > maxBytes) {
+          fail(`declared frame of ${declared} bytes exceeds the ${maxBytes} byte limit`);
+        }
+      }
+      const buf = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
       const frames = [];
       let offset = 0;
-      while (pending.length - offset >= FRAME_HEADER_BYTES) {
-        const length = pending.readUInt32BE(offset);
+      while (buf.length - offset >= FRAME_HEADER_BYTES) {
+        const length = buf.readUInt32BE(offset);
         if (length > maxBytes) {
-          // A declared length beyond the limit desynchronises the stream: there is no way to know
-          // where the next real boundary is, so nothing is kept and the caller must reconnect.
-          pending = Buffer.alloc(0);
-          throw new RangeError(`declared frame of ${length} bytes exceeds the ${maxBytes} byte limit`);
+          fail(`declared frame of ${length} bytes exceeds the ${maxBytes} byte limit`);
         }
-        if (pending.length - offset - FRAME_HEADER_BYTES < length) break;
+        if (buf.length - offset - FRAME_HEADER_BYTES < length) break;
         const start = offset + FRAME_HEADER_BYTES;
-        frames.push(pending.subarray(start, start + length));
+        frames.push(Buffer.from(buf.subarray(start, start + length)));
         offset = start + length;
       }
-      if (offset > 0) pending = pending.subarray(offset);
+      pending = offset === 0 ? buf : Buffer.from(buf.subarray(offset));
       return frames;
     },
     get bufferedBytes() {
       return pending.length;
     },
+    get failed() {
+      return failed !== null;
+    },
   };
 }
+
+
