@@ -187,8 +187,10 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       const nextSeq = applied.upToSeq + 1;
       if (!waiting.has(nextSeq)) break;
       const held = waiting.get(nextSeq);
-      waiting.delete(nextSeq);
       commitRange({ changes: held.changes, next: { ...applied, upToSeq: nextSeq } });
+      // Released only once it is durable: a failed write must leave the frame held so it can be
+      // applied later, not leave it dropped with no record of it ever having arrived.
+      waiting.delete(nextSeq);
       closeGaps(nextSeq);
       count += 1;
     }

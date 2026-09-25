@@ -101,6 +101,23 @@ test('the spool survives a restart with its segments and its cursor', async () =
   });
 });
 
+test('a write that throws is accounted for exactly like one that returns zero', async () => {
+  await withSpool(async (dir) => {
+    const fsModule = { ...fs };
+    let calls = 0;
+    fsModule.writeSync = (fd, buf, off, len) => {
+      calls += 1;
+      if (calls > 1) throw new Error('EIO: i/o error'); // the syscall itself fails
+      return fs.writeSync(fd, buf, off, Math.min(len, 2));
+    };
+    const spool = createSpool({ dir, fsModule });
+    assert.throws(() => spool.append(envelope(1)), /EIO/);
+    assert.notEqual(spool.failed, null, 'the spool still knows it holds a torn record');
+    assert.equal(spool.bytes, 2, 'and still counts only what reached the disk');
+    assert.equal(spool.append(envelope(2)), false, 'so nothing is appended after the tear');
+  });
+});
+
 test('a torn write is counted honestly, and the spool takes nothing more', async () => {
   await withSpool(async (dir) => {
     const fsModule = { ...fs };

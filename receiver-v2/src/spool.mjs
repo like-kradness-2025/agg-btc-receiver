@@ -152,22 +152,26 @@ export function createSpool(options = {}) {
     // written or the caller is told it did not fit; a partial tail is what the torn-tail rules are
     // for, and no bytes are counted as held until the record is actually on the disk.
     let written = 0;
-    while (written < record.length) {
-      const wrote = fsModule.writeSync(file, record, written, record.length - written);
-      if (!(wrote > 0)) {
-        // These bytes are on the disk and cannot be taken back, so they are counted and the spool is
-        // closed to further writes. Counting only what was written keeps the size honest, and
-        // refusing later writes keeps a torn record from being buried under fresh data.
-        if (written > 0) {
-          current.bytes += written;
-          bytes += written;
-          dirty = true;
+    try {
+      while (written < record.length) {
+        const wrote = fsModule.writeSync(file, record, written, record.length - written);
+        if (!(wrote > 0)) {
+          throw new Error(`spool write made no progress after ${written} of ${record.length} bytes`);
         }
-        failed = new Error(`spool write made no progress after ${written} of ${record.length} bytes`);
-        flush();
-        throw failed;
+        written += wrote;
       }
-      written += wrote;
+    } catch (error) {
+      // Whatever the failure looked like - a syscall returning zero or throwing - the same honest
+      // state has to be left behind: count the bytes that did reach the disk, close the spool to
+      // further writes so a torn record is not buried, and pass the failure on.
+      if (written > 0) {
+        current.bytes += written;
+        bytes += written;
+        dirty = true;
+      }
+      if (!failed) failed = error instanceof Error ? error : new Error(String(error));
+      flush();
+      throw failed;
     }
     current.bytes += record.length;
     bytes += record.length;
