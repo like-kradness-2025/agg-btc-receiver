@@ -106,6 +106,10 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
 
   let phase = SYNCING; // a fresh or reopened book proves its boundary before serving
   let lastRefusal = null;
+  // Frames that arrived ahead of a hole, kept rather than dropped: applying them now would move the
+  // position past data that has not arrived and make that data permanently unapplicable, but
+  // discarding them would mean the missing frame arrives and nothing else follows.
+  const waiting = new Map(); // receive_seq -> { envelope, changes }
 
   const boundaryStatement = durability.db.prepare(
     `INSERT OR REPLACE INTO applied_boundary (market, stream, connection_id, generation, up_to_receive_seq, updated_at_ms)
@@ -154,15 +158,53 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     applied = next;
   }
 
+  function recordGap(waitingFor, seenSeq) {
+    durability.db
+      .prepare(
+        `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(market, stream, applied.connectionId, waitingFor, seenSeq, nowMs());
+  }
+
+  function closeGaps(upTo) {
+    durability.db
+      .prepare(
+        `UPDATE book_gap SET filled_at_ms = ?
+         WHERE market = ? AND stream = ? AND filled_at_ms IS NULL AND waiting_for <= ?`,
+      )
+      .run(nowMs(), market, stream, upTo);
+  }
+
+  /**
+   * Apply whatever was held ahead of a hole, now that the hole is filled. In order, one transaction
+   * each, so a crash between them leaves the stored position at whatever was actually applied.
+   */
+  function drainWaiting() {
+    let count = 0;
+    for (;;) {
+      if (applied.upToSeq === null) break;
+      const nextSeq = applied.upToSeq + 1;
+      if (!waiting.has(nextSeq)) break;
+      const held = waiting.get(nextSeq);
+      waiting.delete(nextSeq);
+      commitRange({ changes: held.changes, next: { ...applied, upToSeq: nextSeq } });
+      closeGaps(nextSeq);
+      count += 1;
+    }
+    return count;
+  }
+
   return {
     market,
     stream,
     board,
 
     /** Which connection this book is willing to accept: only a strictly newer generation replaces. */
-    accept(connectionId, { generation = null } = {}) {
+    accept(connectionId, { generation = null, firstSeq = null } = {}) {
+      const withFirst = { generation, firstSeq };
       if (applied.connectionId === null) {
-        applied = { connectionId, generation, upToSeq: null };
+        applied = { connectionId, ...withFirst, upToSeq: null };
         phase = SYNCING;
         persistAcceptance();
         return { accepted: true, reason: 'first connection' };
@@ -170,8 +212,9 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       if (connectionId === applied.connectionId) return { accepted: true, reason: 'same connection' };
       const supersedes = typeof generation === 'number' && (applied.generation === null || generation > applied.generation);
       if (supersedes) {
-        applied = { connectionId, generation, upToSeq: null };
+        applied = { connectionId, ...withFirst, upToSeq: null };
         phase = SYNCING;
+        waiting.clear();
         persistAcceptance();
         return { accepted: true, reason: 'superseded by a newer generation' };
       }
@@ -213,36 +256,33 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       if (applied.upToSeq !== null && seq <= applied.upToSeq) {
         return { applied: false, reason: 'already applied' };
       }
-      if (applied.upToSeq !== null && seq !== applied.upToSeq + 1) {
-        // A hole: record it and wait. Applying this would move the position past data that has not
-        // arrived, and the resend of that data would then be refused as already applied.
-        durability.db
-          .prepare(
-            `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-          )
-          .run(market, stream, applied.connectionId, applied.upToSeq + 1, seq, nowMs());
+
+      const firstSeq = applied.firstSeq ?? envelope.first_seq ?? envelope.meta?.first_seq ?? null;
+      if (applied.upToSeq === null) {
+        if (firstSeq === null) {
+          // Nowhere to anchor the boundary. Starting at whatever arrived first would be guessing at
+          // where this connection's stream begins.
+          return { applied: false, reason: 'first sequence unknown' };
+        }
+        if (seq < firstSeq) return { applied: false, reason: 'below the first sequence' };
+        if (seq > firstSeq) {
+          // The first sequence never arrived. That hole is a fact, and this frame is kept until it
+          // is filled rather than dropped on the floor.
+          recordGap(firstSeq, seq);
+          waiting.set(seq, { envelope, changes });
+          return { applied: false, reason: 'waiting for the first sequence', waitingFor: firstSeq };
+        }
+      } else if (seq !== applied.upToSeq + 1) {
+        // A hole: record it, keep this frame, and let the position stay where the board really is.
+        recordGap(applied.upToSeq + 1, seq);
+        waiting.set(seq, { envelope, changes });
         return { applied: false, reason: 'gap before this sequence', waitingFor: applied.upToSeq + 1 };
-      }
-      if (applied.upToSeq === null && seq !== (envelope.first_seq ?? seq)) {
-        // The first sequence of this connection never arrived: that hole is a fact, not a licence to
-        // start somewhere in the middle.
-        durability.db
-          .prepare(
-            `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-          )
-          .run(market, stream, applied.connectionId, envelope.first_seq ?? seq, seq, nowMs());
-        return { applied: false, reason: 'waiting for the first sequence', waitingFor: envelope.first_seq ?? seq };
       }
 
       commitRange({ changes, next: { ...applied, connectionId: applied.connectionId, upToSeq: seq } });
-      durability.db
-        .prepare(
-          'UPDATE book_gap SET filled_at_ms = ? WHERE market = ? AND stream = ? AND filled_at_ms IS NULL AND waiting_for <= ?',
-        )
-        .run(nowMs(), market, stream, seq);
-      return { applied: true, reason: 'applied' };
+      closeGaps(seq);
+      const alsoApplied = drainWaiting();
+      return { applied: true, reason: 'applied', alsoApplied };
     },
 
     /** Holes this book is waiting for. Unfilled ones are what it cannot claim to have. */

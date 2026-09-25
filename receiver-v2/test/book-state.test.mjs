@@ -17,6 +17,8 @@ const envelope = (seq, connectionId = 'conn-1', extra = {}) =>
     recvTsMs: 1_792_000_000_000 + seq,
     recvMonoNs: 1_000_000 + seq,
     raw: `{"seq":${seq}}`,
+    meta: { first_seq: 1 }, // reception stamps the connection's first sequence; without it there is
+    // nothing to anchor the boundary, which the book refuses rather than guessing.
     ...extra,
   });
 
@@ -77,10 +79,31 @@ test('a frame with a hole before it is refused, and the hole is recorded', async
 
     const missing = book.apply({ envelope: envelope(2), changes: [change(2)] });
     assert.equal(missing.applied, true);
-    const now = book.apply({ envelope: envelope(3), changes: [change(3)] });
-    assert.equal(now.applied, true, 'the frame that arrived early is applied once the hole is filled');
+    assert.equal(missing.alsoApplied, 1, 'the frame that arrived early is applied with it');
     assert.equal(book.appliedBoundary.upToSeq, 3);
+    assert.equal(book.board.size('bid', 103), 3, 'and its change reached the board');
     assert.deepEqual(book.openGaps(), [], 'nothing is left waiting');
+    store.close();
+  });
+});
+
+test('without a first sequence there is nothing to anchor the boundary to', async () => {
+  await withBook(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    const bare = makeEnvelope({
+      market: 'kraken_spot',
+      stream: 'trades',
+      connectionId: 'conn-1',
+      receiveSeq: 7,
+      recvTsMs: 1_792_000_000_007,
+      recvMonoNs: 7,
+      raw: '{"seq":7}',
+    });
+    const refused = book.apply({ envelope: bare, changes: [change(7)] });
+    assert.equal(refused.applied, false, 'starting in the middle would be a guess, not a boundary');
+    assert.equal(refused.reason, 'first sequence unknown');
+    assert.equal(book.board.size('bid', 107), null, 'and nothing reached the board');
     store.close();
   });
 });
