@@ -79,7 +79,11 @@ export function createStructure({
       if (note.ack) onAck(note.ack);
       if (note.accepted === false) return note;
 
-      if (note.durable) {
+      // C8: raw durability and board application are separate questions with separate positions. A
+      // frame that is already durable may still be unapplied, so a resend is routed to the book rather
+      // than dropped here; the book's own (connection, sequence) dedupe makes a second application a
+      // no-op, which is what keeps this from becoming a double write.
+      if (note.durable || note.alreadyDurable) {
         const applied = book.apply({
           envelope: { ...envelope, generation: envelope.generation },
           changes: adapter.changesFor ? adapter.changesFor(envelope) : [],

@@ -136,7 +136,10 @@ export function openOrganizer({
 
       // Already durable: a resend after a reconnect. Nothing to write, nothing to acknowledge anew.
       if (upToSeq !== null && seq <= upToSeq) {
-        return { accepted: true, duplicate: true, reason: 'already durable', ack: null };
+        // "Already durable" is not "already applied". A crash between the raw write and the board
+        // leaves exactly this frame, and a resend is the only way it comes back - so the caller is told
+        // the raw is safe and the frame may still need routing onward.
+        return { accepted: true, duplicate: true, alreadyDurable: true, reason: 'already durable', ack: null };
       }
 
       const durable = writeRaw(envelope) === true;
@@ -147,7 +150,7 @@ export function openOrganizer({
 
       if (upToSeq === null) {
         if (seq < baselineSeq) {
-          return { accepted: true, duplicate: true, reason: 'below this connection\'s first sequence', ack: null };
+          return { accepted: true, duplicate: true, alreadyDurable: true, reason: 'below this connection\'s first sequence', ack: null };
         }
         if (seq > baselineSeq) {
           // The connection's first sequence never arrived: that hole is a fact worth keeping.
