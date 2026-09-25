@@ -55,12 +55,17 @@ test('a durable frame the board refused is held, reported once, and later applie
     structure.feed(envelope(1));
     assert.equal(gaps.length, 1, 'a resend of the same frame does not report it again');
 
-    // Once the book knows the connection, the held frame can be offered again and applies.
+    // Accepting the connection is enough: the held frame is offered again by the structure itself,
+    // without the caller having to remember to ask.
     structure.accept('conn-1');
-    const result = structure.redeliverPending();
-    assert.equal(result.redelivered, 1);
-    assert.equal(result.stillHeld, 0);
-    assert.equal(structure.book.appliedBoundary.upToSeq, 1, 'the frame that was waiting is on the board');
+    assert.equal(
+      structure.book.appliedBoundary.upToSeq,
+      1,
+      'the frame that was waiting is on the board as soon as the connection is accepted',
+    );
+    const after = structure.redeliverPending();
+    assert.equal(after.applied, 0, 'and there is nothing left waiting to be applied');
+    assert.equal(after.stillPending, 0);
 
     // A frame the book is holding on purpose is not a loss and must not be reported as one.
     structure.feed(envelope(3));

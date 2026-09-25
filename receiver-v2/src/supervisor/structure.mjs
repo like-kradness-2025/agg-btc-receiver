@@ -75,6 +75,10 @@ export function createStructure({
   // Frames that are durable in the raw and not on the board, keyed by connection and sequence. This is
   // the difference between the two positions, held so it can be repaired instead of merely reported.
   const unapplied = new Map();
+  // Frames whose connection is gone: durable in the raw, never going to be applied, kept as a record.
+  const skipped = [];
+
+  let structure_redeliver = () => {};
 
   function feed(envelope) {
     if (stopped) {
@@ -162,36 +166,68 @@ export function createStructure({
     ...receiveOptions,
   });
 
-  return {
+  const api = {
     market,
     /** Accept a connection explicitly. Frames from any other connection are refused by the book. */
-    accept: (connectionId, options = {}) => book.accept(connectionId, options),
+    accept: (connectionId, options = {}) => {
+      const accepted = book.accept(connectionId, options);
+      // The held frames were refused because the book did not know this connection. Now that it does,
+      // they are offered again without anyone having to remember to ask - a repair that depends on
+      // somebody calling it is a repair that does not happen.
+      if (accepted && accepted.accepted && unapplied.size > 0) {
+        structure_redeliver(connectionId);
+      }
+      return accepted;
+    },
     /**
      * Offer the held frames to the book again, oldest first. What was refused because the book did not
      * know the connection can be applied once it does; a frame the book still refuses stays held, so a
      * failed attempt costs nothing and the difference between the raw and the board remains visible.
      */
     redeliverPending: () => {
+      // Three answers, kept apart on purpose: what reached the board, what the board is holding until
+      // a hole is filled, and what will never apply because the connection it belongs to is gone. The
+      // previous version called the second one "redelivered" and threw the third one away, which is
+      // how a frame that never arrived gets counted as one that did.
       let appliedCount = 0;
+      let heldCount = 0;
+      let skippedCount = 0;
       const remaining = [];
+      const gone = [];
       for (const [key, entry] of unapplied) {
-        if (entry.envelope.connection_id !== book.appliedBoundary.connectionId) {
-          remaining.push([key, entry]);
+        const currentConnection = book.appliedBoundary.connectionId;
+        if (entry.envelope.connection_id !== currentConnection) {
+          // Its connection was replaced, so nothing will ever accept it. That is a permanent loss and
+          // it is recorded as one instead of being held for a delivery that cannot happen.
+          gone.push([key, entry]);
           continue;
         }
         const result = book.apply({
           envelope: entry.envelope,
           changes: adapter.changesFor ? adapter.changesFor(entry.envelope) : [],
         });
-        if (result.applied === true || (result.reason && HELD_BY_DESIGN.test(result.reason))) {
+        if (result.applied === true) {
           appliedCount += 1;
-        } else {
+        } else if (result.reason && HELD_BY_DESIGN.test(result.reason)) {
+          heldCount += 1;
           remaining.push([key, entry]);
+        } else {
+          const key2 = key;
+          remaining.push([key2, entry]);
         }
       }
       unapplied.clear();
       for (const [key, entry] of remaining) unapplied.set(key, entry);
-      return { redelivered: appliedCount, stillHeld: unapplied.size };
+      for (const [key, entry] of gone) {
+        skipped.push({ connectionId: entry.envelope.connection_id, seq: entry.envelope.receive_seq, reason: entry.reason });
+      }
+      if (gone.length > 0) {
+        for (const entry of skipped.slice(-gone.length)) {
+          onGap({ market, reason: `the connection this frame belonged to is gone: ${entry.reason}`, seq: entry.seq });
+        }
+      }
+      skippedCount = gone.length;
+      return { applied: appliedCount, held: heldCount, skipped: skippedCount, stillPending: unapplied.size };
     },
     stream,
     book,
@@ -225,4 +261,9 @@ export function createStructure({
       };
     },
   };
+
+  // The public redeliver, wired so accept() can use it without the caller arranging anything.
+  structure_redeliver = (connectionId) => api.redeliverPending(connectionId);
+
+  return api;
 }
