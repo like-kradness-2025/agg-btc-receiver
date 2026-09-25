@@ -1,21 +1,24 @@
 /**
  * The book: keep the board, and be able to prove where it stands.
  *
- * Two rules decide everything here.
+ * Three rules decide everything here, each of them a correction of a way this could quietly lose
+ * data while looking healthy.
  *
- * 1. The applied position is written in the same transaction as the state it describes. A record
- *    that ran ahead of the state would be worse than no record: a resend would be skipped as
- *    "already applied" while the board never received it. A record that lags is safe, because the
- *    resend is applied again - which is why applying a range must be idempotent, and why the test
- *    for that is as important as this comment.
+ * 1. The board is persisted in the same transaction as the position that describes it. A position
+ *    that is remembered while the board is only in memory is worse than no memory at all: after a
+ *    restart the board is empty and every resend up to that position is refused as already applied.
+ *    The levels and the position move together or not at all.
  *
- * 2. Nothing is trusted about a connection except what arrived with the data. Reception issues the
- *    connection generation; the book keeps whichever one it was told to accept and refuses anything
- *    from a superseded one. It does not invent a second opinion about which connection is current.
+ * 2. A range applies contiguously. A frame whose predecessors have not arrived is not applied and
+ *    does not move the position - otherwise the missing data is refused later as "already applied",
+ *    which is the one way a gap can become permanent. The hole is recorded and waited for.
  *
- * The sync state is fail-closed by construction: a book is not running until a boundary has been
- * proven, and any doubt - a connection change, a failed proof - puts it back to syncing rather than
- * letting it serve a board it cannot vouch for.
+ * 3. Signals that only make sense once the boundary is proven do not come from applying data. A book
+ *    serves because its snapshot was checked against the stream, not because frames kept arriving.
+ *    Any doubt puts it back to syncing, and only an explicit, successful proof puts it back.
+ *
+ * Trust about connections is not decided here either. Reception issues the generation; this module
+ * keeps the highest one it has been shown and accepts nothing that is not strictly newer.
  */
 
 const SYNCING = 'syncing';
@@ -26,16 +29,32 @@ CREATE TABLE IF NOT EXISTS applied_boundary (
   market TEXT NOT NULL,
   stream TEXT NOT NULL,
   connection_id TEXT NOT NULL,
+  generation INTEGER,
   up_to_receive_seq INTEGER,
   updated_at_ms INTEGER NOT NULL,
   PRIMARY KEY (market, stream)
 );
+CREATE TABLE IF NOT EXISTS book_level (
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  side TEXT NOT NULL,
+  price REAL NOT NULL,
+  size REAL NOT NULL,
+  PRIMARY KEY (market, stream, side, price)
+);
+CREATE TABLE IF NOT EXISTS book_gap (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
+  waiting_for INTEGER NOT NULL,
+  seen_seq INTEGER NOT NULL,
+  detected_at_ms INTEGER NOT NULL,
+  filled_at_ms INTEGER
+);
 `;
 
-/**
- * Read-only view of a board: the levels this process currently believes in. Kept deliberately thin -
- * what matters for the contract is the position, not the shape of the book.
- */
+/** Read-only view of a board: the levels this process currently believes in. */
 export function createBoard() {
   const levels = new Map(); // `${side}:${price}` -> size
   return {
@@ -44,17 +63,21 @@ export function createBoard() {
       if (size === 0) levels.delete(key);
       else levels.set(key, size);
     },
+    restore(rows) {
+      levels.clear();
+      for (const row of rows) levels.set(`${row.side}:${row.price}`, row.size);
+    },
     size(side, price) {
       return levels.get(`${side}:${price}`) ?? null;
     },
-    get depth() {
-      return levels.size;
-    },
-    snapshot() {
+    rows() {
       return [...levels.entries()].map(([key, size]) => {
         const [side, price] = key.split(':');
-        return { side, price, size };
+        return { side, price: Number(price), size };
       });
+    },
+    get depth() {
+      return levels.size;
     },
   };
 }
@@ -66,34 +89,58 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
   durability.db.exec(BOOK_SCHEMA);
   const board = createBoard();
 
-  const row = durability.db
-    .prepare('SELECT connection_id, up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?')
-    .get(market, stream);
-  // The position comes back from the store, not from the caller's memory: a restart resumes where the
-  // board actually is, which is the only value that keeps a resend from skipping applied data.
-  let applied = row
-    ? { connectionId: row.connection_id, upToSeq: row.up_to_receive_seq ?? null }
-    : { connectionId: null, upToSeq: null };
+  // The board comes back from the store, not from a caller's memory, and it comes back together with
+  // the position it was written with.
+  board.restore(
+    durability.db
+      .prepare('SELECT side, price, size FROM book_level WHERE market = ? AND stream = ?')
+      .all(market, stream),
+  );
 
-  let phase = applied.connectionId === null ? SYNCING : SYNCING; // a reopened book still proves first
+  const row = durability.db
+    .prepare('SELECT connection_id, generation, up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?')
+    .get(market, stream);
+  let applied = row
+    ? { connectionId: row.connection_id, generation: row.generation ?? null, upToSeq: row.up_to_receive_seq ?? null }
+    : { connectionId: null, generation: null, upToSeq: null };
+
+  let phase = SYNCING; // a fresh or reopened book proves its boundary before serving
   let lastRefusal = null;
 
-  function persistBoundaryInTransaction(next, stateChange) {
+  const boundaryStatement = durability.db.prepare(
+    `INSERT OR REPLACE INTO applied_boundary (market, stream, connection_id, generation, up_to_receive_seq, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const levelUpsert = durability.db.prepare(
+    `INSERT OR REPLACE INTO book_level (market, stream, side, price, size) VALUES (?, ?, ?, ?, ?)`,
+  );
+  const levelDelete = durability.db.prepare(
+    'DELETE FROM book_level WHERE market = ? AND stream = ? AND side = ? AND price = ?',
+  );
+
+  /** Everything that makes one range durable: the levels and the position, in one transaction. */
+  function commitRange({ changes, next }) {
     durability.db.exec('BEGIN IMMEDIATE');
     try {
-      stateChange();
-      durability.db
-        .prepare(
-          `INSERT OR REPLACE INTO applied_boundary
-             (market, stream, connection_id, up_to_receive_seq, updated_at_ms)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(market, stream, next.connectionId, next.upToSeq, nowMs());
+      for (const change of changes) {
+        if (change.size === 0) levelDelete.run(market, stream, change.side, change.price);
+        else levelUpsert.run(market, stream, change.side, change.price, change.size);
+      }
+      boundaryStatement.run(
+        market,
+        stream,
+        next.connectionId,
+        next.generation,
+        next.upToSeq,
+        nowMs(),
+      );
       durability.db.exec('COMMIT');
     } catch (error) {
       durability.db.exec('ROLLBACK');
       throw error;
     }
+    // Only after the commit does the in-memory board follow the store.
+    for (const change of changes) board.apply(change);
     applied = next;
   }
 
@@ -102,54 +149,50 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     stream,
     board,
 
-    /** Which connection this book is willing to accept. Set from what the data carries, once. */
+    /** Which connection this book is willing to accept: only a strictly newer generation replaces. */
     accept(connectionId, { generation = null } = {}) {
       if (applied.connectionId === null) {
-        applied = { connectionId, upToSeq: null };
+        applied = { connectionId, generation, upToSeq: null };
         phase = SYNCING;
         return { accepted: true, reason: 'first connection' };
       }
       if (connectionId === applied.connectionId) return { accepted: true, reason: 'same connection' };
-      // A newer generation supersedes the old one; anything else is stale and is refused by name.
-      const isNewer = generation !== null && generation > 0;
-      if (isNewer) {
-        applied = { connectionId, upToSeq: null };
+      const supersedes = typeof generation === 'number' && (applied.generation === null || generation > applied.generation);
+      if (supersedes) {
+        applied = { connectionId, generation, upToSeq: null };
         phase = SYNCING;
         return { accepted: true, reason: 'superseded by a newer generation' };
       }
-      lastRefusal = { connectionId, atMs: nowMs(), reason: 'superseded connection' };
+      lastRefusal = { connectionId, generation, atMs: nowMs(), reason: 'superseded connection' };
       return { accepted: false, reason: 'superseded connection' };
     },
 
     get lastRefusal() {
       return lastRefusal ? { ...lastRefusal } : null;
     },
-
     get phase() {
       return phase;
     },
-
     get isRunning() {
       return phase === RUNNING;
     },
-
     get appliedBoundary() {
       return { ...applied };
     },
 
-    /** Where a resend should start. Null until the first connection has been accepted. */
     resumeFrom() {
       if (applied.connectionId === null) return null;
       return { connectionId: applied.connectionId, upToSeq: applied.upToSeq };
     },
 
     /**
-     * Apply one envelope from the ordered stream.
+     * Apply one envelope together with the level changes it carries.
      *
-     * Returns { applied: boolean, reason } and never throws for a duplicate: a resend that is already
-     * covered is a no-op, which is what makes every retry path safe to repeat.
+     * Contiguous only: a frame whose predecessors are missing is refused and the hole is recorded,
+     * because applying it would make the missing data permanently unapplicable. Duplicates are
+     * no-ops. Applying data never changes the phase - only a proven boundary does.
      */
-    apply(envelope, applyFn = () => board.apply(envelope.parsed ?? {})) {
+    apply({ envelope, changes = [] }) {
       if (envelope.connection_id !== applied.connectionId) {
         const accepted = this.accept(envelope.connection_id, { generation: envelope.generation ?? null });
         if (!accepted.accepted) return { applied: false, reason: accepted.reason };
@@ -158,10 +201,51 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       if (applied.upToSeq !== null && seq <= applied.upToSeq) {
         return { applied: false, reason: 'already applied' };
       }
-      persistBoundaryInTransaction({ connectionId: applied.connectionId, upToSeq: seq }, () => applyFn());
-      // A boundary was proven with this range, so the book may serve again.
-      phase = RUNNING;
+      if (applied.upToSeq !== null && seq !== applied.upToSeq + 1) {
+        // A hole: record it and wait. Applying this would move the position past data that has not
+        // arrived, and the resend of that data would then be refused as already applied.
+        durability.db
+          .prepare(
+            `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(market, stream, applied.connectionId, applied.upToSeq + 1, seq, nowMs());
+        return { applied: false, reason: 'gap before this sequence', waitingFor: applied.upToSeq + 1 };
+      }
+      if (applied.upToSeq === null && seq !== (envelope.first_seq ?? seq)) {
+        // The first sequence of this connection never arrived: that hole is a fact, not a licence to
+        // start somewhere in the middle.
+        durability.db
+          .prepare(
+            `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(market, stream, applied.connectionId, envelope.first_seq ?? seq, seq, nowMs());
+        return { applied: false, reason: 'waiting for the first sequence', waitingFor: envelope.first_seq ?? seq };
+      }
+
+      commitRange({ changes, next: { ...applied, connectionId: applied.connectionId, upToSeq: seq } });
+      durability.db
+        .prepare(
+          'UPDATE book_gap SET filled_at_ms = ? WHERE market = ? AND stream = ? AND filled_at_ms IS NULL AND waiting_for <= ?',
+        )
+        .run(nowMs(), market, stream, seq);
       return { applied: true, reason: 'applied' };
+    },
+
+    /** Holes this book is waiting for. Unfilled ones are what it cannot claim to have. */
+    openGaps() {
+      return durability.db
+        .prepare(
+          `SELECT waiting_for, seen_seq, detected_at_ms FROM book_gap
+           WHERE market = ? AND stream = ? AND filled_at_ms IS NULL ORDER BY waiting_for`,
+        )
+        .all(market, stream)
+        .map((row) => ({
+          waitingFor: row.waiting_for,
+          seenSeq: row.seen_seq,
+          detectedAtMs: row.detected_at_ms,
+        }));
     },
 
     /** A sync is starting: the board is not to be trusted until its boundary is proven. */
@@ -170,8 +254,8 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     },
 
     /**
-     * The snapshot has been checked against the stream. Until this is called the book stays syncing,
-     * which is the fail-closed default: no boundary, no service.
+     * The snapshot has been checked against the stream. Only this puts the book back in service; a
+     * fresh book has proven nothing, and reaching this with no connection accepted is not possible.
      */
     proveBoundary() {
       if (applied.connectionId === null) return { proven: false, reason: 'no connection accepted yet' };

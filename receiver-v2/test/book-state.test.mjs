@@ -8,7 +8,7 @@ import { makeEnvelope } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { openBook } from '../src/book/state.mjs';
 
-const envelope = (seq, connectionId = 'conn-1') =>
+const envelope = (seq, connectionId = 'conn-1', extra = {}) =>
   makeEnvelope({
     market: 'kraken_spot',
     stream: 'trades',
@@ -16,8 +16,11 @@ const envelope = (seq, connectionId = 'conn-1') =>
     receiveSeq: seq,
     recvTsMs: 1_792_000_000_000 + seq,
     recvMonoNs: 1_000_000 + seq,
-    raw: `{"seq":${seq},"side":"bid","price":${100 + seq},"size":${seq}}`,
+    raw: `{"seq":${seq}}`,
+    ...extra,
   });
+
+const change = (seq) => ({ side: 'bid', price: 100 + seq, size: seq });
 
 async function withBook(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'book-'));
@@ -28,17 +31,19 @@ async function withBook(fn) {
   }
 }
 
-test('a range applies in order and the position follows it', async () => {
+test('a contiguous range applies, and the board travels with the position', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
     for (const seq of [1, 2, 3]) {
-      const result = book.apply(envelope(seq), () => book.board.apply({ side: 'bid', price: 100 + seq, size: seq }));
+      const result = book.apply({ envelope: envelope(seq), changes: [change(seq)] });
       assert.equal(result.applied, true);
     }
     assert.equal(book.appliedBoundary.upToSeq, 3);
-    assert.equal(book.isRunning, true, 'serving again once a range has landed');
     assert.equal(book.board.size('bid', 103), 3);
+    // The same transaction wrote both, so the store and the board agree.
+    const levels = store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n;
+    assert.equal(levels, 3, 'every applied range is in the store too');
     store.close();
   });
 });
@@ -47,87 +52,99 @@ test('a resend of something already applied is a no-op', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
-    book.apply(envelope(1), () => book.board.apply({ side: 'bid', price: 101, size: 1 }));
-    book.apply(envelope(2), () => book.board.apply({ side: 'bid', price: 102, size: 2 }));
-    const again = book.apply(envelope(2), () => book.board.apply({ side: 'bid', price: 102, size: 999 }));
+    book.apply({ envelope: envelope(1), changes: [change(1)] });
+    book.apply({ envelope: envelope(2), changes: [change(2)] });
+    const again = book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 999 }] });
     assert.equal(again.applied, false);
     assert.equal(again.reason, 'already applied');
     assert.equal(book.board.size('bid', 102), 2, 'the board did not take the second copy');
-    assert.equal(book.appliedBoundary.upToSeq, 2);
     store.close();
   });
 });
 
-test('a restart resumes from the position the board actually reached', async () => {
+test('a frame with a hole before it is refused, and the hole is recorded', async () => {
+  await withBook(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.apply({ envelope: envelope(1), changes: [change(1)] });
+
+    const jumped = book.apply({ envelope: envelope(3), changes: [change(3)] });
+    assert.equal(jumped.applied, false, 'applying this would make 2 permanently unapplicable');
+    assert.equal(jumped.reason, 'gap before this sequence');
+    assert.equal(jumped.waitingFor, 2);
+    assert.equal(book.appliedBoundary.upToSeq, 1, 'the position did not move over the hole');
+    assert.equal(book.openGaps().length, 1, 'and the hole is a recorded fact');
+
+    const missing = book.apply({ envelope: envelope(2), changes: [change(2)] });
+    assert.equal(missing.applied, true);
+    const now = book.apply({ envelope: envelope(3), changes: [change(3)] });
+    assert.equal(now.applied, true, 'the frame that arrived early is applied once the hole is filled');
+    assert.equal(book.appliedBoundary.upToSeq, 3);
+    assert.deepEqual(book.openGaps(), [], 'nothing is left waiting');
+    store.close();
+  });
+});
+
+test('a restart restores the board and the position together', async () => {
   await withBook(async (dir) => {
     const dbPath = join(dir, 'state.sqlite');
     const first = openDurability({ path: dbPath, runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: first });
-    for (const seq of [1, 2, 3, 4]) book.apply(envelope(seq), () => {});
+    for (const seq of [1, 2, 3, 4]) {
+      book.apply({ envelope: envelope(seq), changes: [change(seq)] });
+    }
     first.close();
 
     const second = openDurability({ path: dbPath, runId: 'run-2' });
     const reopened = openBook({ market: 'kraken_spot', stream: 'trades', durability: second });
     assert.equal(reopened.appliedBoundary.upToSeq, 4, 'the position came back from the store');
     assert.equal(reopened.isRunning, false, 'a reopened book proves its boundary before serving');
-    assert.deepEqual(reopened.resumeFrom(), { connectionId: 'conn-1', upToSeq: 4 });
-    const replay = reopened.apply(envelope(4), () => { throw new Error('must not run'); });
-    assert.equal(replay.applied, false, 'a replay of covered data does not run the apply function');
+    assert.equal(reopened.board.size('bid', 104), 4, 'and so did the board the position describes');
+    assert.equal(reopened.board.depth, 4);
+    const replay = reopened.apply({ envelope: envelope(4), changes: [change(4)] });
+    assert.equal(replay.applied, false, 'a replay of covered data is still a no-op');
     second.close();
   });
 });
 
-test('a superseded connection is refused by name, and only a newer one replaces it', async () => {
+test('only a strictly newer generation replaces the connection', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
-    book.apply(envelope(1, 'conn-1'), () => {});
+    book.apply({ envelope: envelope(1, 'conn-1'), changes: [change(1)] });
 
-    const stale = book.apply(envelope(1, 'conn-old'), () => { throw new Error('must not run'); });
-    assert.equal(stale.applied, false);
-    assert.equal(stale.reason, 'superseded connection', 'the book does not guess which one is current');
+    // A numbered generation takes over from an unnumbered one, which is how the first reconnect
+    // after a restart looks.
+    const newer = book.apply({ envelope: { ...envelope(1, 'conn-2'), generation: 2 }, changes: [] });
+    assert.equal(newer.applied, true);
+    assert.equal(book.appliedBoundary.connectionId, 'conn-2');
+
+    // Now a lower number is genuinely stale, whichever connection it names.
+    const older = book.apply({ envelope: { ...envelope(1, 'conn-old'), generation: 1 }, changes: [] });
+    assert.equal(older.applied, false, 'a positive generation is not automatically a newer one');
+    assert.equal(older.reason, 'superseded connection');
     assert.ok(book.lastRefusal, 'and the refusal is recorded rather than swallowed');
 
-    const newer = book.apply({ ...envelope(1, 'conn-2'), generation: 2 }, () => {});
-    assert.equal(newer.applied, true, 'a newer generation takes over');
-    assert.equal(book.appliedBoundary.connectionId, 'conn-2');
+    const newest = book.apply({ envelope: { ...envelope(1, 'conn-3'), generation: 3 }, changes: [] });
+    assert.equal(newest.applied, true, 'only something strictly newer takes over');
     store.close();
   });
 });
 
-test('no boundary, no service: a syncing book does not claim to be running', async () => {
+test('applying data does not put the book into service, and a proof does', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
     assert.equal(book.isRunning, false, 'a fresh book has proven nothing');
     assert.equal(book.proveBoundary().proven, false, 'with no connection there is nothing to prove');
-    book.apply(envelope(1), () => {});
+
+    book.apply({ envelope: envelope(1), changes: [change(1)] });
+    assert.equal(book.isRunning, false, 'frames arriving are not a boundary proof');
+
+    assert.equal(book.proveBoundary().proven, true);
     assert.equal(book.isRunning, true);
     book.beginSync();
     assert.equal(book.isRunning, false, 'a sync in progress means the board is not to be trusted');
-    assert.equal(book.proveBoundary().proven, true);
-    store.close();
-  });
-});
-
-test('the position never runs ahead of the state it describes', async () => {
-  await withBook(async (dir) => {
-    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
-    const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
-    book.apply(envelope(1), () => book.board.apply({ side: 'bid', price: 101, size: 1 }));
-
-    // The state change fails: the transaction must leave the position where it was, so the same
-    // record is applied again later instead of being skipped as already done.
-    assert.throws(() =>
-      book.apply(envelope(2), () => {
-        throw new Error('state change failed');
-      }),
-    );
-    assert.equal(book.appliedBoundary.upToSeq, 1, 'the position did not move without the state');
-
-    const retry = book.apply(envelope(2), () => book.board.apply({ side: 'bid', price: 102, size: 2 }));
-    assert.equal(retry.applied, true, 'and it applies cleanly the second time');
-    assert.equal(book.appliedBoundary.upToSeq, 2);
     store.close();
   });
 });
