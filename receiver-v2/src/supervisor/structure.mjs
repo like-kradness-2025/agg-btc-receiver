@@ -66,10 +66,20 @@ export function createStructure({
     capacity: () => (stopped ? 'stopped' : 'ok'),
   });
 
-  // Apply-refusals that are the book holding a frame on purpose rather than losing it. Matched by
-  // shape rather than by one exact sentence: the previous version listed a phrase the book never used,
-  // so a frame the book was deliberately holding was reported as a loss.
-  const HELD_BY_DESIGN = /already applied|gap before this sequence|first sequence/i;
+  // The board's own vocabulary, by exact name - taken from the board, not guessed at. A pattern loose
+  // enough to catch one wording also catches "first sequence unknown", which is a frame that is
+  // durable and not on the board: the one state all of this bookkeeping exists to expose, and the last
+  // thing that should be filtered out by a regular expression.
+  //
+  //   held by the board   the board has it and is waiting (it says so with waitingFor, and openGaps()
+  //                       reports it) - quiet here, because the board will apply it itself
+  //   already applied     a resend of something the board holds - quiet, nothing happened
+  //   never applicable    it belongs to numbering this connection cannot use - recorded as a permanent
+  //                       loss rather than held for a delivery that will not happen
+  //   anything else       durable and unapplied: held here, reported once, offered again on accept
+  const HELD_BY_BOOK = new Set(['waiting for the first sequence', 'gap before this sequence']);
+  const ALREADY_APPLIED = 'already applied';
+  const NEVER_APPLICABLE = new Set(['below the first sequence']);
 
   let refusedByBook = 0;
   // Frames that are durable in the raw and not on the board, keyed by connection and sequence. This is
@@ -110,11 +120,27 @@ export function createStructure({
         // apart with nothing to say so. C8 keeps those two positions separate precisely so that the
         // difference can be seen, so it is recorded here rather than returned to a caller that may not
         // look.
-        if (applied.applied === false && applied.reason && !HELD_BY_DESIGN.test(applied.reason)) {
+        if (
+          applied.applied === false &&
+          applied.reason &&
+          applied.reason !== ALREADY_APPLIED &&
+          !HELD_BY_BOOK.has(applied.reason)
+        ) {
           // The frame is durable and unapplied, so it is kept rather than handed back for someone else
           // to remember. It is also reported once per frame: a resend repeats the same refusal, and
           // repeating the report turns one lost frame into a stream of noise.
           const key = `${envelope.connection_id}:${envelope.receive_seq}`;
+          if (NEVER_APPLICABLE.has(applied.reason)) {
+            if (!skipped.some((entry) => entry.seq === envelope.receive_seq && entry.connectionId === envelope.connection_id)) {
+              skipped.push({ connectionId: envelope.connection_id, seq: envelope.receive_seq, reason: applied.reason });
+              onGap({
+                market,
+                reason: `this frame can never be applied: ${applied.reason}`,
+                seq: envelope.receive_seq,
+              });
+            }
+            return { ...note, ...applied };
+          }
           if (!unapplied.has(key)) {
             unapplied.set(key, { envelope, reason: applied.reason, note });
             refusedByBook += 1;
@@ -161,6 +187,11 @@ export function createStructure({
       const accepted = book.accept(connectionId, { generation, firstSeq: firstSeq ?? null });
       if (!accepted.accepted) {
         onDiagnostic({ market, reason: `the book did not accept this connection: ${accepted.reason}` });
+      } else if (unapplied.size > 0) {
+        // The same repair the explicit accept performs: frames held while the book did not know this
+        // connection are offered again. Skipping this here would mean the automatic path never runs in
+        // production, where connections arrive through the generation announcement.
+        structure_redeliver(connectionId);
       }
     },
     ...receiveOptions,
@@ -208,7 +239,7 @@ export function createStructure({
         });
         if (result.applied === true) {
           appliedCount += 1;
-        } else if (result.reason && HELD_BY_DESIGN.test(result.reason)) {
+        } else if (result.reason && HELD_BY_BOOK.has(result.reason)) {
           heldCount += 1;
           remaining.push([key, entry]);
         } else {
