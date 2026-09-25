@@ -24,6 +24,8 @@
  * recorded rather than assumed.
  */
 
+import { makeEnvelope } from '../envelope.mjs';
+
 export const DEFAULT_SILENCE_DEADLINE_MS = 15_000; // measured: a real stall runs 20s+, normal gaps do not
 export const DEFAULT_STABILITY_MS = 60_000; // attempts reset only after the link has held this long
 
@@ -35,6 +37,8 @@ const FAILED = 'failed';
 export function createReceiveConnection({
   adapter,
   market,
+  runId = null,
+  venue = null,
   webSocketImpl,
   openSocket = (url) => new webSocketImpl(url),
   monotonicNs = () => Number(process.hrtime.bigint()),
@@ -129,22 +133,29 @@ export function createReceiveConnection({
 
   function stamp(raw) {
     receiveSeq += 1;
-    return {
+    // The envelope is built by the one factory that knows the identity, never assembled here. When a
+    // run and a venue are configured the factory derives a run-scoped connection id, so a restarted
+    // process cannot take over the name of a connection that has already been written down; the
+    // generation travels with the envelope instead of riding along as a loose extra.
+    const derivedIdentity = runId && venue;
+    return makeEnvelope({
       market,
       stream: adapter.stream ?? 'unknown',
-      connectionId,
+      connectionId: derivedIdentity ? null : connectionId,
+      runId,
+      venue,
+      generation,
       receiveSeq,
       recvTsMs: wallClockMs(),
       recvMonoNs: monotonicNs(),
       raw,
-      generation,
       meta: {
         // Downstream needs to know where this connection's stream begins, otherwise a book cannot
         // anchor its boundary and would be starting from a guess.
         first_seq: firstSeq,
         venue_seq: adapter.venueSeqOf ? adapter.venueSeqOf(raw) : undefined,
       },
-    };
+    });
   }
 
   let firstSeq = 1;

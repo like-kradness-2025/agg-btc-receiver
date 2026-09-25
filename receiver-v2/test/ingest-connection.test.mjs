@@ -111,10 +111,12 @@ test('data is stamped with the receive metadata the rest of the structure depend
   h.sockets[0].onopen();
   h.sockets[0].deliver('{"price":1}');
   h.sockets[0].deliver('{"price":2}');
-  assert.deepEqual(h.envelopes.map((e) => e.receiveSeq), [1, 2]);
-  assert.equal(h.envelopes[0].connectionId, 'kraken_spot:1');
-  assert.ok(h.envelopes[0].recvTsMs > 0, 'the wall clock is stamped at the boundary');
-  assert.ok(h.envelopes[1].recvMonoNs > h.envelopes[0].recvMonoNs, 'and the monotonic clock advances');
+  // The names here are the contract's names, not a private spelling: the same envelope goes on the
+  // wire and into the book, so a test that reads camelCase would pin a shape nothing else uses.
+  assert.deepEqual(h.envelopes.map((e) => e.receive_seq), [1, 2]);
+  assert.equal(h.envelopes[0].connection_id, 'kraken_spot:1');
+  assert.ok(h.envelopes[0].recv_ts_ms > 0, 'the wall clock is stamped at the boundary');
+  assert.ok(h.envelopes[1].recv_mono_ns > h.envelopes[0].recv_mono_ns, 'and the monotonic clock advances');
   assert.equal(h.envelopes[0].meta.first_seq, 1, 'so a book can anchor where this stream begins');
   assert.equal(h.envelopes[0].generation, 1);
 });
@@ -138,8 +140,8 @@ test('a replaced socket issues a new generation, and the old one is no longer he
   assert.equal(h.envelopes.length, before, 'nothing from an old socket is used');
 
   second.deliver('{"price":2}');
-  assert.equal(h.envelopes.at(-1).connectionId, 'kraken_spot:2');
-  assert.equal(h.envelopes.at(-1).receiveSeq, 1, 'and the sequence starts again with the connection');
+  assert.equal(h.envelopes.at(-1).connection_id, 'kraken_spot:2');
+  assert.equal(h.envelopes.at(-1).receive_seq, 1, 'and the sequence starts again with the connection');
 });
 
 test('silence is treated as a dead link, not as a quiet market', () => {
