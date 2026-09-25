@@ -323,8 +323,13 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       // what is missing is an anchor, the sequence this connection's numbering starts from. Without
       // one there is nothing to prove, and saying otherwise is how a book goes into service holding
       // a board assembled from a guess.
-      if (applied.connectionId !== null && applied.upToSeq === null && applied.firstSeq === null) {
-        return { proven: false, reason: 'no anchor for the accepted connection' };
+      // C6, corrected: a declared first sequence is not a boundary proof. Declaring where a connection
+      // starts says nothing about whether any of it arrived, and a board holding nothing from that
+      // connection has nothing to be consistent with. What is required is data that was actually
+      // applied. Note the loose comparison: on reopen the field comes back undefined rather than null,
+      // and `undefined === null` is false - which is how a missing anchor read as a present one.
+      if (applied.connectionId !== null && applied.upToSeq == null) {
+        return { proven: false, reason: 'the board holds nothing from this connection yet' };
       }
       if (applied.connectionId === null) return { proven: false, reason: 'no connection accepted yet' };
       phase = RUNNING;

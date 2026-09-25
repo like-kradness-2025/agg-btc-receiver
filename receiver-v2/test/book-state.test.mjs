@@ -190,11 +190,16 @@ test('applying data does not put the book into service, and a proof does', async
     assert.equal(book.isRunning, false, 'a fresh book has proven nothing');
     assert.equal(book.proveBoundary().proven, false, 'with no connection there is nothing to prove');
 
+    book.accept('conn-1', { firstSeq: 1 }); // the anchor, declared before any frame
     book.apply({ envelope: envelope(1), changes: [change(1)] });
     assert.equal(book.isRunning, false, 'frames arriving are not a boundary proof');
-
-    // ここで初めて錨が与えられ、境界が証明される
-    book.accept('conn-1', { firstSeq: 1 });
+    // 錨の宣言だけでは証明にならない（Astra 監査の指摘）
+    // 別の保存先にする: 同じ保存先だと適用済みの位置が復元され、錨を宣言していない板と区別できない
+    const emptyStore = openDurability({ path: join(dir, 'empty.sqlite'), runId: 'run-2' });
+    const justDeclared = openBook({ market: 'kraken_spot', stream: 'trades', durability: emptyStore });
+    justDeclared.accept('conn-9', { firstSeq: 1 });
+    assert.equal(justDeclared.proveBoundary().proven, false, 'a declared anchor is not a proof');
+    emptyStore.close();
     assert.equal(book.proveBoundary().proven, true);
     assert.equal(book.isRunning, true);
     book.beginSync();
