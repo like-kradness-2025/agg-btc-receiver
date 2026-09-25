@@ -167,6 +167,9 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       .run(market, stream, applied.connectionId, waitingFor, seenSeq, nowMs());
   }
 
+  // Runs that have been replaced. A run does not come back, whatever number it quotes.
+  const supersededRuns = new Set();
+
   function closeGaps(upTo) {
     // C7: a hole belongs to the connection that opened it. Closing by sequence alone lets a new
     // connection's numbering fill a hole a dead one left behind, which reads as "the missing data
@@ -206,10 +209,32 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     board,
 
     /** Which connection this book is willing to accept: only a strictly newer generation replaces. */
-    accept(connectionId, { generation = null, firstSeq = null } = {}) {
-      const withFirst = { generation, firstSeq };
+    accept(connectionId, { generation = null, firstSeq = null, runId = null, takeover = false } = {}) {
+      // C11: generation numbers only order connections inside one run. A different run is not "older"
+      // or "newer", it is unrelated, and the only safe way to hand the book to it is to say so. Without
+      // this, a restarted process (whose generation starts again) is refused as stale, and a replay of a
+      // dead run can take over by accident - both directions were reproduced in an audit.
+      const knownRun = applied.runId ?? null;
+      const sameRun = knownRun === null || runId === null || runId === knownRun;
+      if (runId !== null && supersededRuns.has(runId)) {
+        // A replaced run is finished. Letting it back in with a larger number would undo the takeover
+        // it lost, and a replay of its old frames would look newer than it is.
+        return { accepted: false, reason: 'this run was already replaced' };
+      }
+      if (!sameRun && takeover !== true) {
+        return { accepted: false, reason: 'a different run needs an explicit takeover' };
+      }
+      if (!sameRun) {
+        // A takeover is not a comparison: the new run starts its own numbering, so the previous run's
+        // generation is cleared rather than beaten. Without this the new run's first connection looks
+        // older than the one it is replacing and the takeover is refused by the very rule that let it
+        // through the permission check.
+        if (knownRun !== null) supersededRuns.add(knownRun);
+        applied = { ...applied, generation: null };
+      }
+      const withFirst = { generation, firstSeq, runId };
       if (applied.connectionId === null) {
-        applied = { connectionId, ...withFirst, upToSeq: null };
+        applied = { connectionId, ...withFirst, upToSeq: null }; // runId travels with the connection
         phase = SYNCING;
         persistAcceptance();
         return { accepted: true, reason: 'first connection' };
@@ -330,6 +355,19 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       // and `undefined === null` is false - which is how a missing anchor read as a present one.
       if (applied.connectionId !== null && applied.upToSeq == null) {
         return { proven: false, reason: 'the board holds nothing from this connection yet' };
+      }
+      // C7: an open hole for this connection is not a boundary either. The board has a position and a
+      // board, and something in between them is still missing; serving it as ready is how a gap gets
+      // forgotten. Holes of older connections are deliberately not consulted here - those are history,
+      // and they must not stop a new connection from recovering.
+      const openForThisConnection = durability.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM book_gap
+           WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL`,
+        )
+        .get(market, stream, applied.connectionId).n;
+      if (openForThisConnection > 0) {
+        return { proven: false, reason: 'this connection has an unresolved hole' };
       }
       if (applied.connectionId === null) return { proven: false, reason: 'no connection accepted yet' };
       phase = RUNNING;
