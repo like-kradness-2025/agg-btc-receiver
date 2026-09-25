@@ -23,6 +23,9 @@ const REQUIRED_FIELDS = Object.freeze([
   'market',
   'stream',
   'connection_id',
+  'run_id',
+  'venue',
+  'generation',
   'receive_seq',
   'recv_ts_ms',
   'recv_mono_ns',
@@ -60,6 +63,9 @@ export function makeEnvelope({
   market,
   stream,
   connectionId,
+  runId = null,
+  venue = null,
+  generation = null,
   receiveSeq,
   recvTsMs,
   recvMonoNs,
@@ -68,7 +74,19 @@ export function makeEnvelope({
 }) {
   assertNonEmptyString(market, 'market');
   assertNonEmptyString(stream, 'stream');
-  assertNonEmptyString(connectionId, 'connectionId');
+  if (runId !== null) assertNonEmptyString(runId, 'runId');
+  if (venue !== null) assertNonEmptyString(venue, 'venue');
+  if (generation !== null && !Number.isInteger(generation)) {
+    throw new TypeError('generation must be an integer or null');
+  }
+  // The connection is named in one place only. A run-scoped id means a process that restarts cannot
+  // reuse the name of a connection that has already been written down, and the generation travels
+  // inside the envelope rather than being attached by whoever happens to remember. Callers that
+  // already hold a full id may pass it and skip the derivation.
+  const resolvedConnectionId =
+    connectionId ??
+    (runId && venue && Number.isInteger(generation) ? `${runId}:${venue}:${market}:${generation}` : null);
+  assertNonEmptyString(resolvedConnectionId, 'connectionId (or runId + venue + generation)');
   assertUint32(receiveSeq, 'receiveSeq');
   assertSafePositiveInteger(recvTsMs, 'recvTsMs');
   assertSafePositiveInteger(recvMonoNs, 'recvMonoNs');
@@ -79,7 +97,10 @@ export function makeEnvelope({
   return Object.freeze({
     market,
     stream,
-    connection_id: connectionId,
+    connection_id: resolvedConnectionId,
+    run_id: runId,
+    venue,
+    generation,
     receive_seq: receiveSeq,
     recv_ts_ms: recvTsMs,
     recv_mono_ns: recvMonoNs,
