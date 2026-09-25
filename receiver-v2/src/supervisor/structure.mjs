@@ -88,8 +88,6 @@ export function createStructure({
   // Frames whose connection is gone: durable in the raw, never going to be applied, kept as a record.
   const skipped = [];
 
-  let structure_redeliver = () => {};
-
   function feed(envelope) {
     if (stopped) {
       // Reception is stopped, so anything still arriving is recorded as a hole rather than lost
@@ -176,25 +174,23 @@ export function createStructure({
   }
 
   const connection = createReceiveConnection({
+    // The caller's options come first so that the wiring below cannot be replaced by them: a caller who
+    // could override onEnvelope could bypass the book entirely, and a caller who could override
+    // onGeneration could take a connection without the book ever hearing about it.
+    ...receiveOptions,
     adapter,
     market,
     webSocketImpl,
     onEnvelope: feed,
-    // The book is told which connection it is about to receive, before any of its frames arrive. A
-    // generation change is announced here, and this is the only place that announces it: the book
-    // refuses frames from a connection that was never accepted.
     onGeneration: ({ connectionId, generation, firstSeq }) => {
-      const accepted = book.accept(connectionId, { generation, firstSeq: firstSeq ?? null });
+      // Acceptance goes through the same route as a caller's accept(), so there is one behaviour rather
+      // than a manual path and an automatic path that quietly differ. The generation is announced
+      // before the connection's frames arrive, which is when the book needs to hear about it.
+      const accepted = api.accept(connectionId, { generation, firstSeq: firstSeq ?? null });
       if (!accepted.accepted) {
         onDiagnostic({ market, reason: `the book did not accept this connection: ${accepted.reason}` });
-      } else if (unapplied.size > 0) {
-        // The same repair the explicit accept performs: frames held while the book did not know this
-        // connection are offered again. Skipping this here would mean the automatic path never runs in
-        // production, where connections arrive through the generation announcement.
-        structure_redeliver(connectionId);
       }
     },
-    ...receiveOptions,
   });
 
   const api = {
@@ -202,11 +198,15 @@ export function createStructure({
     /** Accept a connection explicitly. Frames from any other connection are refused by the book. */
     accept: (connectionId, options = {}) => {
       const accepted = book.accept(connectionId, options);
-      // The held frames were refused because the book did not know this connection. Now that it does,
-      // they are offered again without anyone having to remember to ask - a repair that depends on
-      // somebody calling it is a repair that does not happen.
-      if (accepted && accepted.accepted && unapplied.size > 0) {
-        structure_redeliver(connectionId);
+      if (accepted && accepted.accepted) {
+        // Every part of the structure follows the same connection. The organizer kept its own idea of
+        // which connection it was working on, so it is told here rather than left to infer it from
+        // whichever frame happens to arrive first.
+        if (typeof organizer.accept === 'function') organizer.accept(connectionId);
+        // And the held frames were refused because the book did not know this connection; now that it
+        // does, they are offered again without anyone having to remember to ask, because a repair that
+        // depends on somebody calling it is a repair that does not happen.
+        if (unapplied.size > 0) api.redeliverPending();
       }
       return accepted;
     },
@@ -292,9 +292,6 @@ export function createStructure({
       };
     },
   };
-
-  // The public redeliver, wired so accept() can use it without the caller arranging anything.
-  structure_redeliver = (connectionId) => api.redeliverPending(connectionId);
 
   return api;
 }
