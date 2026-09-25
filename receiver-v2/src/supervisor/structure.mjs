@@ -66,6 +66,11 @@ export function createStructure({
     capacity: () => (stopped ? 'stopped' : 'ok'),
   });
 
+  // Apply-refusals that are the book holding a frame on purpose rather than losing it.
+  const HELD_BY_DESIGN = new Set(['already applied', 'gap before this sequence']);
+
+  let refusedByBook = 0;
+
   function feed(envelope) {
     if (stopped) {
       // Reception is stopped, so anything still arriving is recorded as a hole rather than lost
@@ -88,8 +93,22 @@ export function createStructure({
           envelope: { ...envelope, generation: envelope.generation },
           changes: adapter.changesFor ? adapter.changesFor(envelope) : [],
         });
-        // A refused apply is not an error: the book is holding it until its hole is filled, and it
-        // will apply it itself when that happens.
+        // Two refusals are the book working as designed: a frame it already holds, and a frame it is
+        // holding until the hole before it is filled. Those are states, not losses.
+        //
+        // Any other refusal is a frame that is durable in the raw, acknowledged as durable, and not on
+        // the board - and if that is not written down, the raw position and the applied position drift
+        // apart with nothing to say so. C8 keeps those two positions separate precisely so that the
+        // difference can be seen, so it is recorded here rather than returned to a caller that may not
+        // look.
+        if (applied.applied === false && applied.reason && !HELD_BY_DESIGN.has(applied.reason)) {
+          refusedByBook += 1;
+          onGap({
+            market,
+            reason: `the board refused the frame: ${applied.reason}`,
+            seq: envelope.receive_seq,
+          });
+        }
         return { ...note, ...applied };
       }
 
