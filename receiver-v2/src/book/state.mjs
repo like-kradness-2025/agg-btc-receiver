@@ -118,6 +118,16 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     'DELETE FROM book_level WHERE market = ? AND stream = ? AND side = ? AND price = ?',
   );
 
+  /**
+   * Write down which connection is accepted now, before anything is applied.
+   *
+   * The generation is a fact about the connection, not a consequence of applying its data: waiting
+   * for a successful apply leaves a window in which a restart would accept the old generation again.
+   */
+  function persistAcceptance() {
+    boundaryStatement.run(market, stream, applied.connectionId, applied.generation, applied.upToSeq, nowMs());
+  }
+
   /** Everything that makes one range durable: the levels and the position, in one transaction. */
   function commitRange({ changes, next }) {
     durability.db.exec('BEGIN IMMEDIATE');
@@ -154,6 +164,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       if (applied.connectionId === null) {
         applied = { connectionId, generation, upToSeq: null };
         phase = SYNCING;
+        persistAcceptance();
         return { accepted: true, reason: 'first connection' };
       }
       if (connectionId === applied.connectionId) return { accepted: true, reason: 'same connection' };
@@ -161,6 +172,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       if (supersedes) {
         applied = { connectionId, generation, upToSeq: null };
         phase = SYNCING;
+        persistAcceptance();
         return { accepted: true, reason: 'superseded by a newer generation' };
       }
       lastRefusal = { connectionId, generation, atMs: nowMs(), reason: 'superseded connection' };

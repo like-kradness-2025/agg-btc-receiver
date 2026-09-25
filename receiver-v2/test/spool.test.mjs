@@ -101,6 +101,23 @@ test('the spool survives a restart with its segments and its cursor', async () =
   });
 });
 
+test('a torn write is counted honestly, and the spool takes nothing more', async () => {
+  await withSpool(async (dir) => {
+    const fsModule = { ...fs };
+    let calls = 0;
+    fsModule.writeSync = (fd, buf, off, len) => {
+      calls += 1;
+      if (calls > 1) return 0; // the disk fills up after a couple of bytes
+      return fs.writeSync(fd, buf, off, Math.min(len, 2));
+    };
+    const spool = createSpool({ dir, fsModule });
+    assert.throws(() => spool.append(envelope(1)), /no progress/);
+    assert.notEqual(spool.failed, null, 'the spool knows it holds a torn record');
+    assert.equal(spool.bytes, 2, 'only the bytes that reached the disk are counted');
+    assert.equal(spool.append(envelope(2)), false, 'and it does not take anything more');
+  });
+});
+
 test('a torn tail is reported, not parsed as a record', async () => {
   await withSpool(async (dir) => {
     const spool = createSpool({ dir });

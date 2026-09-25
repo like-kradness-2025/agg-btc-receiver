@@ -87,6 +87,7 @@ export function createSpool(options = {}) {
   let handle = null;
   let current = segments.length > 0 ? segments[segments.length - 1] : null;
   let dirty = false;
+  let failed = null;
   let bytes = segments.reduce((sum, segment) => sum + segment.bytes, 0);
   let fsyncTimer = null;
 
@@ -134,6 +135,7 @@ export function createSpool(options = {}) {
    * the caller - reception pauses and the gap is recorded - never a reason to drop this record.
    */
   function append(envelope) {
+    if (failed) return false; // a torn record was written: appending after it would bury the tear
     const record = frame(encodeEnvelope(envelope));
     if (record.length > FRAME_MAX_BYTES) {
       throw new RangeError('a single record exceeds the frame limit');
@@ -153,8 +155,17 @@ export function createSpool(options = {}) {
     while (written < record.length) {
       const wrote = fsModule.writeSync(file, record, written, record.length - written);
       if (!(wrote > 0)) {
+        // These bytes are on the disk and cannot be taken back, so they are counted and the spool is
+        // closed to further writes. Counting only what was written keeps the size honest, and
+        // refusing later writes keeps a torn record from being buried under fresh data.
+        if (written > 0) {
+          current.bytes += written;
+          bytes += written;
+          dirty = true;
+        }
+        failed = new Error(`spool write made no progress after ${written} of ${record.length} bytes`);
         flush();
-        throw new Error(`spool write made no progress after ${written} of ${record.length} bytes`);
+        throw failed;
       }
       written += wrote;
     }
@@ -263,6 +274,10 @@ export function createSpool(options = {}) {
     },
     get isOverBound() {
       return bytes >= maxBytes;
+    },
+    /** Non-null once a write failed part-way: the spool holds a torn record and takes no more. */
+    get failed() {
+      return failed;
     },
   };
 }

@@ -131,6 +131,25 @@ test('only a strictly newer generation replaces the connection', async () => {
   });
 });
 
+test('the accepted generation is written down before any data is applied', async () => {
+  await withBook(async (dir) => {
+    const dbPath = join(dir, 'state.sqlite');
+    const store = openDurability({ path: dbPath, runId: 'run-1' });
+    const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.apply({ envelope: envelope(1, 'conn-1'), changes: [] });
+    book.accept('conn-2', { generation: 5 }); // accepted, nothing applied from it yet
+    store.close();
+
+    const second = openDurability({ path: dbPath, runId: 'run-2' });
+    const reopened = openBook({ market: 'kraken_spot', stream: 'trades', durability: second });
+    assert.equal(reopened.appliedBoundary.connectionId, 'conn-2');
+    assert.equal(reopened.appliedBoundary.generation, 5, 'the generation survived the restart');
+    const stale = reopened.accept('conn-1', { generation: 1 });
+    assert.equal(stale.accepted, false, 'so a restart cannot fall back to an older generation');
+    second.close();
+  });
+});
+
 test('applying data does not put the book into service, and a proof does', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
