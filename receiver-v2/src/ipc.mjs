@@ -230,7 +230,7 @@ export function createChannel(socket, options = {}) {
     for (const payload of payloads) {
       if (payload.length < 1) {
         fail(new TypeError('empty payload'));
-        continue;
+        return; // the channel is closed: nothing else from this chunk is treated as data
       }
       const tag = payload[0];
       const body = payload.subarray(1);

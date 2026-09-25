@@ -156,7 +156,9 @@ test('after a frame is refused, the rest of that chunk is not processed', () => 
     onError: (error) => errors.push(error),
   });
   const empty = Buffer.alloc(4); // declares a frame of zero bytes: no tag, so it is a violation
-  const good = Buffer.from(encodeEnvelope(envelope(1)));
+  // A genuinely valid payload: tag byte first, then the encoded envelope. Without the tag this test
+  // would fail on the trailing frame for the wrong reason and prove nothing about the refusal.
+  const good = Buffer.concat([Buffer.from([0x01]), Buffer.from(encodeEnvelope(envelope(1)))]);
   const goodLen = Buffer.alloc(4);
   goodLen.writeUInt32BE(good.length, 0);
   socket.handlers.data(Buffer.concat([empty, goodLen, good]));
