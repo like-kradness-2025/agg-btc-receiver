@@ -150,10 +150,24 @@ export function decodeEnvelope(frameBytes) {
   const headerEnd = FRAME_HEADER_BYTES + headerLength;
   if (headerEnd > frameBytes.length) throw new TypeError('frame header length exceeds frame size');
   const header = JSON.parse(frameBytes.subarray(FRAME_HEADER_BYTES, headerEnd).toString('utf8'));
+  // The identity travels with the frame, so it has to come back out of it. Passing only the assembled
+  // connection id would make a round trip silently lose the run, the venue and the generation, which
+  // is what the wire check missed: the header was written correctly and read back as nulls.
+  const claimed = header.connection_id;
+  const derived =
+    header.run_id && header.venue && Number.isInteger(header.generation)
+      ? `${header.run_id}:${header.venue}:${header.market}:${header.generation}`
+      : null;
+  if (derived && claimed !== derived) {
+    throw new TypeError('frame header names a connection that its own identity does not describe');
+  }
   return makeEnvelope({
     market: header.market,
     stream: header.stream,
-    connectionId: header.connection_id,
+    connectionId: claimed,
+    runId: header.run_id ?? null,
+    venue: header.venue ?? null,
+    generation: header.generation ?? null,
     receiveSeq: header.receive_seq,
     recvTsMs: header.recv_ts_ms,
     recvMonoNs: header.recv_mono_ns,
