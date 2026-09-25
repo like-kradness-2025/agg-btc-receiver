@@ -37,6 +37,7 @@ test('a contiguous range applies, and the board travels with the position', asyn
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1', { firstSeq: 1 }); // a connection is taken over only by an explicit accept
     for (const seq of [1, 2, 3]) {
       const result = book.apply({ envelope: envelope(seq), changes: [change(seq)] });
       assert.equal(result.applied, true);
@@ -54,6 +55,7 @@ test('a resend of something already applied is a no-op', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1', { firstSeq: 1 }); // a connection is taken over only by an explicit accept
     book.apply({ envelope: envelope(1), changes: [change(1)] });
     book.apply({ envelope: envelope(2), changes: [change(2)] });
     const again = book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 999 }] });
@@ -68,6 +70,7 @@ test('a frame with a hole before it is refused, and the hole is recorded', async
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1', { firstSeq: 1 }); // a connection is taken over only by an explicit accept
     book.apply({ envelope: envelope(1), changes: [change(1)] });
 
     const jumped = book.apply({ envelope: envelope(3), changes: [change(3)] });
@@ -91,6 +94,7 @@ test('without a first sequence there is nothing to anchor the boundary to', asyn
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1'); // a connection is taken over only by an explicit accept
     const bare = makeEnvelope({
       market: 'kraken_spot',
       stream: 'trades',
@@ -113,6 +117,7 @@ test('a restart restores the board and the position together', async () => {
     const dbPath = join(dir, 'state.sqlite');
     const first = openDurability({ path: dbPath, runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: first });
+      book.accept('conn-1', { firstSeq: 1 }); // a connection is taken over only by an explicit accept
     for (const seq of [1, 2, 3, 4]) {
       book.apply({ envelope: envelope(seq), changes: [change(seq)] });
     }
@@ -120,6 +125,7 @@ test('a restart restores the board and the position together', async () => {
 
     const second = openDurability({ path: dbPath, runId: 'run-2' });
     const reopened = openBook({ market: 'kraken_spot', stream: 'trades', durability: second });
+    reopened.accept('conn-1', { firstSeq: 1 }); // a connection is taken over only by an explicit accept
     assert.equal(reopened.appliedBoundary.upToSeq, 4, 'the position came back from the store');
     assert.equal(reopened.isRunning, false, 'a reopened book proves its boundary before serving');
     assert.equal(reopened.board.size('bid', 104), 4, 'and so did the board the position describes');
@@ -134,22 +140,25 @@ test('only a strictly newer generation replaces the connection', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1', { firstSeq: 1 }); // a connection is taken over only by an explicit accept
     book.apply({ envelope: envelope(1, 'conn-1'), changes: [change(1)] });
 
     // A numbered generation takes over from an unnumbered one, which is how the first reconnect
     // after a restart looks.
-    const newer = book.apply({ envelope: { ...envelope(1, 'conn-2'), generation: 2 }, changes: [] });
-    assert.equal(newer.applied, true);
+    const newer = book.accept('conn-2', { generation: 2 });
+    assert.equal(newer.accepted, true, 'a strictly newer generation takes over');
+    const newerApplied = book.apply({ envelope: { ...envelope(1, 'conn-2'), generation: 2 }, changes: [] });
+    assert.equal(newerApplied.applied, true);
     assert.equal(book.appliedBoundary.connectionId, 'conn-2');
 
     // Now a lower number is genuinely stale, whichever connection it names.
-    const older = book.apply({ envelope: { ...envelope(1, 'conn-old'), generation: 1 }, changes: [] });
-    assert.equal(older.applied, false, 'a positive generation is not automatically a newer one');
+    const older = book.accept('conn-old', { generation: 1 });
+    assert.equal(older.accepted, false, 'a positive generation is not automatically a newer one');
     assert.equal(older.reason, 'superseded connection');
     assert.ok(book.lastRefusal, 'and the refusal is recorded rather than swallowed');
 
-    const newest = book.apply({ envelope: { ...envelope(1, 'conn-3'), generation: 3 }, changes: [] });
-    assert.equal(newest.applied, true, 'only something strictly newer takes over');
+    const newest = book.accept('conn-3', { generation: 3 });
+    assert.equal(newest.accepted, true, 'only something strictly newer takes over');
     store.close();
   });
 });
@@ -177,12 +186,15 @@ test('applying data does not put the book into service, and a proof does', async
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1'); // a connection is taken over only by an explicit accept
     assert.equal(book.isRunning, false, 'a fresh book has proven nothing');
     assert.equal(book.proveBoundary().proven, false, 'with no connection there is nothing to prove');
 
     book.apply({ envelope: envelope(1), changes: [change(1)] });
     assert.equal(book.isRunning, false, 'frames arriving are not a boundary proof');
 
+    // ここで初めて錨が与えられ、境界が証明される
+    book.accept('conn-1', { firstSeq: 1 });
     assert.equal(book.proveBoundary().proven, true);
     assert.equal(book.isRunning, true);
     book.beginSync();

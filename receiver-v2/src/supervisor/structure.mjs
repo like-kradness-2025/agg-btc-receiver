@@ -38,6 +38,7 @@ export function createStructure({
   onAck = () => {},
   onGap = () => {},
   onStop = () => {},
+  onDiagnostic = () => {},
   ...receiveOptions
 }) {
   if (!durability?.db) throw new TypeError('the structure needs the durability store');
@@ -114,11 +115,22 @@ export function createStructure({
     market,
     webSocketImpl,
     onEnvelope: feed,
+    // The book is told which connection it is about to receive, before any of its frames arrive. A
+    // generation change is announced here, and this is the only place that announces it: the book
+    // refuses frames from a connection that was never accepted.
+    onGeneration: ({ connectionId, generation, firstSeq }) => {
+      const accepted = book.accept(connectionId, { generation, firstSeq: firstSeq ?? null });
+      if (!accepted.accepted) {
+        onDiagnostic({ market, reason: `the book did not accept this connection: ${accepted.reason}` });
+      }
+    },
     ...receiveOptions,
   });
 
   return {
     market,
+    /** Accept a connection explicitly. Frames from any other connection are refused by the book. */
+    accept: (connectionId, options = {}) => book.accept(connectionId, options),
     stream,
     book,
     organizer,

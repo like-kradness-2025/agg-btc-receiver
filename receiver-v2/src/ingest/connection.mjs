@@ -235,11 +235,15 @@ export function createReceiveConnection({
     if (closed) return;
     if (socket) teardownSocket(reason);
     generation += 1;
-    connectionId = `${market}:${generation}`;
+    // The name of the connection is the same one the envelope will carry: the run, the venue, the
+    // market and the generation. Naming it twice from two rules is how a book ends up accepting one
+    // id and being handed frames labelled with another.
+    connectionId =
+      runId && venue ? `${runId}:${venue}:${market}:${generation}` : `${market}:${generation}`;
     receiveSeq = 0;
     firstSeq = 1;
     attempts += 1;
-    onGeneration({ market, generation, connectionId, reason });
+    onGeneration({ market, generation, connectionId, reason, firstSeq });
     setState('connecting', reason);
 
     const delay = delayForAttempt(attempts);

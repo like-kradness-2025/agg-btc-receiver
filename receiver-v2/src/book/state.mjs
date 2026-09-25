@@ -251,8 +251,12 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
      */
     apply({ envelope, changes = [] }) {
       if (envelope.connection_id !== applied.connectionId) {
-        const accepted = this.accept(envelope.connection_id, { generation: envelope.generation ?? null });
-        if (!accepted.accepted) return { applied: false, reason: accepted.reason };
+        // A connection is taken over only by an explicit accept. Accepting on sight is how a frame from
+        // a connection nobody agreed to trust walks straight into the book, which is what a restarted
+        // process replaying an old connection's tail would look like.
+        const reason =
+          applied.connectionId === null ? 'no connection has been accepted yet' : 'connection not accepted';
+        return { applied: false, reason };
       }
       const seq = envelope.receive_seq;
       if (applied.upToSeq !== null && seq <= applied.upToSeq) {
@@ -312,6 +316,13 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
      * fresh book has proven nothing, and reaching this with no connection accepted is not possible.
      */
     proveBoundary() {
+      // A connection existing is not a boundary. C6: the connection id alone must never be enough -
+      // what is missing is an anchor, the sequence this connection's numbering starts from. Without
+      // one there is nothing to prove, and saying otherwise is how a book goes into service holding
+      // a board assembled from a guess.
+      if (applied.connectionId !== null && applied.upToSeq === null && applied.firstSeq === null) {
+        return { proven: false, reason: 'no anchor for the accepted connection' };
+      }
       if (applied.connectionId === null) return { proven: false, reason: 'no connection accepted yet' };
       phase = RUNNING;
       return { proven: true, reason: 'boundary proven' };

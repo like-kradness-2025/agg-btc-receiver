@@ -51,6 +51,7 @@ async function withStructure(fn, { rawWriterBehaviour = 'durable', spool = false
     onGap: (gap) => gaps.push(gap),
     onStop: (stop) => stops.push(stop),
   });
+  structure.accept('conn-1'); // only an explicitly accepted connection is taken over
   try {
     return await fn({ structure, store, rawWritten, acks, gaps, stops, dir });
   } finally {
