@@ -182,6 +182,21 @@ export function createFrameDecoder({ maxBytes = FRAME_MAX_BYTES } = {}) {
           fail(`declared frame of ${declared} bytes exceeds the ${maxBytes} byte limit`);
         }
       }
+      // A prefix split across two reads must be judged too, and judging it means reading those four
+      // bytes - not copying the chunk that carries them. Without this, a corrupt length arriving one
+      // byte after a partial read would still be paid for before it was refused.
+      if (pending.length > 0 && pending.length < FRAME_HEADER_BYTES) {
+        const needed = FRAME_HEADER_BYTES - pending.length;
+        if (chunk.length >= needed) {
+          const prefix = Buffer.allocUnsafe(FRAME_HEADER_BYTES);
+          pending.copy(prefix, 0);
+          chunk.copy(prefix, pending.length, 0, needed);
+          const declared = prefix.readUInt32BE(0);
+          if (declared > maxBytes) {
+            fail(`declared frame of ${declared} bytes exceeds the ${maxBytes} byte limit`);
+          }
+        }
+      }
       const buf = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
       const frames = [];
       let offset = 0;

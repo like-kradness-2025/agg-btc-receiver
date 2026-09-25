@@ -156,6 +156,9 @@ export function createChannel(socket, options = {}) {
    * reconnects. Anything already read from a desynchronised stream is not treated as data.
    */
   function fail(error) {
+    // One report per channel, however many things go wrong after the first: a caller reacting to a
+    // failure must not be told twice, and the second report would arrive after the socket is gone.
+    if (closed) return;
     closed = true;
     bufferedBytes = 0;
     batch = [];
@@ -236,15 +239,15 @@ export function createChannel(socket, options = {}) {
         else if (tag === TAG_CONTROL) onControl(JSON.parse(body.toString('utf8')), payload);
         else fail(new TypeError(`unknown tag ${tag}`));
       } catch (error) {
-        const protocol = error instanceof TypeError || error instanceof SyntaxError;
-        if (protocol) fail(error);
-        else onError(error);
+        // Any error on this channel is terminal. A frame that cannot be decoded leaves the stream's
+        // integrity in doubt, and continuing would mean reading the next boundary on trust.
+        fail(error);
       }
       if (closed) return;
     }
   });
 
-  socket.on('error', (error) => onError(error));
+  socket.on('error', (error) => fail(error));
   socket.on('close', () => {
     closed = true;
     flushBatch();

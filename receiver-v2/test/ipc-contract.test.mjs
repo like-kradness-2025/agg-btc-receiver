@@ -134,3 +134,33 @@ test('a protocol violation closes the channel instead of reading on', () => {
   assert.equal(calls.destroy, 1, 'the stream cannot be resynchronised, so it is closed');
   assert.equal(channel.sendEnvelope(envelope(1)), false, 'nothing is sent on a failed channel');
 });
+
+test('a corrupt length arriving one byte after a partial read is still refused first', () => {
+  const decoder = createFrameDecoder({ maxBytes: 64 });
+  // One byte of a prefix, then the rest of it declares a million bytes.
+  assert.deepEqual(decoder.push(Buffer.from([0x00])), []);
+  const rest = Buffer.alloc(200 * 1024, 0);
+  rest.writeUInt32BE(1_000_000, 0);
+  rest[0] = 0x0f; // completes the corrupt length with the byte already held
+  assert.throws(() => decoder.push(rest.subarray(1)), RangeError);
+  assert.equal(decoder.bufferedBytes, 0, 'the declared length was judged before anything was copied');
+  assert.equal(decoder.failed, true);
+});
+
+test('after a frame is refused, the rest of that chunk is not processed', () => {
+  const errors = [];
+  const delivered = [];
+  const { socket, calls } = stuckSocket();
+  const channel = createChannel(socket, {
+    onEnvelope: (env) => delivered.push(env),
+    onError: (error) => errors.push(error),
+  });
+  const empty = Buffer.alloc(4); // declares a frame of zero bytes: no tag, so it is a violation
+  const good = Buffer.from(encodeEnvelope(envelope(1)));
+  const goodLen = Buffer.alloc(4);
+  goodLen.writeUInt32BE(good.length, 0);
+  socket.handlers.data(Buffer.concat([empty, goodLen, good]));
+  assert.equal(errors.length, 1);
+  assert.equal(delivered.length, 0, 'a valid frame later in the same chunk is not data any more');
+  assert.equal(calls.destroy, 1);
+});
