@@ -28,7 +28,10 @@ async function withOrganizer(fn, options = {}) {
       market: 'kraken_spot',
       stream: 'trades',
       durability: store,
-      writeRaw: (envelope) => written.push(envelope.receive_seq),
+      writeRaw: (envelope) => {
+        written.push(envelope.receive_seq);
+        return true; // durable: the contract this module relies on
+      },
       ...options,
     });
     try {
@@ -98,7 +101,7 @@ test('the watermark survives a restart, so a replay is not acknowledged twice', 
       market: 'kraken_spot',
       stream: 'trades',
       durability: first,
-      writeRaw: () => {},
+      writeRaw: () => true, // durable: the contract this module relies on
     });
     one.note(envelope(1));
     one.note(envelope(2));
@@ -110,7 +113,10 @@ test('the watermark survives a restart, so a replay is not acknowledged twice', 
       market: 'kraken_spot',
       stream: 'trades',
       durability: second,
-      writeRaw: (envelope) => written.push(envelope.receive_seq),
+      writeRaw: (envelope) => {
+        written.push(envelope.receive_seq);
+        return true; // durable: the contract this module relies on
+      },
     });
     const accepted = two.accept('conn-1');
     assert.equal(accepted.upToSeq, 2, 'the watermark came back from the store');
@@ -131,4 +137,22 @@ test('another connection is not this one, and is refused by name', async () => {
     assert.equal(other.reason, 'not the accepted connection');
     assert.deepEqual(written, [1], 'nothing from the refused connection was written');
   });
+});
+
+test('a raw write that is not durable moves neither the watermark nor the acknowledgement', async () => {
+  let durable = false;
+  await withOrganizer(
+    async ({ organizer }) => {
+      const blocked = organizer.note(envelope(1));
+      assert.equal(blocked.durable, false);
+      assert.equal(blocked.ack, null, 'nothing is acknowledged on the strength of a write that failed');
+      assert.equal(organizer.ackState.upToSeq, null, 'and the watermark did not move');
+
+      durable = true;
+      const after = organizer.note(envelope(1));
+      assert.equal(after.durable, true, 'the same frame is accepted once the raw is safe');
+      assert.equal(after.ack.upToSeq, 1);
+    },
+    { writeRaw: () => durable },
+  );
 });

@@ -52,6 +52,9 @@ export function openOrganizer({
   if (!market || !stream) throw new TypeError('an organizer needs a market and a stream');
   if (!durability?.db) throw new TypeError('an organizer needs the durability store');
   if (typeof writeRaw !== 'function') throw new TypeError('an organizer needs a way to write raw data');
+  // writeRaw must be durable before it returns, and must say so: true means the canonical record is
+  // safe. Anything else - false, a Promise, a count, silence - counts as "not durable yet", and
+  // nothing is acknowledged or advanced on the strength of it.
 
   durability.db.exec(ORGANIZE_SCHEMA);
 
@@ -136,7 +139,11 @@ export function openOrganizer({
         return { accepted: true, duplicate: true, reason: 'already durable', ack: null };
       }
 
-      writeRaw(envelope); // the canonical record is safe before anything is acknowledged
+      const durable = writeRaw(envelope) === true;
+      if (!durable) {
+        // The raw is not safe, so the watermark does not move and no acknowledgement is emitted.
+        return { accepted: true, durable: false, reason: 'raw not durable yet', ack: null };
+      }
 
       if (upToSeq === null) {
         if (seq < baselineSeq) {
@@ -168,7 +175,7 @@ export function openOrganizer({
       }
 
       persist();
-      return { accepted: true, reason: 'durable', ack: { connectionId, upToSeq, capacity: capacity() } };
+      return { accepted: true, durable: true, reason: 'durable', ack: { connectionId, upToSeq, capacity: capacity() } };
     },
 
     /** Holes seen and not yet filled: the ranges this process cannot claim to have. */

@@ -145,7 +145,19 @@ export function createSpool(options = {}) {
     if (bytes + record.length > maxBytes) return false;
     rotateIfNeeded(record.length);
     const file = openCurrent();
-    fsModule.writeSync(file, record);
+    // A write can be short - a full disk, an interrupted syscall - and treating that as a complete
+    // record is how data disappears while everything still looks accepted. The whole record is
+    // written or the caller is told it did not fit; a partial tail is what the torn-tail rules are
+    // for, and no bytes are counted as held until the record is actually on the disk.
+    let written = 0;
+    while (written < record.length) {
+      const wrote = fsModule.writeSync(file, record, written, record.length - written);
+      if (!(wrote > 0)) {
+        flush();
+        throw new Error(`spool write made no progress after ${written} of ${record.length} bytes`);
+      }
+      written += wrote;
+    }
     current.bytes += record.length;
     bytes += record.length;
     dirty = true;
