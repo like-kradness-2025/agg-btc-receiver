@@ -66,10 +66,15 @@ export function createStructure({
     capacity: () => (stopped ? 'stopped' : 'ok'),
   });
 
-  // Apply-refusals that are the book holding a frame on purpose rather than losing it.
-  const HELD_BY_DESIGN = new Set(['already applied', 'gap before this sequence']);
+  // Apply-refusals that are the book holding a frame on purpose rather than losing it. Matched by
+  // shape rather than by one exact sentence: the previous version listed a phrase the book never used,
+  // so a frame the book was deliberately holding was reported as a loss.
+  const HELD_BY_DESIGN = /already applied|gap before this sequence|first sequence/i;
 
   let refusedByBook = 0;
+  // Frames that are durable in the raw and not on the board, keyed by connection and sequence. This is
+  // the difference between the two positions, held so it can be repaired instead of merely reported.
+  const unapplied = new Map();
 
   function feed(envelope) {
     if (stopped) {
@@ -101,13 +106,20 @@ export function createStructure({
         // apart with nothing to say so. C8 keeps those two positions separate precisely so that the
         // difference can be seen, so it is recorded here rather than returned to a caller that may not
         // look.
-        if (applied.applied === false && applied.reason && !HELD_BY_DESIGN.has(applied.reason)) {
-          refusedByBook += 1;
-          onGap({
-            market,
-            reason: `the board refused the frame: ${applied.reason}`,
-            seq: envelope.receive_seq,
-          });
+        if (applied.applied === false && applied.reason && !HELD_BY_DESIGN.test(applied.reason)) {
+          // The frame is durable and unapplied, so it is kept rather than handed back for someone else
+          // to remember. It is also reported once per frame: a resend repeats the same refusal, and
+          // repeating the report turns one lost frame into a stream of noise.
+          const key = `${envelope.connection_id}:${envelope.receive_seq}`;
+          if (!unapplied.has(key)) {
+            unapplied.set(key, { envelope, reason: applied.reason, note });
+            refusedByBook += 1;
+            onGap({
+              market,
+              reason: `the board refused the frame: ${applied.reason}`,
+              seq: envelope.receive_seq,
+            });
+          }
         }
         return { ...note, ...applied };
       }
@@ -154,6 +166,33 @@ export function createStructure({
     market,
     /** Accept a connection explicitly. Frames from any other connection are refused by the book. */
     accept: (connectionId, options = {}) => book.accept(connectionId, options),
+    /**
+     * Offer the held frames to the book again, oldest first. What was refused because the book did not
+     * know the connection can be applied once it does; a frame the book still refuses stays held, so a
+     * failed attempt costs nothing and the difference between the raw and the board remains visible.
+     */
+    redeliverPending: () => {
+      let appliedCount = 0;
+      const remaining = [];
+      for (const [key, entry] of unapplied) {
+        if (entry.envelope.connection_id !== book.appliedBoundary.connectionId) {
+          remaining.push([key, entry]);
+          continue;
+        }
+        const result = book.apply({
+          envelope: entry.envelope,
+          changes: adapter.changesFor ? adapter.changesFor(entry.envelope) : [],
+        });
+        if (result.applied === true || (result.reason && HELD_BY_DESIGN.test(result.reason))) {
+          appliedCount += 1;
+        } else {
+          remaining.push([key, entry]);
+        }
+      }
+      unapplied.clear();
+      for (const [key, entry] of remaining) unapplied.set(key, entry);
+      return { redelivered: appliedCount, stillHeld: unapplied.size };
+    },
     stream,
     book,
     organizer,
