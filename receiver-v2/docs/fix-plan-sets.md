@@ -1,6 +1,6 @@
 # receiver v2 修正計画（セット2 以降）— Astra 監査 2026-09-25 反映版
 
-**状態: 承認待ち（実装しない）。** この計画に対する Astra の APPROVE が出るまで、コードは書かない。
+**状態: APPROVED（2026-09-25 Astra APPROVE・実装可）。** 実装は下記 6節の注意点に従う。
 実装は1セット=1コミットで進め、各セットで「実装 → 全テスト → コミット → gpt-5.6-luna(xhigh) の厳格レビュー」を回す。
 
 契約の正本: `spec-v2-contracts.md`（C1〜C11）／本計画はその残件をどう閉じるかだけを扱う。
@@ -101,3 +101,32 @@
 - **Astra の APPROVE まで実装しない。** 計画を変えるときは本ファイルを更新して再度承認に掛ける。
 - 1セット=1コミット。**赤いツリーはコミットしない**。レビューは `gpt-5.6-luna` / effort `xhigh`。
 - レビューが出す指摘は、その回で全部潰すか、本ファイルに残件として明示してから次へ進む。
+
+## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
+
+1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。
+   `commitRange`（136行）を後回しにすると、適用時に owner 情報を消す。確認の区切りは「保存・復元一式」「認可・伝達・fixture 一式」「整理・再配送期待値一式」。
+2. **SQLite**: `BEGIN IMMEDIATE` の後、`PRAGMA table_info(applied_boundary)` の `name` を集合化し、**欠けた列だけ** `ADD COLUMN`。
+   両方ある・片方だけある場合も通す。**重複列を含む全例外の握り潰しは禁止**。新列を使う statement は migration 完了後に prepare。
+   migration と通常の accept は**別トランザクション**（`BEGIN` を入れ子にしない）。`INSERT OR REPLACE` は削除＋再挿入なので、**全保存経路で8列を指定**（6列のままだと新列が NULL に戻る）。
+   `DatabaseSync` は同期 API、SQL の NULL は JS の `null`、**トランザクション内に `await` を挟まない**。
+3. **ロールバックは「COMMIT 前にメモリを変えない」構造にする**: `persistAcceptance(next, retiredRun)` の形で候補を渡し、
+   **引退行 INSERT → owner・位置を含む境界行保存 → COMMIT → メモリ（`applied`・履歴・`phase`・`waiting`）更新**。
+   先行する `supersededRuns.add` / `applied=` / `waiting.clear()` を残さない。BEGIN 失敗時に ROLLBACK しない。ロールバックの失敗で元例外を隠さない。
+4. **`accept` の契約**: 戻り値は `{ accepted, reason }` を維持。同一 connection ID でも run／generation が違えば「same connection」で通さない。
+   起点補完は**同一 owner・generation・connection かつ `firstSeq` 未確定**のときだけ `next = { ...applied, firstSeq }` を保存し、
+   **`upToSeq`・`waiting`・穴・`phase` を変えず、drain も呼ばない**。確定済み起点への異なる値は拒否。
+   封筒由来の起点（294行）を採用して適用するなら `next.firstSeq` にも保存する。**所有情報の検証は重複判定・穴記録より前**。
+5. **structure／organizer**: `connection.mjs:246` → `structure.mjs:185` に `runId`／`venue` を伝達。
+   板の accept 成功後に `organizer.accept(connectionId, { firstSeq: book.appliedBoundary.firstSeq })` → 再配送 の順。省略値で既存起点を上書きしない。
+   `watermark.mjs:104` は同一接続なら watermark と `outOfOrder` を維持し、**未確定の baseline だけ補完**。131行の暗黙 accept を除去。
+   起点 NULL は比較演算より前に分岐し、raw 成功なら **`durable:true, ack:null`** を返す。起点不明中の耐久済み seq も保持し、起点到着時に連続分だけ進める。
+   **`redeliverPending` は板にしか再配送しないので、それだけで organizer の ACK が進むと考えない。**
+6. **赤くなるはずのテスト（Astra の静的読解・推測）**: `structure-redeliver`（明示accept・起点NULLから）/ `structure-refusal`（未acceptは `accepted:false`・ACKなし）/
+   `organize-redelivery`（初回 note 前に明示 accept）/ `structure-holds-losses`（`stillPending:1` → `0`）/ `book-gap-scope`（accept と封筒に同じ run/generation）。
+   `book-run-authority` は維持。`runId=null` を**初回も拒否**する実装にすると `book-state` の8本と `organize-watermark` の共通準備も対象（推測）。
+7. **コミットは1つ**: migration・認可・伝達・整理・対応テストをまとめる。セット3以降（台帳耐久化・再配送分類・境界証明）を混ぜない。
+8. **手で確認する**: 使い捨てDBで旧6列→再migration、8列の値、板別の引退履歴、再オープン後の owner を SQL で照合。失敗注入3点は getter だけでなくDBも確認。
+
+**未決（実装前に決める）**: `structure.mjs:189` は現在 `takeover` を渡していない。**再起動時に明示 takeover を発行するのは誰か**を決める（無条件 `takeover:true` は不可）。
+受信封筒の `adapter.stream` と板の stream の一致も確認する。
