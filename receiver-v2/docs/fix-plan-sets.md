@@ -130,3 +130,28 @@
 
 **未決（実装前に決める）**: `structure.mjs:189` は現在 `takeover` を渡していない。**再起動時に明示 takeover を発行するのは誰か**を決める（無条件 `takeover:true` は不可）。
 受信封筒の `adapter.stream` と板の stream の一致も確認する。
+
+## 7. ④の認可配線と ①の再試行契約（Astra 判定 2026-09-25 を反映）
+
+**④ 認可を「実際の受信開始」へ渡す（Astra 指摘の要修正を反映）**
+- 発行は `structure.accept` ✓。条件は `!admitted && options.runId === runId && ownerRun != null && ownerRun !== runId` ✓。
+  **呼び出し元の `options.takeover` では上書きさせない** ✓。`runId` は非空必須、`ownerRun` は板の現在値。
+- **旧復旧の完了が前提**: entry point が ①新 run 生成＋`beginRun()` ②旧 spool を流し切る ③旧境界を確定 してから `accept` を呼ぶ ✓。
+- **実際の `onGeneration` で新 run を認可し、**`accept` が成功するまで**受信開始を阻止**する ✓。
+  （現状は `structure.mjs:185` が拒否をログするだけで、`connection.mjs:246` から socket 開始へ進む ✗）
+- `admitted` は**板ごとの「今回の新 run」**に限定する ✓。**旧 run の復旧 accept では消費しない** ✓
+  （消費すると新 run への交代が拒否され得る）。
+- `admitted` は**板の保存が成功した直後にだけ**立てる ✓（保存失敗では立てず、DB・メモリとも旧状態を維持 ✓）。
+- 再起動では新 run を生成し、**保存済み owner から再判定**する ✓。
+
+**① 保存後・途中失敗の再試行契約**
+- 板の保存が成功した後に organizer／再配送で失敗しても、**takeover を再発行しない** ✓。
+- 再試行は**同一 owner・generation・connection**で行い、後続（organizer の accept・ACK 通知・再配送）だけを完了させる ✓。
+
+**③ の精度（Astra 明示）**: 通知するのは「**補完によって進み、保存できた連続耐久上限だけ**」✓。
+耐久済み `{1,3}` に起点 `1` を補完したら **ACK は 1**、穴 `2` は残す ✓。上限 NULL・不変・保存失敗では通知しない ✓。
+「1回」は**当該補完処理内**の意味で、クラッシュをまたぐ厳密な一度限りの保証ではない ✓。
+
+**⑤ チェックの位置**: `structure.stream` と `adapter.stream` の不一致は **`openBook`・spool 生成より前**に throw ✓。
+
+**セット2 で完成扱いにしないもの**: spool drain と起動時の `applied_boundary` 起点再送は**セット3・5 のまま** ✓。
