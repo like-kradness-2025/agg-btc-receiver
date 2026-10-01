@@ -23,6 +23,56 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { closeSync, existsSync, openSync, statSync } from 'node:fs';
+import { bindInternals } from './internal/wiring.mjs';
+
+/**
+ * One store, one handle, one execution right.
+ *
+ * A change operation must not start while another one is in progress: the caller's hooks are synchronous
+ * functions it hands in, so they can call back into anything on the same stack, and a second BEGIN is not
+ * nested by SQLite - it simply fails, which the reception path turns into a permanent stop.
+ *
+ * Rather than deciding which two handles are looking at one database - which means reading names the way
+ * SQLite reads them, down to URI fragments, query options, percent escapes, hard links, symlinks and VFS
+ * names - the store is held by one handle at a time. The identity is only ever used to refuse the second
+ * open, so a name this module reads imperfectly costs an extra attempt, never a second right.
+ */
+const OPEN_STORES = new Map();
+
+/** The public refusal of a change operation that arrived while another one was in progress. */
+export const REENTRANT_OPERATION = 'REENTRANT_OPERATION';
+
+/**
+ * The shape a refused public call answers with: a normal refusal the caller can report, never a
+ * durability verdict (that word means the raw refused the write) and never an error (an error here
+ * would be read as a store failure and stop reception).
+ */
+export function reentryRefusal(operation, { acceptedKey = 'accepted' } = {}) {
+  return {
+    [acceptedKey]: false,
+    code: REENTRANT_OPERATION,
+    reason: `${operation} may not start while another change operation is being processed`,
+    ack: null,
+  };
+}
+
+/**
+ * The file SQLite opened, as an identity - or null when there is no file to hold.
+ *
+ * `PRAGMA database_list` reports what this connection actually opened, with the URI syntax, the fragment and
+ * the query already resolved, and an empty name for anything SQLite keeps in memory (an in-memory database,
+ * a shared cache, a VFS like memdb). Nothing here reads a name in a way of its own: a database with no file
+ * is refused rather than used, and a file is held by one handle at a time.
+ */
+function databaseFileKey(db) {
+  const main = db.prepare('PRAGMA database_list').all().find((row) => row.name === 'main');
+  if (!main || !main.file) return null;
+  // No fallback to the name: a file that cannot be identified is one this store cannot promise anything
+  // about, and two readings of one file must not be two keys.
+  const stats = statSync(main.file);
+  return `file:${stats.dev}:${stats.ino}`;
+}
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS pending_boundary (
@@ -72,19 +122,74 @@ const STATE_INVALIDATED = 'invalidated';
 export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), Database = DatabaseSync }) {
   if (!dbPath) throw new TypeError('durability needs a path');
   if (!runId) throw new TypeError('durability needs a run id');
-  const db = new Database(dbPath);
-  db.exec('PRAGMA journal_mode = WAL');
-  db.exec('PRAGMA synchronous = FULL');
-  db.exec(SCHEMA);
+  // Opening the store writes to it - the schema, and the marker of the run it replaces - so it is a change
+  // operation like every other one, and the store is one handle. Nothing here reads a name: the handle is
+  // opened, what SQLite says it opened decides the identity, and a database with no file, or a file another
+  // handle in this process already holds, is refused before anything is written by this handle.
+  const refusedOpen = (reason) => {
+    const error = new Error(reason);
+    error.code = REENTRANT_OPERATION;
+    return error;
+  };
+  let db;
+  let fileKey = null;
+  let registered = false;
+  let closed = false;
+  const right = { busy: false };
+  try {
+    db = new Database(dbPath);
 
-  // Only an unfinished generation is invalidated. A run that closed cleanly keeps that fact: erasing
-  // it would hide the very thing the marker exists to record.
-  const invalidate = db.prepare('UPDATE run_marker SET state = ?, at_ms = ? WHERE state = ?');
-  // Through the same transaction discipline as everything else: a rollback that fails must not replace the
-  // error that caused it, or the reason this store could not open is lost behind the attempt to clean up.
-  inTransaction(() => {
-    invalidate.run(STATE_INVALIDATED, nowMs(), STATE_RUNNING);
-  });
+    // What SQLite opened, before this handle writes anything: no file means no identity to hold, so the
+    // database is refused rather than used (an in-memory one, a shared cache, a VFS-backed one).
+    try {
+      fileKey = databaseFileKey(db);
+    } catch (error) {
+      throw refusedOpen(`this store's file could not be identified: ${error.message}`);
+    }
+    if (fileKey === null) {
+      throw refusedOpen(
+        'this database has no file to be held by: an in-memory, shared-cache or VFS-backed store cannot be used here',
+      );
+    }
+    if (OPEN_STORES.has(fileKey)) {
+      throw refusedOpen('this file is already held by another handle in this process');
+    }
+    // Held from here, before anything is written: the initialisation below calls back into the caller's
+    // clock, and a re-open from there must find the file already taken.
+    OPEN_STORES.set(fileKey, true);
+    registered = true;
+
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec('PRAGMA synchronous = FULL');
+    db.exec(SCHEMA);
+
+    // Only an unfinished generation is invalidated. A run that closed cleanly keeps that fact: erasing
+    // it would hide the very thing the marker exists to record.
+    const invalidate = db.prepare('UPDATE run_marker SET state = ?, at_ms = ? WHERE state = ?');
+    // Through the same transaction discipline as everything else: a rollback that fails must not replace the
+    // error that caused it, or the reason this store could not open is lost behind the attempt to clean up.
+    inTransaction(() => {
+      invalidate.run(STATE_INVALIDATED, nowMs(), STATE_RUNNING);
+    });
+  } catch (error) {
+    // The file is freed only if this handle really is closed - the same rule as `close()`. The closing is
+    // attempted twice, because a connector can refuse the first one (a statement still open, a driver that
+    // needs the transaction to unwind); if it still fails, the file stays held, which refuses a second
+    // handle rather than admitting one over a connection that may still be live.
+    let closedHere = false;
+    if (db) {
+      for (let attempt = 0; attempt < 2 && !closedHere; attempt += 1) {
+        try {
+          db.close();
+          closedHere = true;
+        } catch {
+          // the original failure is the one to report
+        }
+      }
+    }
+    if (registered && fileKey !== null && closedHere) OPEN_STORES.delete(fileKey);
+    throw error;
+  }
 
   /**
    * Run fn inside one transaction, so that a record cannot land alone.
@@ -113,7 +218,64 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     }
   }
 
-  return {
+  function beginChange() {
+    if (right.busy) return false;
+    right.busy = true;
+    return true;
+  }
+
+  function endChange() {
+    right.busy = false;
+  }
+
+  /**
+   * Run fn with the right held, refused if it is not free.
+   *
+   * Opening a module writes to the store, so the whole initialisation is one change operation: without
+   * taking the right around it, a hook the initialisation calls (the caller's clock, a writer) could
+   * re-enter, and the nested BEGIN that follows fails and is read as a store failure.
+   */
+  function whileChange(fn) {
+    if (!beginChange()) {
+      const error = new Error('an initialisation cannot begin while a change operation is being processed');
+      error.code = REENTRANT_OPERATION;
+      throw error;
+    }
+    try {
+      return fn();
+    } finally {
+      endChange();
+    }
+  }
+
+  function inChange() {
+    return right.busy;
+  }
+
+  /**
+   * Wrap one public change operation in this store's execution right.
+   *
+   * Every module hands its public names through here, and keeps the unguarded function closed over for
+   * itself: one frame's processing is one operation, while a hook the caller handed in reaches the
+   * public name and is refused like any other caller. The refusal is a shape the caller already
+   * understands - never a durability verdict (that word means the raw refused a write) and never an
+   * error, which the reception path would read as a store failure and stop over.
+   */
+  function guard(operation, run, refusalShape = (refusal) => refusal) {
+    return (...args) => {
+      if (!beginChange()) return refusalShape(reentryRefusal(operation));
+      try {
+        return run(...args);
+      } finally {
+        endChange();
+      }
+    };
+  }
+
+  /** This store's own change operations take the right like every other module's, and refuse the same way. */
+  const guarded = (operation, run) => guard(operation, run, () => reentryRefusal(operation, { acceptedKey: 'changed' }));
+
+  const api = {
     db,
     inTransaction,
 
@@ -232,7 +394,49 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     },
 
     close() {
+      // Closing is once, and it is the closing that frees the file. A second call changes nothing, so a
+      // handle that has been closed cannot free a file another handle has taken since. If the close itself
+      // fails the file stays held - refusing a second handle rather than admitting one - and closing can be
+      // tried again, because the flag is set only by a close that succeeded.
+      if (closed) return;
       db.close();
+      closed = true;
+      if (fileKey !== null) OPEN_STORES.delete(fileKey);
     },
   };
+
+  // The unguarded routes, kept closed over: they exist so that this store's own names can be public and
+  // guarded without recursing into themselves. Nothing outside this file can reach them.
+  const internal = {
+    beginRun: api.beginRun,
+    completeRun: api.completeRun,
+    advanceWithBoundary: api.advanceWithBoundary,
+    clearBoundary: api.clearBoundary,
+    updateReceivedTail: api.updateReceivedTail,
+    recordSuspectedGap: api.recordSuspectedGap,
+    close: api.close,
+  };
+  for (const [name, run] of Object.entries(internal)) api[name] = guarded(`store.${name}`, run);
+  // A caller's transaction is a change operation like any other. Its refusal is thrown rather than
+  // returned: a caller expecting its own function's result must not be handed a refusal object as if it
+  // were that result.
+  api.inTransaction = guard('store.inTransaction', api.inTransaction, () => {
+    const error = new Error('a transaction cannot begin while a change operation is being processed');
+    error.code = REENTRANT_OPERATION;
+    throw error;
+  });
+
+  // Nothing about the right is handed out: a caller that can reach `endChange` can release the right that
+  // is holding its own frame, and a caller that can reach the unguarded routes can write without one. The
+  // store's own change operations are reachable by their public names, which take the right themselves.
+  // `inChange` is a read: a module asked to open while a frame is being processed needs to know that it
+  // must refuse, and knowing it cannot change the right.
+  //
+  // The wiring, however, is handed the right, the transaction discipline and that observation - through
+  // `internal/wiring.mjs`, and not on this object. A module that called `store.guard(...)` on the object a
+  // caller holds would hand its unguarded route to whoever replaced that method: the route would then be
+  // callable from inside a frame, and the same frame would be written twice.
+  const exported = { ...api, inChange, REENTRANT_OPERATION };
+  bindInternals(exported, { guard, inTransaction, inChange, whileChange, REENTRANT_OPERATION });
+  return exported;
 }

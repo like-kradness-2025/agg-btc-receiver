@@ -29,8 +29,11 @@
 
 import { openBook } from '../book/state.mjs';
 import { openOrganizer } from '../organize/watermark.mjs';
+import { openDeliveryLedger, INTENT, OWED } from './delivery.mjs';
+import { makeEnvelope } from '../envelope.mjs';
 import { createSpool } from '../spool.mjs';
 import { createReceiveConnection } from '../ingest/connection.mjs';
+import { internalsOf } from '../internal/wiring.mjs';
 
 export function createStructure({
   market,
@@ -60,14 +63,29 @@ export function createStructure({
     );
   }
 
+  // The right, the transactions and the observation come from the wiring, never from the object handed in.
+  const wiring = internalsOf(durability);
+
+  // The private routes of each module are obtained here, by the wiring that opened them, and the module
+  // objects themselves carry none of them: a hook that can reach an unguarded route can hand the same frame
+  // to the same book twice, or release the right that is holding its own frame. Nothing a caller is handed -
+  // no object and no argument - holds them either; see `internal/wiring.mjs`.
   const book = openBook({ market, stream, durability });
+  const bookInternal = internalsOf(book);
   const spool = spoolDir ? createSpool({ dir: spoolDir }) : null;
+  // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
+  // this process, because the frames it names are only recoverable while that knowledge survives a crash.
+  const ledger = openDeliveryLedger({ durability, market, stream });
+  const ledgerInternal = internalsOf(ledger);
 
   // Backpressure is decided here rather than inside a buffer. In one process the roles are called
   // synchronously, so the pressure shows up as the raw writer refusing: the frame then goes to the
   // spool, and only if the spool cannot hold it either does reception stop. (Across processes the
   // same decision is made when the channel reports a full queue.)
   let stopped = false;
+  // Raised only while this structure is calling into the connection it opened, so the callbacks that call
+  // comes back on are recognised as this operation's own continuation rather than an arrival from outside.
+  let drivingReception = false;
   let spooledFrames = 0;
   let refusedFrames = 0;
 
@@ -81,6 +99,7 @@ export function createStructure({
     },
     capacity: () => (stopped ? 'stopped' : 'ok'),
   });
+  const organizerInternal = internalsOf(organizer);
 
   // The run this structure has already admitted for this board. A takeover is issued once per run: the
   // second connection of the same run is a change of connection, not a new claim on the board, and the
@@ -108,7 +127,7 @@ export function createStructure({
     // against anything else, a frame from another run or generation would be written to the canonical
     // record on the strength of a connection id that happens to match.
     const boundary = book.appliedBoundary;
-    const organized = organizer.accept(connectionId, {
+    const organized = organizerInternal.accept(connectionId, {
       firstSeq: origin,
       runId: boundary.runId ?? null,
       generation: boundary.generation ?? null,
@@ -139,13 +158,170 @@ export function createStructure({
   const HELD_BY_BOOK = new Set(['waiting for the first sequence', 'gap before this sequence']);
   const ALREADY_APPLIED = 'already applied';
   const NEVER_APPLICABLE = new Set(['below the first sequence']);
+  const OWED_REASON = 'durable in the raw and not applied to the board yet';
 
   let refusedByBook = 0;
-  // Frames that are durable in the raw and not on the board, keyed by connection and sequence. This is
-  // the difference between the two positions, held so it can be repaired instead of merely reported.
-  const unapplied = new Map();
+  // Frames this process wrote into the ledger for the first time. Cumulative, like the spool and reception
+  // counters, and not the same question as what is still owed - that is the ledger's own count - because an
+  // intent a refused raw write takes back was still written down once.
+  let framesWrittenDown = 0;
   // Frames whose connection is gone: durable in the raw, never going to be applied, kept as a record.
   const skipped = [];
+
+  /**
+   * Write down that the raw holds this frame and the board does not have it yet - or, before the write is
+   * attempted, that it is about to.
+   *
+   * This entry is what makes the difference between the two positions recoverable, so a frame that is
+   * confirmed durable is written down in the same commit that claims it (the organizer's hook), while a
+   * frame that was already durable is written down here and confirmed at once - its entry can be missing
+   * in a store written before this record existed, and it would otherwise be delivered by nobody. Returns
+   * whether it was the frame's first entry, so that a report about it is made once rather than once per
+   * attempt, and touches no shared counter: that is a change to make after the commit, not inside it.
+   */
+  function owe(envelope, reason = OWED_REASON, state = OWED) {
+    const { recorded } = ledgerInternal.record(envelope, reason, state);
+    // The insert is a commit of its own - the organizer's transaction runs later, around a hook that only
+    // confirms - so the counter moves after it and never before: a frame that was written down is a
+    // committed fact, and one whose write never landed is not counted at all.
+    if (recorded) framesWrittenDown += 1;
+    return recorded;
+  }
+
+  /**
+   * Stop this structure receiving, for good.
+   *
+   * Reception is stopped *and closed*: a stopped structure refuses every further frame, so a socket left
+   * open would keep delivering frames that go nowhere - each one reported as a hole and dropped, which is
+   * the one outcome this design never allows. Escalating this to a non-zero exit belongs to the entry point
+   * that does not exist yet; keeping the receiver from quietly eating data belongs here.
+   */
+  function stopReception(reason) {
+    if (stopped) return;
+    stopped = true;
+    try {
+      connection?.stop?.();
+    } catch (error) {
+      // Nothing here can do anything useful about a socket that will not close; the stop is recorded and the
+      // caller has been told, which is what matters.
+      onDiagnostic({ market, reason: `reception could not be closed: ${error.message}` });
+    }
+    onStop({ market, reason });
+  }
+
+  /**
+   * Whether this frame could be one of this board's at all, asked without touching anything.
+   *
+   * The same questions the book and the organizer ask, in one place, so that a route which reaches the board
+   * without passing through them (a resend that is served from the ledger) cannot skip them: the board's
+   * identity, the board's market and stream, and the connection it currently holds. Refusing here has no
+   * side effects, which is what makes it usable before anything has been decided.
+   */
+  function belongsToBoard(envelope) {
+    const boundary = book.appliedBoundary;
+    if (envelope.market !== market || envelope.stream !== stream) {
+      return { ok: false, reason: 'this frame belongs to another board' };
+    }
+    if (boundary.connectionId === null) {
+      return { ok: false, reason: 'no connection has been accepted yet' };
+    }
+    if (envelope.connection_id !== boundary.connectionId) {
+      return { ok: false, reason: 'not the accepted connection' };
+    }
+    if (
+      (envelope.run_id ?? null) !== (boundary.runId ?? null) ||
+      (envelope.generation ?? null) !== (boundary.generation ?? null)
+    ) {
+      return { ok: false, reason: 'this frame belongs to another run or generation' };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Let go of what is delivered: as far as the board has reached, and as far as the raw's own record can
+   * vouch for it.
+   *
+   * Both bounds are needed. A frame the raw holds above its contiguous position has no record anywhere else
+   * than this one, and forgetting it would make the next resend of that frame a rewrite - the raw refuses to
+   * write what it already has, and that refusal would be read as "not durable" and stop reception over a
+   * frame nothing is wrong with. The board's ceiling moves contiguously only (§2.2), so releasing up to it
+   * cannot drop a frame still waiting behind a hole.
+   */
+  function releaseDelivered() {
+    const boundary = book.appliedBoundary;
+    const organized = organizer.ackState?.upToSeq ?? null;
+    ledgerInternal.release({
+      connectionId: boundary.connectionId,
+      firstSeq: boundary.firstSeq,
+      // A raw position of NULL is the raw saying it holds nothing contiguously, so there is nothing it can
+      // vouch for: the entry is the only record of what is in the raw under this connection, and it stays
+      // until a position exists to compare against.
+      upToSeq: boundary.upToSeq === null || organized === null ? null : Math.min(boundary.upToSeq, organized),
+    });
+  }
+
+  /**
+   * Put one frame on the board, and say what happened to it.
+   *
+   * One route for every frame that reaches the board - the one that just arrived, and the one the ledger
+   * kept - so there is no second behaviour that quietly differs from the first: the book's own dedupe makes
+   * a repeat a no-op, the applied ceiling releases what the board now holds, and a refusal the board only
+   * records as a loss is reported exactly once.
+   */
+  function deliver(target, note, { newlyWritten: wrote = false } = {}) {
+    const applied = bookInternal.apply({
+      envelope: target,
+      changes: adapter.changesFor ? adapter.changesFor(target) : [],
+    });
+    // The board may have anchored its boundary on the origin this frame declares. The organizer has to hear
+    // the same origin: the ceiling lives there, and a start that reached only the board would leave every
+    // frame durable and unacknowledged, waiting for a start that has arrived.
+    //
+    // Who is followed comes from the board's own boundary, never from the frame that was just handed in: a
+    // frame of a connection the board does not hold is refused above, and letting it name the organizer's
+    // connection would refuse the frames of the connection that really is the board's - before the raw, so
+    // they would not even be spooled.
+    const followed = book.appliedBoundary;
+    if (followed.connectionId !== null && followed.firstSeq !== null) {
+      followConnection(followed.connectionId, { origin: followed.firstSeq });
+    }
+    releaseDelivered();
+    // Two refusals are the book working as designed: a frame it already holds, and a frame it is holding
+    // until the hole before it is filled. Those are states, not losses.
+    //
+    // Any other refusal is a frame that is durable in the raw, acknowledged as durable, and not on the board
+    // - and if that is not written down, the raw position and the applied position drift apart with nothing
+    // to say so. C8 keeps those two positions separate precisely so that the difference can be seen.
+    if (
+      applied.applied === false &&
+      applied.reason &&
+      applied.reason !== ALREADY_APPLIED &&
+      !HELD_BY_BOOK.has(applied.reason)
+    ) {
+      if (NEVER_APPLICABLE.has(applied.reason)) {
+        if (!skipped.some((known) => known.seq === target.receive_seq && known.connectionId === target.connection_id)) {
+          skipped.push({ connectionId: target.connection_id, seq: target.receive_seq, reason: applied.reason });
+          onGap({
+            market,
+            reason: `this frame can never be applied: ${applied.reason}`,
+            seq: target.receive_seq,
+          });
+        }
+        return { ...note, ...applied };
+      }
+      // Reported once per frame: a resend repeats the same refusal, and repeating the report turns one lost
+      // frame into a stream of noise.
+      if (wrote) {
+        refusedByBook += 1;
+        onGap({
+          market,
+          reason: `the board refused the frame: ${applied.reason}`,
+          seq: target.receive_seq,
+        });
+      }
+    }
+    return { ...note, ...applied };
+  }
 
   function feed(envelope) {
     if (stopped) {
@@ -155,88 +331,137 @@ export function createStructure({
       onGap({ market, reason: 'reception stopped: nothing more can be held', seq: envelope.receive_seq });
       return { accepted: false, reason: 'stopped' };
     }
+    // Whether this call created the frame's entry in the ledger: the report about a frame is made once, on
+    // the first time it is written down, not once per attempt to deliver it.
+    let newlyWritten = false;
+    // Whether *this* attempt wrote the intent it may take back. An entry that was already there is not this
+    // attempt's to remove: an existing one may be a frame the raw really does hold (its claim was committed
+    // in an earlier life, and the attempt that refused now says nothing about it), or one whose write is
+    // still owed an attempt.
+    let wroteIntentNow = false;
     try {
-      const note = organizer.note(envelope);
-      if (note.ack) onAck(note.ack);
-      if (note.accepted === false) return note;
-
-      // C8: raw durability and board application are separate questions with separate positions. A
-      // frame that is already durable may still be unapplied, so a resend is routed to the book rather
-      // than dropped here; the book's own (connection, sequence) dedupe makes a second application a
-      // no-op, which is what keeps this from becoming a double write.
-      if (note.durable || note.alreadyDurable) {
-        const applied = book.apply({
-          envelope: { ...envelope, generation: envelope.generation },
-          changes: adapter.changesFor ? adapter.changesFor(envelope) : [],
+      // The raw already holds this frame, so a resend of it is not a question about the raw any more. Asking
+      // for the write again would rewrite a frame the canonical record has, and a refusal of that rewrite
+      // says nothing about whether the frame is durable - it is, that is what the entry means. The stored
+      // frame is what goes to the board, and the refusal path (spool, stopping) is never reached on this
+      // account.
+      const stored = ledger.find(envelope.connection_id, envelope.receive_seq);
+      if (stored !== null) {
+        // The arrival is judged by what it claims to be, not by what the store holds: serving a frame from the
+        // ledger must not become a way for another run, generation or board to be told about this one.
+        const claim = belongsToBoard(envelope);
+        if (!claim.ok) return { accepted: false, reason: claim.reason, ack: null };
+      }
+      // What the frame *is* was decided when it was first written down: a resend under the same key is the
+      // same frame, and the store's copy is the one the raw holds (or is about to). Taking the arrival's
+      // bytes, meta or identity for it afterwards would let the canonical record and the board describe
+      // different data under one key.
+      const target = stored === null ? envelope : envelopeFromEntry(stored);
+      if (stored !== null && stored.state === OWED) {
+        return deliver(target, {
+          accepted: true,
+          alreadyDurable: true,
+          reason: 'the raw already holds this frame',
+          ack: null,
         });
-        // The board may have anchored its boundary on the origin this frame declares. The organizer has
-        // to hear the same origin: the ceiling lives there, and a start that reached only the board
-        // would leave every frame durable and unacknowledged, waiting for a start that has arrived.
-        if (book.appliedBoundary.firstSeq !== null) {
-          followConnection(envelope.connection_id, { origin: book.appliedBoundary.firstSeq });
-        }
-        // Two refusals are the book working as designed: a frame it already holds, and a frame it is
-        // holding until the hole before it is filled. Those are states, not losses.
-        //
-        // Any other refusal is a frame that is durable in the raw, acknowledged as durable, and not on
-        // the board - and if that is not written down, the raw position and the applied position drift
-        // apart with nothing to say so. C8 keeps those two positions separate precisely so that the
-        // difference can be seen, so it is recorded here rather than returned to a caller that may not
-        // look.
-        if (
-          applied.applied === false &&
-          applied.reason &&
-          applied.reason !== ALREADY_APPLIED &&
-          !HELD_BY_BOOK.has(applied.reason)
-        ) {
-          // The frame is durable and unapplied, so it is kept rather than handed back for someone else
-          // to remember. It is also reported once per frame: a resend repeats the same refusal, and
-          // repeating the report turns one lost frame into a stream of noise.
-          const key = `${envelope.connection_id}:${envelope.receive_seq}`;
-          if (NEVER_APPLICABLE.has(applied.reason)) {
-            if (!skipped.some((entry) => entry.seq === envelope.receive_seq && entry.connectionId === envelope.connection_id)) {
-              skipped.push({ connectionId: envelope.connection_id, seq: envelope.receive_seq, reason: applied.reason });
-              onGap({
-                market,
-                reason: `this frame can never be applied: ${applied.reason}`,
-                seq: envelope.receive_seq,
-              });
-            }
-            return { ...note, ...applied };
+      }
+      const note = organizerInternal.note(target, {
+        // The intent is written before the raw is touched and confirmed in the commit that claims the frame
+        // durable. Neither hook touches this process's counters: those move after the commit, when the store
+        // has actually changed.
+        onIntent: (frame) => {
+          if (owe(frame, OWED_REASON, INTENT)) {
+            newlyWritten = true;
+            wroteIntentNow = true;
           }
-          if (!unapplied.has(key)) {
-            unapplied.set(key, { envelope, reason: applied.reason, note });
-            refusedByBook += 1;
-            onGap({
-              market,
-              reason: `the board refused the frame: ${applied.reason}`,
-              seq: envelope.receive_seq,
-            });
-          }
-        }
-        return { ...note, ...applied };
+        },
+        onDurable: (frame) => ledgerInternal.confirm(frame),
+      });
+      if (note.accepted === false) return note;
+      if (note.durable === false && wroteIntentNow) {
+        // The raw refused this attempt and the entry exists only because of it, so it is taken back: a
+        // restart would otherwise deliver a frame the canonical record never took. An entry that was already
+        // there stays, whatever this attempt decided - the raw may hold that frame, and deleting it here is
+        // deleting the only record that it still has to be delivered (C8).
+        ledgerInternal.drop(target.connection_id, target.receive_seq);
+      }
+      // A frame that was already durable is still owed unless the board's position has passed it: it may be
+      // exactly the frame a crash left behind, and the record of that is what brings it back.
+      if (note.alreadyDurable && owe(target, note.reason ?? OWED_REASON)) newlyWritten = true;
+      // Only now may the raw be acknowledged. An acknowledgement that outran the record would let a crash
+      // take with it the only statement that this frame still has to reach the board (C8, C11).
+      if (note.ack) onAck(note.ack);
+
+      // C8: raw durability and board application are separate questions with separate positions. A frame
+      // that is already durable may still be unapplied, so a resend is routed to the book rather than
+      // dropped here; the book's own (connection, sequence) dedupe makes a second application a no-op,
+      // which is what keeps this from becoming a double write.
+      if (note.durable || note.alreadyDurable) {
+        return deliver(target, note, { newlyWritten });
       }
 
       // The raw writer refused: the frame is spilled rather than dropped.
-      if (spool && spool.append(envelope) && !spool.failed) {
+      // What is spilled is the frame this key means - the one that was written down - not the resend that
+      // arrived under it.
+      if (spool && spool.append(target) && !spool.failed) {
         spooledFrames += 1;
         return { ...note, spooled: true };
       }
       // Nothing could hold it. Reception stops and the gap is written down, which is the only honest
       // outcome left: continuing would mean pretending the frame was handled.
-      stopped = true;
       onGap({ market, reason: 'raw refused and the spool could not hold it', seq: envelope.receive_seq });
-      onStop({ market, reason: 'nothing could hold the frame' });
+      stopReception('nothing could hold the frame');
       return { ...note, stopped: true };
     } catch (error) {
-      // An exception anywhere in the path is not swallowed: reception stops and the caller hears
-      // about it, rather than the structure carrying on with a frame whose fate is unknown.
-      stopped = true;
+      // An exception from a caller's hook stops reception and the caller hears about it. That includes the
+      // one our own gate raises: a module opened from inside a frame is refused before it writes anything
+      // (so no nested BEGIN is ever attempted), but the point at which it was refused may be after the raw
+      // has taken the frame - and continuing from there would leave a durable frame with no record that it
+      // is owed, which is the loss this set exists to prevent. A refusal returned by the guard, by contrast,
+      // writes nothing and needs no stop.
       onGap({ market, reason: `failure while handling a frame: ${error.message}`, seq: envelope.receive_seq });
-      onStop({ market, reason: error.message });
+      stopReception(error.message);
       return { accepted: false, reason: 'failure', error };
     }
   }
+
+  /**
+   * Rebuild the frame a ledger entry stands for. The entry carries everything the envelope needs,
+   * including the bytes and the meta the frame arrived with, so nothing here has to ask the raw what it
+   * holds - the raw writer is a caller's hook with no read side.
+   */
+  function envelopeFromEntry(entry) {
+    return makeEnvelope({
+      market,
+      stream,
+      connectionId: entry.connectionId,
+      runId: entry.runId,
+      venue: entry.venue,
+      generation: entry.generation,
+      receiveSeq: entry.receiveSeq,
+      recvTsMs: entry.recvTsMs,
+      recvMonoNs: entry.recvMonoNs,
+      raw: entry.raw,
+      meta: entry.meta,
+    });
+  }
+
+  // What arrives on the socket is an entry point from outside, exactly like a caller's own call, so the two
+  // callbacks below take the store's execution right: a frame cannot be processed while another operation
+  // is running. The one exception is the socket this structure itself opens - `start()` calls down into the
+  // connection, which announces its generation and hands over what it already holds synchronously - and
+  // those are this operation's own continuation, so they run unguarded. `drivingReception` is raised only
+  // around that call, in this module's own closure, so nothing a caller or a hook can reach can raise it.
+  const feedGuarded = wiring.guard('structure.feed', feed);
+  const admitGuarded = wiring.guard('structure.accept', admitOnGeneration, () => {
+    onDiagnostic({
+      market,
+      reason: 'this connection arrived while another operation was in progress',
+    });
+    return false;
+  });
+  const feedEntry = (envelope) => (drivingReception ? feed(envelope) : feedGuarded(envelope));
+  const admitEntry = (details) => (drivingReception ? admitOnGeneration(details) : admitGuarded(details));
 
   const connection = createReceiveConnection({
     // The caller's options come first so that the wiring below cannot be replaced by them: a caller who
@@ -248,12 +473,44 @@ export function createStructure({
     runId,
     venue,
     webSocketImpl,
-    onEnvelope: feed,
+    onEnvelope: feedEntry,
     // Reception's own reports - a connection it refused to open, a socket it tore down, a frame it could
     // not parse - travel to the same caller that hears about the book, so a refusal that stops reception
     // is not something only the connection knows.
     onDiagnostic: (diagnostic) => onDiagnostic(diagnostic),
-    onGeneration: ({ connectionId, generation, firstSeq, runId: incomingRunId }) => {
+    onGeneration: admitEntry,
+  });
+
+  // What a caller is handed for the connection: its reads are the connection's own, while starting and
+  // stopping it are change operations. A connection replaced from inside an operation hands the board a new
+  // identity while the frame being processed belongs to the old one, and that frame is then refused as
+  // belonging to a connection the board no longer holds. The structure's own calls go straight to the
+  // connection, inside an operation it already holds.
+  const connectionSurface = {};
+  for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(connection))) {
+    if (name === 'start' || name === 'stop') continue;
+    Object.defineProperty(
+      connectionSurface,
+      name,
+      descriptor.get ? { get: () => connection[name], enumerable: true } : descriptor,
+    );
+  }
+  connectionSurface.start = wiring.guard('connection.start', () => connection.start(), () => {
+    onDiagnostic({ market, reason: 'reception cannot be started while a change operation is being processed' });
+    return false;
+  });
+  connectionSurface.stop = wiring.guard('connection.stop', () => connection.stop(), () => {
+    onDiagnostic({ market, reason: 'reception cannot be stopped while a change operation is being processed' });
+    return false;
+  });
+
+  /**
+   * The same acceptance as a caller's, reached from the connection's own announcement. It is one
+   * operation - the book, the organizer, the acknowledgement and the redelivery - so it takes the
+   * store's execution right for the whole of it, and a re-entrant arrival is refused the way a refused
+   * connection is: reception does not start.
+   */
+  function admitOnGeneration({ connectionId, generation, firstSeq, runId: incomingRunId }) {
       // Acceptance goes through the same route as a caller's accept(), so there is one behaviour rather
       // than a manual path and an automatic path that quietly differ. The generation is announced
       // before the connection's frames arrive, which is when the book needs to hear about it.
@@ -281,8 +538,7 @@ export function createStructure({
       }
       admittedRunId = incomingRunId;
       return true;
-    },
-  });
+  }
 
   /**
    * Accept a connection: one route for the manual case and the automatic one, so there is no second
@@ -293,7 +549,7 @@ export function createStructure({
    * starts, because that is the only place that knows which run is running here.
    */
   function admit(connectionId, options, { takeover = false } = {}) {
-    const accepted = book.accept(connectionId, { ...options, takeover });
+    const accepted = bookInternal.accept(connectionId, { ...options, takeover });
     if (accepted?.accepted) {
       // Every part of the structure follows the same connection. The organizer kept its own idea of
       // which connection it was working on, so it is told here - with the origin the board actually
@@ -303,7 +559,7 @@ export function createStructure({
       // And the held frames were refused because the book did not know this connection; now that it
       // does, they are offered again without anyone having to remember to ask, because a repair that
       // depends on somebody calling it is a repair that does not happen.
-      if (unapplied.size > 0) api.redeliverPending();
+      if (ledger.size() > 0) redeliverPendingInternal();
     }
     return accepted;
   }
@@ -318,8 +574,8 @@ export function createStructure({
       return admit(connectionId, callerOptions);
     },
     /**
-     * Offer the held frames to the book again, oldest first. What was refused because the book did not
-     * know the connection can be applied once it does; a frame the book still refuses stays held, so a
+     * Offer the owed frames to the book again, oldest first. What was refused because the book did not
+     * know the connection can be applied once it does; a frame the book still refuses stays owed, so a
      * failed attempt costs nothing and the difference between the raw and the board remains visible.
      */
     redeliverPending: () => {
@@ -330,51 +586,120 @@ export function createStructure({
       let appliedCount = 0;
       let heldCount = 0;
       let skippedCount = 0;
-      const remaining = [];
-      const gone = [];
-      for (const [key, entry] of unapplied) {
-        const currentConnection = book.appliedBoundary.connectionId;
-        if (entry.envelope.connection_id !== currentConnection) {
-          // Its connection was replaced, so nothing will ever accept it. That is a permanent loss and
-          // it is recorded as one instead of being held for a delivery that cannot happen.
-          gone.push([key, entry]);
+      // Only what the raw is confirmed to hold: an intent is a frame the raw may not have, and delivering
+      // it would put the board ahead of the canonical record.
+      for (const entry of ledger.pending({ state: OWED })) {
+        if (entry.connectionId !== book.appliedBoundary.connectionId) {
+          // Its connection was replaced, so nothing will ever accept it. That is a permanent loss, and it
+          // is reported as one instead of being held for a delivery that cannot happen. The entry itself
+          // stays in the ledger: it is the durable record of that loss, and deciding how a permanent loss
+          // is written down for good belongs with the classification of skipped frames, not here.
+          if (!skipped.some((known) => known.seq === entry.receiveSeq && known.connectionId === entry.connectionId)) {
+            skipped.push({ connectionId: entry.connectionId, seq: entry.receiveSeq, reason: entry.reason });
+            onGap({
+              market,
+              reason: `the connection this frame belonged to is gone: ${entry.reason}`,
+              seq: entry.receiveSeq,
+            });
+          }
+          skippedCount += 1;
           continue;
         }
-        const result = book.apply({
-          envelope: entry.envelope,
-          changes: adapter.changesFor ? adapter.changesFor(entry.envelope) : [],
-        });
+        // Through the same route as a live frame: the board may adopt an origin here, and the organizer has to
+        // hear it before anything is released - a start that reached only the board would leave the raw's
+        // position behind, and the next resend of that frame would be written again.
+        const result = deliver(
+          envelopeFromEntry(entry),
+          { accepted: true, alreadyDurable: true, reason: 'the raw already holds this frame', ack: null },
+        );
         if (result.applied === true) {
           appliedCount += 1;
         } else if (result.reason && HELD_BY_BOOK.has(result.reason)) {
           heldCount += 1;
-          remaining.push([key, entry]);
-        } else {
-          const key2 = key;
-          remaining.push([key2, entry]);
         }
       }
-      unapplied.clear();
-      for (const [key, entry] of remaining) unapplied.set(key, entry);
-      for (const [key, entry] of gone) {
-        skipped.push({ connectionId: entry.envelope.connection_id, seq: entry.envelope.receive_seq, reason: entry.reason });
-      }
-      if (gone.length > 0) {
-        for (const entry of skipped.slice(-gone.length)) {
-          onGap({ market, reason: `the connection this frame belonged to is gone: ${entry.reason}`, seq: entry.seq });
+      // Whatever the board now holds stops being owed, released by position: the ceiling the board
+      // reached covers exactly the contiguous frames it applied.
+      releaseDelivered();
+      return { applied: appliedCount, held: heldCount, skipped: skippedCount, stillPending: ledger.size() };
+    },
+    /**
+     * A restart resumes from the board's applied position (C8, C11): everything the raw holds and the
+     * board does not have yet is offered to it again, oldest first.
+     *
+     * The frames go straight to the book rather than back through the organizer. The organizer's own
+     * record says the raw already holds them - that is what the ledger entry means - and asking it to
+     * take the frame again would write it to the raw a second time for no gain. What the book takes is
+     * released by position; what it cannot take yet (a hole it waits behind, a connection that is no
+     * longer its own) stays owed, which is exactly what the store is for.
+     */
+    resume: () => {
+      // What the raw is confirmed to hold goes first, and it is not a matter of taste: those frames are what
+      // tells the board where this connection's numbering can start (a frame it has been handed fixes the
+      // ceiling, §2.2). An intent re-decided before them could carry a start declaration above a frame the
+      // store already holds, and the board would accept it - skipping that frame for ever.
+      // Before anything is released, the organizer is told what the raw already holds. A frame the raw holds
+      // above its contiguous position has no record anywhere else, and without this the next resend of it would
+      // be written to the raw again - the raw refuses a rewrite of what it has, and that refusal would be read
+      // as a frame that is not durable. Telling it here is what makes the release below safe.
+      const owed = ledger.pending({ state: OWED });
+      if (owed.length > 0) {
+        const boundary = book.appliedBoundary;
+        if (boundary.connectionId !== null) {
+          followConnection(boundary.connectionId, { origin: boundary.firstSeq });
+          for (const entry of owed) organizerInternal.note(envelopeFromEntry(entry), { rawAlreadyHolds: true });
         }
       }
-      skippedCount = gone.length;
-      return { applied: appliedCount, held: heldCount, skipped: skippedCount, stillPending: unapplied.size };
+      const delivered = redeliverPendingInternal();
+      // Then an intent, which is a frame the raw may not hold: it is offered back through the organizer,
+      // which decides the write again - the one direction in which a crash leaves something recoverable.
+      // The organizer has to be on the connection the board recorded for that to be anything but a refusal
+      // (fail-closed), and the board's own identity is where that comes from.
+      const intended = ledger.pending({ state: INTENT });
+      if (intended.length > 0) {
+        const boundary = book.appliedBoundary;
+        if (boundary.connectionId !== null) {
+          followConnection(boundary.connectionId, { origin: boundary.firstSeq });
+        }
+        for (const entry of intended) feed(envelopeFromEntry(entry));
+      }
+      // Everything the raw holds is now in the organizer's own record, which is what a resend is judged
+      // against.
+      return { intended: intended.length, offered: delivered.stillPending, ...delivered };
     },
     stream,
     book,
     organizer,
-    connection,
+    ledger,
+    connection: connectionSurface,
     spool,
-    start: () => connection.start(),
+    start: () => {
+      // A structure that has stopped does not start again by being asked to: reception was closed because the
+      // frames could not be handled, and reopening the socket would deliver frames this structure can only
+      // refuse - the state is what says so, not the socket. Restarting is a new process with a new run.
+      if (stopped) return { started: false, reason: 'this structure has stopped' };
+      // A restart delivers what the raw already holds before it listens again: the two positions are where
+      // this process and its store disagree, and nothing new should be added to the stream before that
+      // difference is closed.
+      resumeInternal();
+      // Recovery can stop this structure (a frame nothing could hold): opening the socket then would deliver
+      // frames the structure can only refuse, and the stop is exactly the information that reception must not
+      // start.
+      if (stopped) return { started: false, reason: 'this structure has stopped' };
+      drivingReception = true;
+      try {
+        return connection.start();
+      } finally {
+        drivingReception = false;
+      }
+    },
     stop: () => {
-      connection.stop();
+      drivingReception = true;
+      try {
+        connection.stop();
+      } finally {
+        drivingReception = false;
+      }
       spool?.close();
     },
     /** A frame handed in directly, for a replay adapter or a dry run. */
@@ -395,10 +720,57 @@ export function createStructure({
         gaps: book.openGaps().length,
         spooledFrames,
         refusedFrames,
+        // What the raw holds and the board does not have yet: the difference between the two positions
+        // that a restart is able to close, rather than a number kept in this process's head.
+        owed: ledger.size(),
+        framesWrittenDown,
         stopped,
       };
     },
   };
+
+  // The structure's own change operations take the store's execution right like every other module's: a
+  // caller's hook is a synchronous function it handed in, so it can call back in while a frame is being
+  // processed, and the answer has to be the same wherever it lands. The unguarded names stay local to this
+  // function - admit, resume and redeliver are one operation rather than three - so that nothing reachable
+  // from a caller's hook can run one while another is in progress. The refusals are shapes the callers
+  // already read: `feed` answers like a refused frame, `start` like a structure that did not start, the
+  // rest carry the code.
+  const feedInternal = api.feed;
+  const acceptInternal = api.accept;
+  const redeliverPendingInternal = api.redeliverPending;
+  const resumeInternal = api.resume;
+  const startInternal = api.start;
+  const stopInternal = api.stop;
+  api.feed = feedGuarded;
+  api.accept = wiring.guard('structure.accept', acceptInternal);
+  api.redeliverPending = wiring.guard('structure.redeliverPending', redeliverPendingInternal, (refusal) => ({
+    applied: 0,
+    refused: true,
+    code: refusal.code,
+    reason: refusal.reason,
+  }));
+  api.resume = wiring.guard('structure.resume', resumeInternal, (refusal) => ({
+    delivered: 0,
+    refused: true,
+    code: refusal.code,
+    reason: refusal.reason,
+  }));
+  api.start = wiring.guard('structure.start', startInternal, (refusal) => ({
+    started: false,
+    code: refusal.code,
+    reason: refusal.reason,
+  }));
+  api.stop = wiring.guard('structure.stop', stopInternal);
+
+  // A restart resumes here, and not only in start(): what the raw holds and the board does not has to reach
+  // the book before anything else can accept a connection. Those frames are also what fixes the ceiling on
+  // where a connection's numbering may start - a completion above a frame already written down is a
+  // completion that skips it (§2.2) - so resuming in start() alone leaves the window open to any caller that
+  // accepts first, which is exactly the order a recovery is written in. It is driven through the guarded
+  // name, so the recovery holds the store while it runs: a hook it calls cannot start a second operation and
+  // hand the same frame to the same module twice.
+  api.resume();
 
   return api;
 }

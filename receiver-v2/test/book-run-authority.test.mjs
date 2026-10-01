@@ -9,6 +9,7 @@ import { openBook } from '../src/book/state.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { makeEnvelope } from '../src/envelope.mjs';
 import { withInjectableWrites, APPLIED_BOUNDARY_WRITE, RETIRED_RUN_WRITE } from '../test-support/failing-store.mjs';
+import { bindInternals, internalsOf } from '../src/internal/wiring.mjs';
 
 const envelope = (seq, connectionId, generation = null, runId = null, extra = {}) =>
   makeEnvelope({
@@ -138,12 +139,17 @@ test('a store that predates the ownership columns is migrated, and then keeps it
     assert.equal(book.phase, 'syncing');
 
     // The completion is a write, not a change of mind: it is in the store before a single frame is applied,
-    // so a restart in between cannot lose the anchor it has just established.
-    const between = openDurability({ path: dbPath, runId: 'run-A' });
-    const reopenedBetween = openBook({ market: 'kraken_spot', stream: 'book', durability: between });
-    assert.equal(reopenedBetween.appliedBoundary.firstSeq, 1, 'the origin is in the store as soon as it is known');
-    assert.equal(reopenedBetween.appliedBoundary.upToSeq, null, 'and it is still not a position');
-    between.close();
+    // so a restart in between cannot lose the anchor it has just established. It is read through this
+    // handle - one file is held by one handle at a time - and the restart below confirms it outlived the
+    // process that wrote it.
+    assert.equal(
+      first.db
+        .prepare('SELECT first_seq FROM applied_boundary WHERE market = ? AND stream = ?')
+        .get('kraken_spot', 'book').first_seq,
+      1,
+      'the origin is in the store as soon as it is known',
+    );
+    assert.equal(book.appliedBoundary.upToSeq, null, 'and it is still not a position');
 
     // One frame applied, so that position, origin and board all exist to be checked after a restart.
     const applied = book.apply({
@@ -630,6 +636,9 @@ test('a store another process migrates mid-way keeps the owner that process reco
           },
         },
       };
+      // The wrapper is the wiring's own: it re-binds to the store's private routes, because a module takes
+      // the right and the transactions from the wiring rather than from the object it is handed.
+      bindInternals(racing, internalsOf(store));
       const book = openBook({ market: 'kraken_spot', stream: 'book', durability: racing });
       return { store, book };
     };

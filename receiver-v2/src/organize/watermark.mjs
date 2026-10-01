@@ -30,17 +30,23 @@
  * resumes from what was written down, never from what was merely received.
  */
 
+import { bindInternals, internalsOf } from '../internal/wiring.mjs';
+
 const ORGANIZE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS organized_watermark (
-  connection_id TEXT NOT NULL PRIMARY KEY,
+  connection_id TEXT NOT NULL,
   market TEXT NOT NULL,
+  stream TEXT NOT NULL,
   up_to_receive_seq INTEGER,
-  updated_at_ms INTEGER NOT NULL
+  first_seq INTEGER,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (market, stream, connection_id)
 );
 CREATE TABLE IF NOT EXISTS organize_gap (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   connection_id TEXT NOT NULL,
   market TEXT NOT NULL,
+  stream TEXT NOT NULL,
   missing_from INTEGER NOT NULL,
   missing_to INTEGER NOT NULL,
   detected_at_ms INTEGER NOT NULL,
@@ -49,28 +55,71 @@ CREATE TABLE IF NOT EXISTS organize_gap (
 );
 `;
 
-export function openOrganizer({
-  market,
-  stream,
-  durability,
-  writeRaw,
-  firstSeq = 1,
-  nowMs = () => Date.now(),
-  capacity = () => 'ok',
-}) {
+/**
+ * Open an organizer. Opening it writes to the store, so the whole initialisation is one change operation: the
+ * execution right is taken here, which makes a re-entrant call from a hook the initialisation calls (the
+ * caller's clock, a writer, a migration's reader) an ordinary refusal instead of a nested `BEGIN`.
+ *
+ * The right, the transaction discipline and the observation of the right come from the wiring, never from
+ * the object handed in: a module that used a method on that object could be made to hand its unguarded
+ * routes to whoever replaced the method. Unbound means unopenable, before anything is written.
+ */
+export function openOrganizer(options) {
+  if (!options?.durability?.db) throw new TypeError('an organizer needs the durability store');
+  const wiring = internalsOf(options.durability);
+  return wiring.whileChange(() => openOrganizerWithin(options, wiring));
+}
+
+function openOrganizerWithin(options, wiring) {
+  const {
+    market,
+    stream,
+    durability,
+    writeRaw,
+    firstSeq = 1,
+    nowMs = () => Date.now(),
+    capacity = () => 'ok',
+  } = options;
   if (!market || !stream) throw new TypeError('an organizer needs a market and a stream');
   if (!durability?.db) throw new TypeError('an organizer needs the durability store');
   // The ceiling and the holes it implies are written together, so this module needs the store's
   // transaction discipline rather than a second copy of it.
-  if (typeof durability.inTransaction !== 'function') {
-    throw new TypeError('an organizer needs the durability store and its transactions');
-  }
+
   if (typeof writeRaw !== 'function') throw new TypeError('an organizer needs a way to write raw data');
   // writeRaw must be durable before it returns, and must say so: true means the canonical record is
   // safe. Anything else - false, a Promise, a count, silence - counts as "not durable yet", and
   // nothing is acknowledged or advanced on the strength of it.
 
-  durability.db.exec(ORGANIZE_SCHEMA);
+  // A store written before this module was the board's own - or before a connection's start was part of its
+  // record - cannot describe which board a position belonged to: its tables are keyed by connection id alone,
+  // and a connection id names two boards (a market's book and its trades share one). Those rows are therefore
+  // *not* attributed to either of them - guessing would hand one board the other's durability - and they are
+  // kept aside for inspection, under a name of their own so that a second migration cannot overwrite what an
+  // earlier one set aside. What the raw really holds is re-established from the ledger, and the writer's own
+  // contract (a frame it already holds is durable, not a refusal) is what keeps that honest.
+  //
+  // The new tables are created in the same transaction as the move, so a failure leaves the store as the older
+  // version wrote it rather than half of each.
+  wiring.inTransaction(() => {
+    const required = {
+      organized_watermark: ['stream', 'first_seq'],
+      organize_gap: ['stream'],
+    };
+    for (const [table, columnsNeeded] of Object.entries(required)) {
+      const columns = durability.db.prepare(`PRAGMA table_info(${table})`).all();
+      if (columns.length === 0) continue;
+      const names = new Set(columns.map((column) => column.name));
+      if (columnsNeeded.every((column) => names.has(column))) continue;
+      let legacy = `${table}_legacy`;
+      let suffix = 2;
+      const taken = (name) =>
+        durability.db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !==
+        undefined;
+      while (taken(legacy)) legacy = `${table}_legacy_${suffix++}`;
+      durability.db.exec(`ALTER TABLE ${table} RENAME TO ${legacy}`);
+    }
+    durability.db.exec(ORGANIZE_SCHEMA);
+  });
 
   let connectionId = null;
   let upToSeq = null; // null means: nothing durable yet, which is not the same as 0
@@ -92,24 +141,29 @@ export function openOrganizer({
   let identityRunId = null;
   let identityGeneration = null;
 
-  function persist(ceiling) {
+  // Every read and write here is this board's own: a connection id names a run's connection, and two boards
+  // (a market's book and its trades, say) share that name while being different boards. A position that
+  // belongs to another one of them is not this board's durability, and treating it as such would accept a
+  // frame the raw never took.
+  function persist(ceiling, start = baselineSeq) {
     if (connectionId === null) return;
     durability.db
       .prepare(
         `INSERT OR REPLACE INTO organized_watermark
-           (connection_id, market, up_to_receive_seq, updated_at_ms)
-         VALUES (?, ?, ?, ?)`,
+           (connection_id, market, stream, up_to_receive_seq, first_seq, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(connectionId, market, ceiling, nowMs());
+      .run(connectionId, market, stream, ceiling, start ?? null, nowMs());
   }
 
   function recordGap(from, to) {
     durability.db
       .prepare(
-        `INSERT INTO organize_gap (connection_id, market, missing_from, missing_to, detected_at_ms, reason)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO organize_gap
+           (connection_id, market, stream, missing_from, missing_to, detected_at_ms, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(connectionId, market, from, to, nowMs(), 'sequence gap seen in the received order');
+      .run(connectionId, market, stream, from, to, nowMs(), 'sequence gap seen in the received order');
   }
 
   /**
@@ -120,9 +174,9 @@ export function openOrganizer({
     durability.db
       .prepare(
         `UPDATE organize_gap SET filled_at_ms = ?
-         WHERE connection_id = ? AND filled_at_ms IS NULL AND missing_to <= ?`,
+         WHERE connection_id = ? AND market = ? AND stream = ? AND filled_at_ms IS NULL AND missing_to <= ?`,
       )
-      .run(nowMs(), connectionId, upTo);
+      .run(nowMs(), connectionId, market, stream, upTo);
   }
 
   /**
@@ -201,19 +255,28 @@ export function openOrganizer({
       };
     }
 
+    if (seq < baselineSeq) {
+      // Below where this connection's numbering starts: written down like any other frame (the raw is the
+      // canonical record, and this frame arrived), but never applicable to the board - so no ceiling moves,
+      // no hole is opened below the ceiling, and nothing is acknowledged for it. Saying "already durable"
+      // here would keep the frame out of the raw *and* out of the board while both claimed to have it.
+      return {
+        write: true,
+        ceiling: upToSeq,
+        outOfOrder,
+        held,
+        gaps,
+        closing,
+        result: {
+          accepted: true,
+          durable: true,
+          reason: "below this connection's first sequence",
+          ack: null,
+        },
+      };
+    }
+
     if (upToSeq === null) {
-      if (seq < baselineSeq) {
-        return {
-          write: false,
-          result: {
-            accepted: true,
-            duplicate: true,
-            alreadyDurable: true,
-            reason: "below this connection's first sequence",
-            ack: null,
-          },
-        };
-      }
       if (seq > baselineSeq) {
         // The connection's first sequence never arrived: that hole is a fact worth keeping, and this frame
         // is durable while it waits - which is what tells the caller it may still be routed onward.
@@ -277,7 +340,7 @@ export function openOrganizer({
     };
   }
 
-  return {
+  const api = {
     market,
     stream,
 
@@ -306,8 +369,8 @@ export function openOrganizer({
           // must leave the organizer as it was - with the completion still outstanding, so that asking
           // again can finish it - rather than leave a ceiling that is only in this process's head.
           const candidate = planFromOrigin(known);
-          durability.inTransaction(() => {
-            persist(candidate.ceiling);
+          wiring.inTransaction(() => {
+            persist(candidate.ceiling, known);
             for (const gap of candidate.gaps) recordGap(gap.from, gap.to);
             if (candidate.ceiling !== null) closeGapsUpTo(candidate.ceiling);
           });
@@ -327,11 +390,18 @@ export function openOrganizer({
       if (nextRunId === undefined) identityRunId = null;
       if (nextGeneration === undefined) identityGeneration = null;
       const row = durability.db
-        .prepare('SELECT up_to_receive_seq FROM organized_watermark WHERE connection_id = ?')
-        .get(connectionId);
-      if (row && row.up_to_receive_seq !== null) {
-        upToSeq = row.up_to_receive_seq;
-        baselineSeq = 1; // an existing watermark means the start of this connection is already known
+        .prepare(
+          `SELECT up_to_receive_seq, first_seq FROM organized_watermark
+            WHERE connection_id = ? AND market = ? AND stream = ?`,
+        )
+        .get(connectionId, market, stream);
+      // Where this connection's numbering starts is part of the record, and it is restored whether or not a
+      // ceiling was recorded with it: a connection whose frames are still held has a start and no position yet,
+      // and dropping the start there would put the judgement back on a guess - frames below the real start
+      // would look like ones this connection covers, and be answered as duplicates nobody wrote.
+      if (row) {
+        upToSeq = row.up_to_receive_seq ?? null;
+        baselineSeq = row.first_seq ?? known ?? null;
       } else {
         upToSeq = null;
         baselineSeq = known;
@@ -363,8 +433,17 @@ export function openOrganizer({
      * before the duplicate test and before the raw, because the canonical record must not hold a frame
      * nobody accepted, and a "durable" answer for one would leave the board holding nothing while the raw
      * says otherwise.
+     *
+     * rawAlreadyHolds, when given, says the raw already has this frame: the write is skipped, and the frame is
+     * judged durable on the caller's word - which is only sound because the caller is reading it back from the
+     * record of what was made durable.
+     *
+     * onIntent, when given, is called immediately before the write: it is where an intent that has to exist
+     * *because* a write is being attempted is written down, so the failure direction of a crash is the
+     * recoverable one. onDurable, when given, is called with the frame inside the same transaction that
+     * claims it durable: there the claim and its consequence cannot be separated by a crash.
      */
-    note(envelope) {
+    note(envelope, { onIntent = null, onDurable = null, rawAlreadyHolds = false } = {}) {
       if (connectionId === null) {
         // Fail-closed: nothing is accepted by default. A frame that is written down for a connection
         // nobody accepted is a frame that becomes the canonical record on the strength of its own
@@ -382,18 +461,52 @@ export function openOrganizer({
       }
       const seq = envelope.receive_seq;
 
-      // Already durable: a resend after a reconnect. Nothing to write, nothing to acknowledge anew.
-      if (upToSeq !== null && seq <= upToSeq) {
+      // Already durable: a resend after a reconnect. Only a sequence *inside* the numbering this connection
+      // covers can be that - below its first sequence is a frame that was never written, whatever the ceiling
+      // says, and treating it as durable would leave the canonical record without it.
+      if (upToSeq !== null && seq <= upToSeq && (baselineSeq === null || seq >= baselineSeq)) {
         // "Already durable" is not "already applied". A crash between the raw write and the board
         // leaves exactly this frame, and a resend is the only way it comes back - so the caller is told
         // the raw is safe and the frame may still need routing onward.
         return { accepted: true, duplicate: true, alreadyDurable: true, reason: 'already durable', ack: null };
       }
 
-      const durable = writeRaw(envelope) === true;
+      // The frame belongs to this connection and is not known to be durable yet, so a write is about to be
+      // attempted. Whatever has to be written down *because* of that goes here, before the write: the raw
+      // is outside this store's transactions, and of the two orders a crash can leave behind, only this one
+      // is recoverable - an intent for a frame the raw may not hold can be decided again, while a frame the
+      // raw does hold with nobody knowing it is owed is a frame that is never delivered.
+      // The hooks around the write are the caller's, and a caller's hook may hand the board to another
+      // connection while this frame is being written - the raw writer is where that happens today. The
+      // numbering this method is about to describe would then be the new connection's, and claiming a
+      // ceiling for it makes that connection's *next* frame answer "already durable" although nothing ever
+      // wrote it: the raw is left without the frame while both sides say they hold it. The connection that
+      // was accepted when the frame arrived is the one this frame belongs to, so it is fixed here and
+      // checked again after the write.
+      const ownerAtWrite = connectionId;
+      if (!rawAlreadyHolds && typeof onIntent === 'function') onIntent(envelope);
+
+      // rawAlreadyHolds is the caller saying this frame is in the canonical record already - a frame the raw
+      // holds above its contiguous position, which only the ledger can vouch for. The write is skipped because
+      // there is nothing to write, and the rest of this method (the ceiling, the holes, the acknowledgement)
+      // runs exactly as it does for a frame that has just been written.
+      const durable = rawAlreadyHolds || writeRaw(envelope) === true;
       if (!durable) {
         // The raw is not safe, so the watermark does not move and no acknowledgement is emitted.
         return { accepted: true, durable: false, reason: 'raw not durable yet', ack: null };
+      }
+
+      if (connectionId !== ownerAtWrite) {
+        // The board was handed to another connection inside a caller's hook. The frame was written, so its
+        // debt is recorded against the connection it arrived for - and nothing is claimed or acknowledged
+        // for the connection that took over, which never received this frame.
+        if (typeof onDurable === 'function') wiring.inTransaction(() => onDurable(envelope));
+        return {
+          accepted: true,
+          durable: true,
+          reason: 'the board was handed over while this frame was written',
+          ack: null,
+        };
       }
 
       const plan = planNote(seq);
@@ -401,10 +514,16 @@ export function openOrganizer({
 
       // The ceiling, the holes it opens and the holes it closes go in one transaction, and memory follows
       // the commit: a frame the store could not describe leaves this process exactly as it was.
-      durability.inTransaction(() => {
+      //
+      // Anything that has to be written down *because* this frame is durable goes in that same
+      // transaction, through the hook: the raw's claim and whatever depends on it become one commit, so
+      // no crash between them can leave a durable frame whose consequences were never written - which is
+      // the whole difference between knowing a frame exists and knowing it still has to be delivered.
+      wiring.inTransaction(() => {
         persist(plan.ceiling);
         for (const gap of plan.gaps) recordGap(gap.from, gap.to);
         if (plan.closing !== null) closeGapsUpTo(plan.closing);
+        if (typeof onDurable === 'function') onDurable(envelope);
       });
       upToSeq = plan.ceiling;
       outOfOrder = plan.outOfOrder;
@@ -419,9 +538,10 @@ export function openOrganizer({
       return durability.db
         .prepare(
           `SELECT missing_from, missing_to, detected_at_ms, reason FROM organize_gap
-           WHERE connection_id = ? AND filled_at_ms IS NULL ORDER BY missing_from`,
+           WHERE connection_id = ? AND market = ? AND stream = ? AND filled_at_ms IS NULL
+           ORDER BY missing_from`,
         )
-        .all(connectionId)
+        .all(connectionId, market, stream)
         .map((row) => ({
           missingFrom: row.missing_from,
           missingTo: row.missing_to,
@@ -430,4 +550,17 @@ export function openOrganizer({
         }));
     },
   };
+
+  // The unguarded routes. A caller that already holds the store's execution right - the module
+  // that *is* the operation in progress - goes through these; every other caller takes the public
+  // name above, which refuses a call that arrives while another change operation is running.
+  const internal = {
+    accept: api.accept,
+    note: api.note,
+  };
+  api.accept = wiring.guard('organizer.accept', internal.accept);
+  api.note = wiring.guard('organizer.note', internal.note);
+
+  bindInternals(api, internal);
+  return api;
 }

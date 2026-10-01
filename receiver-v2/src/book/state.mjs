@@ -26,6 +26,8 @@
  *    A null run is an identity of its own: "we were never told the run" is not "any run will do".
  */
 
+import { bindInternals, internalsOf } from '../internal/wiring.mjs';
+
 const SYNCING = 'syncing';
 const RUNNING = 'running';
 
@@ -110,14 +112,30 @@ export function createBoard() {
   };
 }
 
-export function openBook({ market, stream, durability, nowMs = () => Date.now() }) {
+/**
+ * Open a book. Opening it writes to the store, so the whole initialisation is one change operation: the
+ * execution right is taken here, which makes a re-entrant call from a hook the initialisation calls (the
+ * caller's clock, a writer, a migration's reader) an ordinary refusal instead of a nested `BEGIN`.
+ *
+ * The right, the transaction discipline and the observation of the right come from the wiring, never from
+ * the object handed in: a module that used a method on that object could be made to hand its unguarded
+ * routes to whoever replaced the method. Unbound means unopenable, before anything is written.
+ */
+export function openBook(options) {
+  if (!options?.durability?.db) throw new TypeError('a book needs the durability store');
+  const wiring = internalsOf(options.durability);
+  return wiring.whileChange(() => openBookWithin(options, wiring));
+}
+
+function openBookWithin(options, wiring) {
+  const {
+    market, stream, durability, nowMs = () => Date.now()
+  } = options;
   if (!market || !stream) throw new TypeError('a book needs a market and a stream');
   if (!durability?.db) throw new TypeError('a book needs the durability store for its position');
   // The book writes several records in one transaction, so it needs the store's transaction discipline
   // rather than its own copy of it: a half-written ownership chain is not recoverable.
-  if (typeof durability.inTransaction !== 'function') {
-    throw new TypeError('a book needs the durability store and its transactions');
-  }
+
 
   durability.db.exec(BOOK_SCHEMA);
   const board = createBoard();
@@ -147,7 +165,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     // The look before the transaction is only a reason to enter it: what is actually added is decided inside,
     // with the write lock held, because another process may have migrated this same store since.
     if (ownershipColumns.some(([name]) => !columnNames().has(name))) {
-      durability.inTransaction(() => {
+      wiring.inTransaction(() => {
         // §6.2: the columns are read inside the transaction, so the set that is missing is the set at the
         // moment of writing - with the write lock held, nothing else can be moving the store underneath.
         const present = columnNames();
@@ -253,7 +271,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
   // rather than left open to being claimed by another run or generation. A store whose row predates the
   // ownership columns is left alone: it has no established owner to write down yet.
   if (row && ownerEstablished && recordedIdentityStatement.get(market, stream, row.connection_id) === undefined) {
-    durability.inTransaction(() => {
+    wiring.inTransaction(() => {
       identityStatement.run(market, stream, row.connection_id, applied.runId, applied.generation);
     });
   }
@@ -284,7 +302,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       next.connectionId !== applied.connectionId ||
       (next.generation ?? null) !== (applied.generation ?? null) ||
       (next.runId ?? null) !== (applied.runId ?? null);
-    durability.inTransaction(() => {
+    wiring.inTransaction(() => {
       if (retiring) retireStatement.run(market, stream, retiredKey, nowMs());
       if (clearUnrecordedOwner) clearUnrecordedOwnerStatement.run(market, stream);
       // The name and the identity it was accepted as are written down together with the position: a name is what
@@ -309,7 +327,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
 
   /** Everything that makes one range durable: the levels and the position, in one transaction. */
   function commitRange({ changes, next }) {
-    durability.inTransaction(() => {
+    wiring.inTransaction(() => {
       for (const change of changes) {
         if (change.size === 0) levelDelete.run(market, stream, change.side, change.price);
         else levelUpsert.run(market, stream, change.side, change.price, change.size);
@@ -372,7 +390,7 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     return count;
   }
 
-  return {
+  const api = {
     market,
     stream,
     board,
@@ -567,7 +585,11 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
         return { applied: false, reason: 'this frame belongs to another generation' };
       }
       const seq = envelope.receive_seq;
-      if (applied.upToSeq !== null && seq <= applied.upToSeq) {
+      if (
+        applied.upToSeq !== null &&
+        seq <= applied.upToSeq &&
+        (applied.firstSeq === null || seq >= applied.firstSeq)
+      ) {
         return { applied: false, reason: 'already applied' };
       }
 
@@ -596,13 +618,18 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       }
 
       const firstSeq = applied.firstSeq ?? envelope.meta?.first_seq ?? null;
+      // Below where this connection's numbering starts, whatever the position says: it was never applied and
+      // never will be, so it is a permanent loss rather than a duplicate - and reporting it as a duplicate
+      // would hide the fact that the frame is nowhere on this board.
+      if (firstSeq !== null && seq < firstSeq) {
+        return { applied: false, reason: 'below the first sequence' };
+      }
       if (applied.upToSeq === null) {
         if (firstSeq === null) {
           // Nowhere to anchor the boundary. Starting at whatever arrived first would be guessing at
           // where this connection's stream begins.
           return { applied: false, reason: 'first sequence unknown' };
         }
-        if (seq < firstSeq) return { applied: false, reason: 'below the first sequence' };
         if (seq > firstSeq) {
           // The first sequence never arrived. That hole is a fact, and this frame is kept until it
           // is filled rather than dropped on the floor.
@@ -683,4 +710,32 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       return { proven: true, reason: 'boundary proven' };
     },
   };
+
+  // The board as a caller sees it. The levels this book believes in are worth reading - a boundary proof is
+  // about exactly them - but writing them from outside would move the book's state without its position, and
+  // the store and the memory disagreeing about where this board stands is the one thing that is not allowed.
+  api.board = Object.freeze({
+    size: (side, price) => board.size(side, price),
+    rows: () => board.rows(),
+    get depth() {
+      return board.depth;
+    },
+  });
+
+  // The unguarded routes. A caller that already holds the store's execution right - the module
+  // that *is* the operation in progress - goes through these; every other caller takes the public
+  // name above, which refuses a call that arrives while another change operation is running.
+  const internal = {
+    accept: api.accept,
+    apply: api.apply,
+    beginSync: api.beginSync,
+    proveBoundary: api.proveBoundary,
+  };
+  api.accept = wiring.guard('book.accept', internal.accept);
+  api.apply = wiring.guard('book.apply', internal.apply, (refusal) => ({ applied: false, code: refusal.code, reason: refusal.reason }));
+  api.beginSync = wiring.guard('book.beginSync', internal.beginSync);
+  api.proveBoundary = wiring.guard('book.proveBoundary', internal.proveBoundary);
+
+  bindInternals(api, internal);
+  return api;
 }
