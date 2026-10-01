@@ -34,12 +34,15 @@ import { makeEnvelope } from '../envelope.mjs';
 import { createSpool } from '../spool.mjs';
 import { createReceiveConnection } from '../ingest/connection.mjs';
 import { bindInternals, constructorOf, internalsOf } from '../internal/wiring.mjs';
+import { openDurability } from '../durability.mjs';
 
 export function createStructure({
   market,
   stream = 'trades',
   adapter,
-  durability,
+  path = null,
+  Database = null,
+  durability = null,
   webSocketImpl,
   rawWriter,
   spoolDir = null,
@@ -54,7 +57,13 @@ export function createStructure({
   maxWaitingEvents = 1_000,
   ...receiveOptions
 }) {
-  if (!durability?.db) throw new TypeError('the structure needs the durability store');
+  // The store is the structure's own: given a path, it opens it here and never hands it out, so nothing a
+  // caller holds is a way to write around the structure. (The wiring may still pass one it opened itself -
+  // the tests do - and that path stays inside the module either way.)
+  const store =
+    durability ?? (path ? openDurability({ path, runId, ...(Database ? { Database } : {}) }) : null);
+  if (!store?.db) throw new TypeError('the structure needs a path for its store');
+  durability = store;
   if (typeof rawWriter !== 'function') throw new TypeError('the structure needs a raw writer');
   // A structure that organizes one stream while its adapter carries another can only produce frames the
   // board will refuse as belonging to another board - after they have been written to the raw. The
@@ -791,6 +800,16 @@ export function createStructure({
       connection.stop();
       spool?.close();
     },
+    /** The termination of the structure: reception, the spool, and the store it owns. */
+    close: () => {
+      // The structure owns its store, so it is also what ends it: reception first, then the store, and the
+      // file is free only after the close that succeeded.
+      connection.stop();
+      spool?.close();
+      // The store's own close would be refused inside this operation; the wiring's is the same close without
+      // a second take.
+      wiring.close();
+    },
     /** A frame handed in directly, for a replay adapter or a dry run. */
     feed,
     applyHeld: () => {
@@ -843,6 +862,7 @@ export function createStructure({
       },
       refusalShape,
     );
+  const closeInternal = api.close;
   api.feed = window('structure.feed', feed);
   api.accept = window('structure.accept', acceptInternal);
   api.redeliverPending = window('structure.redeliverPending', redeliverPendingInternal, (refusal) => ({
@@ -863,6 +883,7 @@ export function createStructure({
     reason: refusal.reason,
   }));
   api.stop = window('structure.stop', stopInternal);
+  api.close = window('structure.close', closeInternal);
 
   // A restart resumes here, and not only in start(): what the raw holds and the board does not has to reach
   // the book before anything else can accept a connection. Those frames are also what fixes the ceiling on

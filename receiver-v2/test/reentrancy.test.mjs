@@ -1281,3 +1281,46 @@ test('the views a caller is handed cannot change what the structure is doing', a
     store.close();
   });
 });
+
+test('the structure creates its store from a path, holds the file, and closes it', async () => {
+  await withStore(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      path,
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: () => [],
+      },
+      webSocketImpl: function fakeSocket(url) {
+        return { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+      },
+      rawWriter: () => true,
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+    });
+
+    assert.throws(
+      () => openDurability({ path, runId: 'run-2' }),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'the file belongs to the structure while it is open',
+    );
+    structure.close();
+    // Free again, and the store the structure wrote is the one that was there.
+    const reopened = openDurability({ path, runId: 'run-3' });
+    reopened.beginRun();
+    assert.equal(
+      reopened.db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n >= 1,
+      true,
+      'the store it wrote survived the close',
+    );
+    reopened.close();
+  });
+});

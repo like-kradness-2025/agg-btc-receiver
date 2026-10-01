@@ -437,6 +437,15 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   // caller holds would hand its unguarded route to whoever replaced that method: the route would then be
   // callable from inside a frame, and the same frame would be written twice.
   const exported = { ...api, inChange, REENTRANT_OPERATION };
-  bindInternals(exported, { guard, inTransaction, inChange, whileChange, REENTRANT_OPERATION });
+  bindInternals(exported, {
+    guard,
+    inTransaction,
+    inChange,
+    whileChange,
+    // The unguarded close: the wiring that holds the right for an operation of its own (a structure's
+    // termination) closes the store inside it, and the public name would refuse that as a second operation.
+    close: internal.close,
+    REENTRANT_OPERATION,
+  });
   return exported;
 }
