@@ -30,7 +30,7 @@
  * resumes from what was written down, never from what was merely received.
  */
 
-import { bindInternals, internalsOf } from '../internal/wiring.mjs';
+import { bindConstructor, bindInternals, internalsOf } from '../internal/wiring.mjs';
 
 const ORGANIZE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS organized_watermark (
@@ -69,6 +69,8 @@ export function openOrganizer(options) {
   const wiring = internalsOf(options.durability);
   return wiring.whileChange(() => openOrganizerWithin(options, wiring));
 }
+
+bindConstructor('organizer', openOrganizerWithin);
 
 function openOrganizerWithin(options, wiring) {
   const {

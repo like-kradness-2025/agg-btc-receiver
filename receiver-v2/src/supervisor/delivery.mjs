@@ -39,7 +39,7 @@
  * decides that a permanent loss is finished with.
  */
 
-import { bindInternals, internalsOf } from '../internal/wiring.mjs';
+import { bindConstructor, bindInternals, internalsOf } from '../internal/wiring.mjs';
 
 const LEDGER_SCHEMA = `
 CREATE TABLE IF NOT EXISTS delivery_ledger (
@@ -80,6 +80,8 @@ export function openDeliveryLedger(options) {
   const wiring = internalsOf(options.durability);
   return wiring.whileChange(() => openDeliveryLedgerWithin(options, wiring));
 }
+
+bindConstructor('ledger', openDeliveryLedgerWithin);
 
 function openDeliveryLedgerWithin(options, wiring) {
   const {

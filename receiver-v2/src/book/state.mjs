@@ -26,7 +26,7 @@
  *    A null run is an identity of its own: "we were never told the run" is not "any run will do".
  */
 
-import { bindInternals, internalsOf } from '../internal/wiring.mjs';
+import { bindConstructor, bindInternals, internalsOf } from '../internal/wiring.mjs';
 
 const SYNCING = 'syncing';
 const RUNNING = 'running';
@@ -126,6 +126,8 @@ export function openBook(options) {
   const wiring = internalsOf(options.durability);
   return wiring.whileChange(() => openBookWithin(options, wiring));
 }
+
+bindConstructor('book', openBookWithin);
 
 function openBookWithin(options, wiring) {
   const {

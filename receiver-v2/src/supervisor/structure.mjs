@@ -33,7 +33,7 @@ import { openDeliveryLedger, INTENT, OWED } from './delivery.mjs';
 import { makeEnvelope } from '../envelope.mjs';
 import { createSpool } from '../spool.mjs';
 import { createReceiveConnection } from '../ingest/connection.mjs';
-import { internalsOf } from '../internal/wiring.mjs';
+import { constructorOf, internalsOf } from '../internal/wiring.mjs';
 
 export function createStructure({
   market,
@@ -50,6 +50,7 @@ export function createStructure({
   onGap = () => {},
   onStop = () => {},
   onDiagnostic = () => {},
+  nowMs = () => Date.now(),
   ...receiveOptions
 }) {
   if (!durability?.db) throw new TypeError('the structure needs the durability store');
@@ -66,18 +67,6 @@ export function createStructure({
   // The right, the transactions and the observation come from the wiring, never from the object handed in.
   const wiring = internalsOf(durability);
 
-  // The private routes of each module are obtained here, by the wiring that opened them, and the module
-  // objects themselves carry none of them: a hook that can reach an unguarded route can hand the same frame
-  // to the same book twice, or release the right that is holding its own frame. Nothing a caller is handed -
-  // no object and no argument - holds them either; see `internal/wiring.mjs`.
-  const book = openBook({ market, stream, durability });
-  const bookInternal = internalsOf(book);
-  const spool = spoolDir ? createSpool({ dir: spoolDir }) : null;
-  // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
-  // this process, because the frames it names are only recoverable while that knowledge survives a crash.
-  const ledger = openDeliveryLedger({ durability, market, stream });
-  const ledgerInternal = internalsOf(ledger);
-
   // Backpressure is decided here rather than inside a buffer. In one process the roles are called
   // synchronously, so the pressure shows up as the raw writer refusing: the frame then goes to the
   // spool, and only if the spool cannot hold it either does reception stop. (Across processes the
@@ -89,17 +78,35 @@ export function createStructure({
   let spooledFrames = 0;
   let refusedFrames = 0;
 
-  const organizer = openOrganizer({
-    market,
-    stream,
-    durability,
-    writeRaw: (envelope) => {
-      const written = rawWriter(envelope);
-      return written === true; // only a durable write may be acknowledged
-    },
-    capacity: () => (stopped ? 'stopped' : 'ok'),
-  });
+  // The construction is one operation of its own: the parts are opened through their internal path, which
+  // does not take the right again, and the whole of it runs inside one take - so no hook an initialisation
+  // calls can find the store free. The right is the store's own; nothing here adds a second flag for it.
+  // The private routes are collected as the parts are built: the part objects themselves carry none of
+  // them, and neither does anything a caller is handed - see `internal/wiring.mjs`.
+  const { book, ledger, organizer } = wiring.whileChange(() => ({
+    book: constructorOf('book')({ market, stream, durability, nowMs }, wiring),
+    // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
+    // this process, because the frames it names are only recoverable while that knowledge survives a crash.
+    ledger: constructorOf('ledger')({ durability, market, stream, nowMs }, wiring),
+    organizer: constructorOf('organizer')(
+      {
+        market,
+        stream,
+        durability,
+        writeRaw: (envelope) => {
+          const written = rawWriter(envelope);
+          return written === true; // only a durable write may be acknowledged
+        },
+        capacity: () => (stopped ? 'stopped' : 'ok'),
+        nowMs,
+      },
+      wiring,
+    ),
+  }));
+  const bookInternal = internalsOf(book);
+  const ledgerInternal = internalsOf(ledger);
   const organizerInternal = internalsOf(organizer);
+  const spool = spoolDir ? createSpool({ dir: spoolDir }) : null;
 
   // The run this structure has already admitted for this board. A takeover is issued once per run: the
   // second connection of the same run is a change of connection, not a new claim on the board, and the

@@ -1057,3 +1057,105 @@ test('a connection handed to a caller cannot be restarted from inside a synchron
     store.close();
   });
 });
+
+test('every public operation of the structure is refused from inside a frame', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const attempts = [];
+    let armed = true;
+    const structure = build(store, {
+      written,
+      onRawWrite: () => {
+        if (!armed) return;
+        armed = false;
+        // Every window the structure offers a caller, driven from inside the frame that is being written.
+        attempts.push(structure.feed(envelope(2)));
+        attempts.push(structure.accept('conn-9', { runId: 'run-1', generation: 1, firstSeq: 1 }));
+        attempts.push(structure.resume());
+        attempts.push(structure.redeliverPending());
+        attempts.push(structure.start());
+        attempts.push(structure.stop());
+      },
+    });
+    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    const first = structure.feed(envelope(1));
+    const second = structure.feed(envelope(2));
+
+    assert.equal(attempts.length, 6, 'all six were attempted from inside the frame');
+    for (const [index, result] of attempts.entries()) {
+      assert.equal(result?.code, 'REENTRANT_OPERATION', `attempt ${index} came back as our refusal, not a throw`);
+    }
+    assert.equal(first.applied, true, 'the frame that was being processed completed');
+    assert.equal(second.applied, true, 'and so did the next one');
+    assert.deepEqual(written, ['conn-1:1', 'conn-1:2'], 'each was written to the raw exactly once');
+    store.close();
+  });
+});
+
+test('the construction of a structure holds the store while its parts are opened', async () => {
+  await withStore(async (dir) => {
+    // A store that predates the ownership columns: opening the book migrates it, and the migration calls the
+    // clock - the hook a re-entrant call can be driven from, during the structure's own construction.
+    const { DatabaseSync } = await import('node:sqlite');
+    const path = join(dir, 'state.sqlite');
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE applied_boundary (
+        market TEXT NOT NULL, stream TEXT NOT NULL, connection_id TEXT, generation INTEGER,
+        up_to_receive_seq INTEGER, updated_at_ms INTEGER, PRIMARY KEY (market, stream)
+      );
+      INSERT INTO applied_boundary (market, stream, connection_id, generation, up_to_receive_seq, updated_at_ms)
+      VALUES ('kraken_spot', 'book', 'kraken_spot:1', 5, 7, 1);
+    `);
+    legacy.close();
+
+    const store = openDurability({ path, runId: 'run-1' });
+    const seen = [];
+    let armed = true;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: () => [],
+      },
+      durability: store,
+      webSocketImpl: function fakeSocket(url) {
+        return { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+      },
+      rawWriter: () => true,
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+      nowMs: () => {
+        if (armed) {
+          armed = false;
+          seen.push({ inChange: store.inChange() });
+          // The structure is still being built, so the re-entry is driven at the store's own surface.
+          try {
+            // A store operation refuses by returning its refusal, and the caller's transaction by throwing;
+            // both shapes are read here.
+            const result = store.beginRun();
+            seen.push({ refused: result?.code ?? null });
+          } catch (error) {
+            seen.push({ refused: error.code });
+          }
+        }
+        return Date.now();
+      },
+    });
+
+    assert.equal(armed, false, 'the clock was called while the structure was being built');
+    assert.equal(seen[0].inChange, true, 'the construction holds the store while its parts are opened');
+    assert.equal(seen[1].refused, 'REENTRANT_OPERATION', 'so a public operation from inside it is refused');
+    structure.stop();
+    store.close();
+  });
+});
