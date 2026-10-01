@@ -51,6 +51,7 @@ export function createStructure({
   onStop = () => {},
   onDiagnostic = () => {},
   nowMs = () => Date.now(),
+  maxWaitingEvents = 1_000,
   ...receiveOptions
 }) {
   if (!durability?.db) throw new TypeError('the structure needs the durability store');
@@ -459,7 +460,47 @@ export function createStructure({
   // connection, which announces its generation and hands over what it already holds synchronously - and
   // those are this operation's own continuation, so they run unguarded. `drivingReception` is raised only
   // around that call, in this module's own closure, so nothing a caller or a hook can reach can raise it.
-  const feedGuarded = wiring.guard('structure.feed', feed);
+  // Every arrival from outside is handed to this executor. When the store is free the work runs now, inside
+  // one take; when an operation is running it is kept, in order, and run when that operation's own work is
+  // done - nothing is dropped, and nothing runs in the middle of a frame. A wait-list that fills up stops
+  // reception and says what was dropped, because silence would look like a quiet stream.
+  const waiting = [];
+  let draining = false;
+  const receiveEvent = (label, work) => {
+    if (wiring.inChange() !== true) {
+      // Free: this arrival is an operation of its own, and whatever arrived while it ran follows it.
+      return wiring.whileChange(() => {
+        const result = work();
+        drainWaiting();
+        return result;
+      });
+    }
+    if (waiting.length >= maxWaitingEvents) {
+      stopped = true;
+      onStop({
+        market,
+        reason: `the wait-list for arrivals is full (${maxWaitingEvents}); ${label} was dropped`,
+      });
+      return false;
+    }
+    waiting.push({ label, work });
+    return undefined;
+  };
+  // Runs after the operation's own work is done, and inside it: the tasks are continuations, so they take no
+  // right of their own and a task that causes another arrival queues it for the same loop.
+  const drainWaiting = () => {
+    if (draining) return;
+    draining = true;
+    try {
+      while (waiting.length > 0) {
+        const next = waiting.shift();
+        next.work();
+      }
+    } finally {
+      draining = false;
+    }
+  };
+
   const admitGuarded = wiring.guard('structure.accept', admitOnGeneration, () => {
     onDiagnostic({
       market,
@@ -467,7 +508,7 @@ export function createStructure({
     });
     return false;
   });
-  const feedEntry = (envelope) => (drivingReception ? feed(envelope) : feedGuarded(envelope));
+  const feedEntry = (envelope) => receiveEvent('message', () => feed(envelope));
   const admitEntry = (details) => (drivingReception ? admitOnGeneration(details) : admitGuarded(details));
 
   const connection = createReceiveConnection({
@@ -749,26 +790,38 @@ export function createStructure({
   const resumeInternal = api.resume;
   const startInternal = api.start;
   const stopInternal = api.stop;
-  api.feed = feedGuarded;
-  api.accept = wiring.guard('structure.accept', acceptInternal);
-  api.redeliverPending = wiring.guard('structure.redeliverPending', redeliverPendingInternal, (refusal) => ({
+  // A window takes the right, runs the operation, and then lets the arrivals that waited for it through -
+  // all inside the same take, so an arrival is never processed in the middle of the frame that was running.
+  const window = (name, run, refusalShape) =>
+    wiring.guard(
+      name,
+      (...args) => {
+        const result = run(...args);
+        drainWaiting();
+        return result;
+      },
+      refusalShape,
+    );
+  api.feed = window('structure.feed', feed);
+  api.accept = window('structure.accept', acceptInternal);
+  api.redeliverPending = window('structure.redeliverPending', redeliverPendingInternal, (refusal) => ({
     applied: 0,
     refused: true,
     code: refusal.code,
     reason: refusal.reason,
   }));
-  api.resume = wiring.guard('structure.resume', resumeInternal, (refusal) => ({
+  api.resume = window('structure.resume', resumeInternal, (refusal) => ({
     delivered: 0,
     refused: true,
     code: refusal.code,
     reason: refusal.reason,
   }));
-  api.start = wiring.guard('structure.start', startInternal, (refusal) => ({
+  api.start = window('structure.start', startInternal, (refusal) => ({
     started: false,
     code: refusal.code,
     reason: refusal.reason,
   }));
-  api.stop = wiring.guard('structure.stop', stopInternal);
+  api.stop = window('structure.stop', stopInternal);
 
   // A restart resumes here, and not only in start(): what the raw holds and the board does not has to reach
   // the book before anything else can accept a connection. Those frames are also what fixes the ceiling on

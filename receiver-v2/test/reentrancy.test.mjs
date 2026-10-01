@@ -1159,3 +1159,104 @@ test('the construction of a structure holds the store while its parts are opened
     store.close();
   });
 });
+
+test('an arrival during a frame waits its turn instead of being refused or dropped', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const acks = [];
+    let socket = null;
+    let duringWrite = null;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      webSocketImpl: function fakeSocket(url) {
+        socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(frame.receive_seq);
+        if (written.length === 1) {
+          // Two more frames arrive while this one is being written.
+          socket.onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+          socket.onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) });
+          duringWrite = [...written];
+        }
+        return true;
+      },
+      onAck: (ack) => acks.push(ack.upToSeq),
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    socket.onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+
+    assert.deepEqual(duringWrite, [1], 'nothing was written for the frames that arrived during the write');
+    assert.deepEqual(written, [1, 2, 3], 'and then they ran in order, once each, before the frame returned');
+    assert.deepEqual(acks, [1, 2, 3], 'with the acknowledgements in the same order');
+
+    socket.onmessage?.({ data: JSON.stringify({ seq: 4, size: 4 }) });
+    assert.deepEqual(written, [1, 2, 3, 4], 'and an arrival with nothing running is processed at once');
+    store.close();
+  });
+});
+
+test('a wait-list that fills up stops reception and says what was dropped', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const stops = [];
+    let socket = null;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      maxWaitingEvents: 1,
+      webSocketImpl: function fakeSocket(url) {
+        socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(frame.receive_seq);
+        if (written.length === 1) {
+          socket.onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+          socket.onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) });
+        }
+        return true;
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: (stop) => stops.push(stop),
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    socket.onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+
+    assert.equal(stops.length, 1, 'the structure stopped instead of dropping an arrival in silence');
+    assert.match(String(stops[0].reason), /wait-list/, 'and it says which wait-list filled up');
+    assert.match(String(stops[0].reason), /message/, 'and which arrival it was');
+    store.close();
+  });
+});
