@@ -9,6 +9,11 @@ import { openBook } from '../src/book/state.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { createStructure } from '../src/supervisor/structure.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
+/** The parts of a structure, for a test that drives one of them directly: the wiring's private side. */
+const partsOf = (structure) => internalsOf(structure);
+
 const envelope = (seq, connectionId = 'conn-1', meta = { first_seq: 1 }) =>
   makeEnvelope({
     market: 'kraken_spot',
@@ -379,7 +384,7 @@ test('an owner without a run name is not handed the board back, and nothing of i
     // A named run takes it over - the authorisation is issued where reception starts, which is what the board
     // sees here.
     assert.equal(
-      unnamed.book.accept('B:v:m:1', { runId: 'B', generation: 1, firstSeq: 1, takeover: true }).accepted,
+      partsOf(unnamed).book.accept('B:v:m:1', { runId: 'B', generation: 1, firstSeq: 1, takeover: true }).accepted,
       true,
     );
     first.close();

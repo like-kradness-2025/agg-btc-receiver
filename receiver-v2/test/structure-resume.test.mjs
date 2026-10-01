@@ -16,6 +16,11 @@ import {
   LEDGER_CONFIRM_WRITE,
 } from '../test-support/failing-store.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
+/** The parts of a structure, for a test that drives one of them directly: the wiring's private side. */
+const partsOf = (structure) => internalsOf(structure);
+
 const envelope = (seq, { connectionId = 'conn-1', generation = 1, payload, meta = { first_seq: 1 } } = {}) =>
   makeEnvelope({
     market: 'kraken_spot',
@@ -217,7 +222,7 @@ test('a restart closes the difference between the two positions before reception
     assert.equal(before.stats.owed, 0);
     // Exactly the crash the ledger exists for: the raw holds a frame the board never saw, and the process
     // is gone before the board could be told.
-    assert.equal(before.ledger.record(envelope(5), 'the raw held it and the board never saw it').recorded, true);
+    assert.equal(partsOf(before).ledger.record(envelope(5), 'the raw held it and the board never saw it').recorded, true);
     first.close();
 
     const second = openDurability({ path, runId: 'run-2' });
@@ -362,7 +367,7 @@ test('an intent left behind by a crash is decided again from its own frame', asy
     before.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // The crash the intent exists for: the frame was written down as about to be made durable, and the
     // process died before the raw write could be attempted or completed.
-    assert.equal(before.ledger.record(envelope(4), 'about to be written', 'intent').recorded, true);
+    assert.equal(partsOf(before).ledger.record(envelope(4), 'about to be written', 'intent').recorded, true);
     assert.equal(before.ledger.pending()[0].state, 'intent', 'and it is not a frame the raw holds');
     assert.equal(before.ledger.size(), 1);
     first.close();
@@ -443,7 +448,7 @@ test('a frame the raw may not hold is not delivered to the board', async () => {
     before.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // An intent is a frame the raw may not hold. Delivering it would put the board ahead of the canonical
     // record, so it is not the board's to take until the write it stands for has happened.
-    assert.equal(before.ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
+    assert.equal(partsOf(before).ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
     const result = before.redeliverPending();
     assert.equal(result.applied, 0, 'nothing was delivered');
     assert.equal(result.stillPending, 1, 'and the entry is still there');
@@ -460,7 +465,7 @@ test('a refused attempt does not forget a frame the raw may already hold', async
     before.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // The crash this entry survives: the raw write happened, and the claim that would have confirmed it
     // never committed, so the entry is still an intent.
-    assert.equal(before.ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
+    assert.equal(partsOf(before).ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
     first.close();
 
     const second = openDurability({ path, runId: 'run-2' });
@@ -528,8 +533,7 @@ test('an intent cannot be re-decided into a start that skips a frame the store h
     assert.equal(before.feed(envelope(3, { meta: null })).reason, 'first sequence unknown');
     // And the frame that was being written when the process died, declaring a start above it.
     assert.equal(
-      before.ledger
-        .record(envelope(5, { meta: { first_seq: 5 } }), 'about to be written', 'intent')
+      partsOf(before).ledger.record(envelope(5, { meta: { first_seq: 5 } }), 'about to be written', 'intent')
         .recorded,
       true,
     );
@@ -609,7 +613,7 @@ test('a stop that happens while recovering keeps the socket shut', async () => {
     // its re-decision on start, and nothing can hold the frame.
     const after = build(second, { opened, stops, rawWriter: () => false });
     after.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
-    assert.equal(after.ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
+    assert.equal(partsOf(after).ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
     assert.equal(after.stats.stopped, false);
 
     const started = after.start();
@@ -730,7 +734,7 @@ test('a retried intent writes and delivers the frame that was written down, not 
     const before = build(first);
     before.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // The frame was written down before the raw write (size 3) and the process died there.
-    assert.equal(before.ledger.record(envelope(3), 'about to be written', 'intent').recorded, true);
+    assert.equal(partsOf(before).ledger.record(envelope(3), 'about to be written', 'intent').recorded, true);
     first.close();
 
     const second = openDurability({ path, runId: 'run-2' });
@@ -764,7 +768,7 @@ test('the stored frame decides what is declared, not the resend that arrives', a
     const before = build(first);
     before.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: null });
     // The frame the raw holds under this key declares nothing about where the numbering starts.
-    assert.equal(before.ledger.record(envelope(3, { meta: null }), 'owed').recorded, true);
+    assert.equal(partsOf(before).ledger.record(envelope(3, { meta: null }), 'owed').recorded, true);
     first.close();
 
     const second = openDurability({ path, runId: 'run-2' });
@@ -787,9 +791,9 @@ test('a frame is not released while the raw itself cannot vouch for it', async (
     assert.equal(structure.feed(envelope(1)).applied, true);
     // The raw holds sequence 2 and its own contiguous position has not reached it: the entry is the only
     // record of that, so reaching it on the board is not a reason to forget it.
-    assert.equal(structure.ledger.record(envelope(2), 'owed').recorded, true);
+    assert.equal(partsOf(structure).ledger.record(envelope(2), 'owed').recorded, true);
     assert.equal(
-      structure.book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 2 }] }).applied,
+      partsOf(structure).book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 2 }] }).applied,
       true,
       'the board has it',
     );
@@ -848,7 +852,7 @@ test('what is spilled is the frame the key means, not the resend that arrived', 
     const before = build(first);
     before.accept(connectionId, { runId: 'run-1', generation: 1, firstSeq: 1 });
     assert.equal(
-      before.ledger.record(envelope(3, { connectionId }), 'about to be written', 'intent').recorded,
+      partsOf(before).ledger.record(envelope(3, { connectionId }), 'about to be written', 'intent').recorded,
       true,
     );
     first.close();
@@ -885,9 +889,9 @@ test('a frame is not released on the raw\'s silence', async () => {
     const structure = build(store);
     // The board holds a position while the raw's own record says nothing about this connection: the entry is
     // the only statement that the raw holds the frame, so nothing may release it.
-    structure.book.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
-    assert.equal(structure.book.apply({ envelope: envelope(1), changes: [] }).applied, true);
-    assert.equal(structure.ledger.record(envelope(1), 'owed').recorded, true);
+    partsOf(structure).book.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    assert.equal(partsOf(structure).book.apply({ envelope: envelope(1), changes: [] }).applied, true);
+    assert.equal(partsOf(structure).ledger.record(envelope(1), 'owed').recorded, true);
     assert.equal(structure.organizer.ackState.upToSeq, null, 'the raw claims nothing contiguously');
 
     // A resend of it is served from the store, and that is the moment the release is decided.

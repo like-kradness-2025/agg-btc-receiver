@@ -11,6 +11,10 @@ import { makeEnvelope } from '../src/envelope.mjs';
 import { withInjectableWrites, APPLIED_BOUNDARY_WRITE, RETIRED_RUN_WRITE } from '../test-support/failing-store.mjs';
 import { bindInternals, internalsOf } from '../src/internal/wiring.mjs';
 
+
+/** The parts of a structure, for a test that drives one of them directly: the wiring's private side. */
+const partsOf = (structure) => internalsOf(structure);
+
 const envelope = (seq, connectionId, generation = null, runId = null, extra = {}) =>
   makeEnvelope({
     market: 'kraken_spot',

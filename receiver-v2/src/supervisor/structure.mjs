@@ -33,7 +33,7 @@ import { openDeliveryLedger, INTENT, OWED } from './delivery.mjs';
 import { makeEnvelope } from '../envelope.mjs';
 import { createSpool } from '../spool.mjs';
 import { createReceiveConnection } from '../ingest/connection.mjs';
-import { constructorOf, internalsOf } from '../internal/wiring.mjs';
+import { bindInternals, constructorOf, internalsOf } from '../internal/wiring.mjs';
 
 export function createStructure({
   market,
@@ -522,11 +522,74 @@ export function createStructure({
     onGeneration: admitEntry,
   });
 
-  // What a caller is handed for the connection: its reads are the connection's own, while starting and
-  // stopping it are change operations. A connection replaced from inside an operation hands the board a new
-  // identity while the frame being processed belongs to the old one, and that frame is then refused as
-  // belonging to a connection the board no longer holds. The structure's own calls go straight to the
-  // connection, inside an operation it already holds.
+  // What a caller is handed for the connection: its reads only. Starting and stopping reception are change
+  // operations of the structure, not of the connection a caller holds - a connection replaced from inside an
+  // operation would hand the board a new identity while the frame being processed belongs to the old one.
+  // What a caller is handed for each part: the reads only. The parts themselves stay in this module's own
+  // closure, which is the wiring's private side, so nothing a caller holds can change what the structure is
+  // doing - and the containers the reads return are copies, so mutating what was handed over is not a way
+  // in either. The change operations of these parts are the structure's own windows, or nothing at all.
+  const copyEntry = (entry) =>
+    entry === null || typeof entry !== 'object'
+      ? entry
+      : { ...entry, ...(entry.raw === undefined ? {} : { raw: Buffer.from(entry.raw) }) };
+  const copyList = (list) => list.map(copyEntry);
+  const bookView = {
+    get market() {
+      return book.market;
+    },
+    get stream() {
+      return book.stream;
+    },
+    get board() {
+      return {
+        size: (side, price) => book.board.size(side, price),
+        get depth() {
+          return book.board.depth;
+        },
+        rows: () => copyList(book.board.rows()),
+      };
+    },
+    get lastRefusal() {
+      return copyEntry(book.lastRefusal);
+    },
+    get phase() {
+      return book.phase;
+    },
+    get isRunning() {
+      return book.isRunning;
+    },
+    get appliedBoundary() {
+      return { ...book.appliedBoundary };
+    },
+    resumeFrom: () => copyEntry(book.resumeFrom()),
+    retiredRuns: () => copyList(book.retiredRuns()),
+    openGaps: () => copyList(book.openGaps()),
+  };
+  const organizerView = {
+    get market() {
+      return organizer.market;
+    },
+    get stream() {
+      return organizer.stream;
+    },
+    get ackState() {
+      return copyEntry(organizer.ackState);
+    },
+    currentAck: () => copyEntry(organizer.currentAck()),
+    openGaps: () => copyList(organizer.openGaps()),
+  };
+  const ledgerView = {
+    get market() {
+      return ledger.market;
+    },
+    get stream() {
+      return ledger.stream;
+    },
+    find: (...args) => copyEntry(ledger.find(...args)),
+    pending: (...args) => copyList(ledger.pending(...args)),
+    size: () => ledger.size(),
+  };
   const connectionSurface = {};
   for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(connection))) {
     if (name === 'start' || name === 'stop') continue;
@@ -536,14 +599,6 @@ export function createStructure({
       descriptor.get ? { get: () => connection[name], enumerable: true } : descriptor,
     );
   }
-  connectionSurface.start = wiring.guard('connection.start', () => connection.start(), () => {
-    onDiagnostic({ market, reason: 'reception cannot be started while a change operation is being processed' });
-    return false;
-  });
-  connectionSurface.stop = wiring.guard('connection.stop', () => connection.stop(), () => {
-    onDiagnostic({ market, reason: 'reception cannot be stopped while a change operation is being processed' });
-    return false;
-  });
 
   /**
    * The same acceptance as a caller's, reached from the connection's own announcement. It is one
@@ -713,6 +768,9 @@ export function createStructure({
     organizer,
     ledger,
     connection: connectionSurface,
+    book: bookView,
+    organizer: organizerView,
+    ledger: ledgerView,
     spool,
     start: () => {
       // A structure that has stopped does not start again by being asked to: reception was closed because the
@@ -814,6 +872,10 @@ export function createStructure({
   // name, so the recovery holds the store while it runs: a hook it calls cannot start a second operation and
   // hand the same frame to the same module twice.
   api.resume();
+
+  // The parts themselves, for the wiring: a test that drives a part directly (a book's own accept, a
+  // ledger's own record) goes through this, and nothing a caller is handed reaches it.
+  bindInternals(api, { book, ledger, organizer, connection, spool });
 
   return api;
 }

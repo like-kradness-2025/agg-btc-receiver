@@ -18,6 +18,10 @@ import { openDurability } from '../src/durability.mjs';
 import { createStructure } from '../src/supervisor/structure.mjs';
 import { openOrganizer } from '../src/organize/watermark.mjs';
 import { withInjectableWrites, LEDGER_CONFIRM_WRITE } from '../test-support/failing-store.mjs';
+import { internalsOf } from '../src/internal/wiring.mjs';
+
+/** The parts of a structure, for a test that drives one of them directly: the wiring's private side. */
+const partsOf = (structure) => internalsOf(structure);
 
 const envelope = (seq, { connectionId = 'conn-1', generation = 1, payload, meta = { first_seq: 1 } } = {}) =>
   makeEnvelope({
@@ -270,16 +274,16 @@ test('a change attempted on any public surface from inside a frame is refused', 
         // Every public change operation of every module, attempted from inside the frame that is being
         // processed. Each one is refused with the same code: the right belongs to the frame, not to the
         // caller, and a caller's hook is a caller.
-        seen.ledgerRecord = subject.ledger.record(envelope(9), 'a test entry', 'owed');
-        seen.ledgerConfirm = subject.ledger.confirm(envelope(1));
-        seen.ledgerRelease = subject.ledger.release({ connectionId: 'conn-1', firstSeq: 1, upToSeq: 1 });
-        seen.ledgerDrop = subject.ledger.drop('conn-1', 1);
-        seen.bookApply = subject.book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 2 }] });
-        seen.bookAccept = subject.book.accept('conn-9', { runId: 'run-1', generation: 9, firstSeq: 1 });
-        seen.bookBeginSync = subject.book.beginSync();
-        seen.bookProveBoundary = subject.book.proveBoundary();
-        seen.organizerAccept = subject.organizer.accept('conn-9', { firstSeq: 1, runId: 'run-1', generation: 9 });
-        seen.organizerNote = subject.organizer.note(envelope(9));
+        seen.ledgerRecord = partsOf(subject).ledger.record(envelope(9), 'a test entry', 'owed');
+        seen.ledgerConfirm = partsOf(subject).ledger.confirm(envelope(1));
+        seen.ledgerRelease = partsOf(subject).ledger.release({ connectionId: 'conn-1', firstSeq: 1, upToSeq: 1 });
+        seen.ledgerDrop = partsOf(subject).ledger.drop('conn-1', 1);
+        seen.bookApply = partsOf(subject).book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 2 }] });
+        seen.bookAccept = partsOf(subject).book.accept('conn-9', { runId: 'run-1', generation: 9, firstSeq: 1 });
+        seen.bookBeginSync = partsOf(subject).book.beginSync();
+        seen.bookProveBoundary = partsOf(subject).book.proveBoundary();
+        seen.organizerAccept = partsOf(subject).organizer.accept('conn-9', { firstSeq: 1, runId: 'run-1', generation: 9 });
+        seen.organizerNote = partsOf(subject).organizer.note(envelope(9));
         seen.storeBeginRun = store.beginRun();
         seen.structureAccept = subject.accept('conn-2', { runId: 'run-1', generation: 2, firstSeq: 1 });
         seen.structureResume = subject.resume();
@@ -656,7 +660,7 @@ test('the recovery a new structure runs holds the store while it runs', async ()
     first.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // A frame the raw may not hold: an intent, which is what a crash between the raw and its confirmation
     // leaves behind, and what the next structure has to offer back through the organizer.
-    assert.equal(first.ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
+    assert.equal(partsOf(first).ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
 
     const { openOrganizer } = await import('../src/organize/watermark.mjs');
     const other = openOrganizer({
@@ -918,7 +922,7 @@ test('a frame that arrives on the socket is one operation, so a hook inside it c
     structure.start();
     socket.onopen?.();
     // A frame the raw may not hold: an intent, which a resume offers back through the organizer.
-    structure.ledger.record(envelope(1), 'about to be written', 'intent');
+    partsOf(structure).ledger.record(envelope(1), 'about to be written', 'intent');
     socket.onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
 
     assert.equal(observations.length >= 2, true, 'the socket frame reached the raw writer');
@@ -926,134 +930,6 @@ test('a frame that arrives on the socket is one operation, so a hook inside it c
     assert.equal(observations[1].resumed.refused, true, 'so a public operation from inside it is refused');
     assert.equal(observations[1].resumed.code, 'REENTRANT_OPERATION', 'with our own code');
     assert.deepEqual(written, [1], 'and the frame was written to the raw once, not twice');
-    store.close();
-  });
-});
-
-test('a generation announced on the socket while an operation is running is refused', async () => {
-  await withStore(async (dir) => {
-    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
-    store.beginRun();
-    const diagnostics = [];
-    const attempts = [];
-    let socket = null;
-    let armed = true;
-    const structure = createStructure({
-      market: 'kraken_spot',
-      stream: 'trades',
-      runId: 'run-1',
-      venue: 'kraken',
-      adapter: {
-        url: 'ws://venue.test/ws',
-        stream: 'trades',
-        parse: () => ({ kind: 'data' }),
-        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
-      },
-      durability: store,
-      webSocketImpl: function fakeSocket(url) {
-        socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
-        return socket;
-      },
-      rawWriter: () => {
-        if (armed) {
-          armed = false;
-          // Starting reception from inside a frame s write: a connection replaced here would hand the board
-          // a new identity while the frame being processed belongs to the old one.
-          attempts.push(structure.connection.start());
-        }
-        return true;
-      },
-      onAck: () => {},
-      onGap: () => {},
-      onStop: () => {},
-      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
-    });
-
-    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
-    structure.feed(envelope(1));
-
-    assert.equal(armed, false, 'the attempt was driven from inside the frame');
-    assert.equal(attempts[0], false, 'and refused');
-    assert.equal(socket, null, 'so reception did not open a socket for a connection nobody admitted');
-    assert.equal(
-      diagnostics.filter((diagnostic) => /cannot be started while a change operation/.test(String(diagnostic.reason))).length,
-      1,
-      'with a diagnostic that says why',
-    );
-    store.close();
-  });
-});
-
-test('a connection handed to a caller cannot be restarted from inside a synchronous continuation', async () => {
-  await withStore(async (dir) => {
-    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
-    store.beginRun();
-    const diagnostics = [];
-    const attempts = [];
-    let armed = true;
-    let opened = 0;
-    const structure = createStructure({
-      market: 'kraken_spot',
-      stream: 'trades',
-      runId: 'run-1',
-      venue: 'kraken',
-      adapter: {
-        url: 'ws://venue.test/ws',
-        stream: 'trades',
-        parse: () => ({ kind: 'data' }),
-        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
-      },
-      durability: store,
-      webSocketImpl: function fakeSocket(url) {
-        const socket = { url, onclose: null, onerror: null, send() {}, close() {} };
-        // The socket opens and hands over a frame as soon as the connection listens for it: everything the
-        // structure s own start() causes happens synchronously, inside that one operation.
-        let openHandler = null;
-        Object.defineProperty(socket, 'onopen', {
-          get: () => openHandler,
-          set(handler) {
-            openHandler = handler;
-            opened += 1;
-            handler?.();
-          },
-        });
-        let messageHandler = null;
-        Object.defineProperty(socket, 'onmessage', {
-          get: () => messageHandler,
-          set(handler) {
-            messageHandler = handler;
-            handler?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
-          },
-        });
-        return socket;
-      },
-      rawWriter: () => {
-        if (armed) {
-          armed = false;
-          const generation = structure.connection.generation;
-          attempts.push({ refused: structure.connection.start() });
-          attempts.push({ generationMoved: structure.connection.generation !== generation });
-        }
-        return true;
-      },
-      onAck: () => {},
-      onGap: () => {},
-      onStop: () => {},
-      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
-    });
-
-    // No explicit accept: the connection the socket announces admits itself here, which is the path a real
-    // start takes.
-    structure.start();
-
-    assert.equal(opened, 1, 'the socket opened once, from the structure s own start');
-    assert.equal(armed, false, 'and the frame it handed over ran inside that start');
-    assert.equal(attempts[0].refused, false, 'a restart from inside it is refused');
-    assert.equal(attempts[1].generationMoved, false, 'so the connection the frame belongs to did not move');
-    assert.equal(
-      diagnostics.filter((diagnostic) => /cannot be started while a change operation/.test(String(diagnostic.reason))).length,
-      1,
-    );
     store.close();
   });
 });
@@ -1160,6 +1036,20 @@ test('the construction of a structure holds the store while its parts are opened
   });
 });
 
+test('the connection a caller is handed cannot be started or stopped at all', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const structure = build(store, {});
+    // Reception is started and stopped through the structure's own windows; a caller holding the connection
+    // can read it and has no way to replace it.
+    assert.equal(structure.connection.start, undefined, 'no way to start reception from the handle');
+    assert.equal(structure.connection.stop, undefined, 'and none to stop it');
+    assert.equal(typeof structure.connection.generation, 'number', 'while its reads are there');
+    assert.equal(typeof structure.connection.state, 'string');
+    assert.equal(typeof partsOf(structure).connection.start, 'function', 'the wiring keeps the real one');
+    store.close();
+  });
+});
 test('an arrival during a frame waits its turn instead of being refused or dropped', async () => {
   await withStore(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
@@ -1337,6 +1227,57 @@ test('a timer that fires during a frame waits for it, and an abandoned socket is
     const writesSoFar = written.length;
     sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
     assert.equal(written.length, writesSoFar, 'a frame from the abandoned socket is not heard');
+    store.close();
+  });
+});
+
+test('the views a caller is handed cannot change what the structure is doing', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const structure = build(store, { written });
+    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    structure.feed(envelope(1));
+
+    // No change operation is reachable from what a caller is handed.
+    for (const [name, value] of [
+      ['book.apply', structure.book.apply],
+      ['book.accept', structure.book.accept],
+      ['book.beginSync', structure.book.beginSync],
+      ['organizer.accept', structure.organizer.accept],
+      ['organizer.note', structure.organizer.note],
+      ['ledger.record', structure.ledger.record],
+      ['ledger.confirm', structure.ledger.confirm],
+      ['ledger.release', structure.ledger.release],
+      ['ledger.drop', structure.ledger.drop],
+      ['connection.start', structure.connection.start],
+      ['connection.stop', structure.connection.stop],
+    ]) {
+      assert.equal(value, undefined, `${name} is not handed out`);
+    }
+
+    // What a read returns is a copy: changing it does not change the structure.
+    const boundary = structure.book.appliedBoundary;
+    boundary.upToSeq = 999;
+    assert.equal(structure.book.appliedBoundary.upToSeq, 1, 'the structure still reports its own position');
+
+    const rows = structure.book.board.rows();
+    assert.ok(rows.length > 0, 'the board has the level the frame carried');
+    const level = rows[0];
+    const size = structure.book.board.size(level.side, level.price);
+    level.size = 0;
+    assert.equal(structure.book.board.size(level.side, level.price), size, 'and its own board');
+
+    const gaps = structure.book.openGaps();
+    gaps.push({ side: 'bid', price: 1, size: 1 });
+    assert.equal(structure.book.openGaps().length, 0, 'a gap pushed onto a copy is not a gap');
+
+    // And it keeps working: the acceptance it already has, and the next frame.
+    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    const second = structure.feed(envelope(2));
+    assert.equal(second.applied, true, 'the next frame is processed normally');
+    assert.deepEqual(written, ['conn-1:1', 'conn-1:2'], 'and reaches the raw once each');
     store.close();
   });
 });
