@@ -50,6 +50,10 @@ export function createReceiveConnection({
   maxBackoffMs = 30_000,
   onEnvelope = () => {},
   onGeneration = () => {},
+  // Every event - a socket message, open/close/error, a timer - is handed here with the socket it came from,
+  // and the work runs inside whatever the caller puts behind this: the structure runs it as an operation of
+  // its own, or keeps it in order when one is already running. Nothing is done from the event entry itself.
+  onEvent = (_label, work) => work(),
   onFailure = () => {},
   onSubscriptions = () => {},
   onState = () => {},
@@ -92,14 +96,16 @@ export function createReceiveConnection({
     silentTimer = setTimer(() => {
       silentTimer = null;
       if (closed) return;
-      onDiagnostic({
-        market,
-        generation,
-        reason: 'silence deadline passed',
-        silentMs: wallClockMs() - lastHeardMs,
-        deadlineMs: silenceDeadlineMs,
+      onEvent('silence-timer', () => {
+        onDiagnostic({
+          market,
+          generation,
+          reason: 'silence deadline passed',
+          silentMs: wallClockMs() - lastHeardMs,
+          deadlineMs: silenceDeadlineMs,
+        });
+        replaceSocket('silence');
       });
-      replaceSocket('silence');
     }, silenceDeadlineMs);
     if (typeof silentTimer.unref === 'function') silentTimer.unref();
   }
@@ -120,8 +126,10 @@ export function createReceiveConnection({
     stabilityTimer = setTimer(() => {
       stabilityTimer = null;
       if (closed) return;
-      attempts = 0;
-      onDiagnostic({ market, generation, reason: 'link held long enough to reset attempts' });
+      onEvent('stability-timer', () => {
+        attempts = 0;
+        onDiagnostic({ market, generation, reason: 'link held long enough to reset attempts' });
+      });
     }, stabilityMs);
     if (typeof stabilityTimer.unref === 'function') stabilityTimer.unref();
   }
@@ -131,7 +139,7 @@ export function createReceiveConnection({
     armSilenceTimer();
   }
 
-  function stamp(raw) {
+  function stamp(raw, atMs, atNs) {
     receiveSeq += 1;
     // The envelope is built by the one factory that knows the identity, never assembled here. The name is
     // derived by the factory from the run, the venue, the market and the generation - the same four things
@@ -146,8 +154,8 @@ export function createReceiveConnection({
       venue,
       generation,
       receiveSeq,
-      recvTsMs: wallClockMs(),
-      recvMonoNs: monotonicNs(),
+      recvTsMs: atMs,
+      recvMonoNs: atNs,
       raw,
       meta: {
         // Downstream needs to know where this connection's stream begins, otherwise a book cannot
@@ -160,7 +168,7 @@ export function createReceiveConnection({
 
   let firstSeq = 1;
 
-  function handleMessage(raw) {
+  function handleMessage(raw, atMs, atNs) {
     noteHeard();
     let parsed;
     try {
@@ -201,7 +209,7 @@ export function createReceiveConnection({
       return;
     }
     if (parsed.kind === 'data') {
-      onEnvelope(stamp(raw));
+      onEnvelope(stamp(raw, atMs, atNs));
       return;
     }
     onDiagnostic({ market, generation, reason: `unhandled message kind ${parsed.kind}` });
@@ -246,7 +254,69 @@ export function createReceiveConnection({
     // The run and the venue travel with the announcement: without them the book is told which
     // connection proposes to take over but not which run it belongs to, and a takeover - which is a
     // question about runs, not about connections - cannot be decided from that.
-    const admitted = onGeneration({
+    // The announcement is settled by this, not by its return value alone: when the structure is free it runs
+    // the announcement now and calls this, and when an operation is running the announcement waits, and this
+    // is called when it runs. A connection nobody admitted never opens its socket.
+    const settle = (admitted) => {
+      if (closed) return;
+      if (admitted === false) {
+        // A connection nobody downstream admitted must not start receiving. Opening the socket anyway would
+        // make this process speak - and stamp frames - for a connection the book refused, and the frames of
+        // a refused connection are refused again further down, after they have been counted as received.
+        setState('refused', reason);
+        onDiagnostic({ market, generation, reason: 'this connection was not admitted downstream' });
+        return;
+      }
+      setState('connecting', reason);
+      const delay = delayForAttempt(attempts);
+      const start = () => {
+        if (closed) return;
+        let next;
+        try {
+          next = openSocket(adapter.url);
+        } catch (error) {
+          onFailure({ market, generation, error, attempts });
+          replaceSocket('open failed');
+          return;
+        }
+        socket = next;
+        next.onopen = () => {
+        if (socket !== next) return;
+        onEvent('open', () => {
+          noteHeard();
+          setState('subscribing');
+          for (const message of adapter.subscribeMessages?.() ?? []) next.send(message);
+          next.send?.(adapter.heartbeatMessage?.() ?? '');
+          armStabilityTimer();
+        });
+      };
+      next.onmessage = (event) => {
+        if (socket !== next) return; // a frame from a socket we have already abandoned
+        const payload = event?.data ?? event;
+        // The arrival is copied and timed here, where it arrives: what the work does later must not change
+        // when it was heard, and the socket's buffer may be reused by the time it runs.
+        const raw = typeof payload === 'string' ? payload : Buffer.from(payload);
+        const atMs = wallClockMs();
+        const atNs = monotonicNs();
+        onEvent('message', () => handleMessage(raw, atMs, atNs));
+      };
+      next.onerror = (error) => {
+        if (socket !== next) return;
+        onEvent('error', () => onFailure({ market, generation, error, attempts }));
+      };
+        next.onclose = () => {
+          if (socket !== next) return;
+          onEvent('close', () => replaceSocket('closed'));
+        };
+      };
+      if (delay === 0) start();
+      else {
+        const timer = setTimer(() => onEvent('reconnect-timer', start), delay);
+        if (typeof timer.unref === 'function') timer.unref();
+      }
+    };
+
+    const announced = onGeneration({
       market,
       generation,
       connectionId,
@@ -254,56 +324,9 @@ export function createReceiveConnection({
       firstSeq,
       runId,
       venue,
+      settle,
     });
-    if (admitted === false) {
-      // A connection nobody downstream admitted must not start receiving. Opening the socket anyway
-      // would make this process speak - and stamp frames - for a connection the book refused, and the
-      // frames of a refused connection are refused again further down, after they have been counted as
-      // received.
-      setState('refused', reason);
-      onDiagnostic({ market, generation, reason: 'this connection was not admitted downstream' });
-      return;
-    }
-    setState('connecting', reason);
-
-    const delay = delayForAttempt(attempts);
-    const start = () => {
-      if (closed) return;
-      let next;
-      try {
-        next = openSocket(adapter.url);
-      } catch (error) {
-        onFailure({ market, generation, error, attempts });
-        replaceSocket('open failed');
-        return;
-      }
-      socket = next;
-      next.onopen = () => {
-        if (socket !== next) return;
-        noteHeard();
-        setState('subscribing');
-        for (const message of adapter.subscribeMessages?.() ?? []) next.send(message);
-        next.send?.(adapter.heartbeatMessage?.() ?? '');
-        armStabilityTimer();
-      };
-      next.onmessage = (event) => {
-        if (socket !== next) return; // a frame from a socket we have already abandoned
-        handleMessage(event?.data ?? event);
-      };
-      next.onerror = (error) => {
-        if (socket !== next) return;
-        onFailure({ market, generation, error, attempts });
-      };
-      next.onclose = () => {
-        if (socket !== next) return;
-        replaceSocket('closed');
-      };
-    };
-    if (delay === 0) start();
-    else {
-      const timer = setTimer(start, delay);
-      if (typeof timer.unref === 'function') timer.unref();
-    }
+    if (announced === false) settle(false);
   }
 
   function delayForAttempt(attempt) {

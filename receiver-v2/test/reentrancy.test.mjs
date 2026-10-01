@@ -1168,6 +1168,7 @@ test('an arrival during a frame waits its turn instead of being refused or dropp
     const acks = [];
     let socket = null;
     let duringWrite = null;
+    let numberedWhileWriting = null;
     const structure = createStructure({
       market: 'kraken_spot',
       stream: 'trades',
@@ -1191,6 +1192,9 @@ test('an arrival during a frame waits its turn instead of being refused or dropp
           socket.onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
           socket.onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) });
           duringWrite = [...written];
+          // The arrivals are not parsed or numbered until their turn: the connection still reports the one
+          // frame that is being written.
+          numberedWhileWriting = structure.connection.receiveSeq;
         }
         return true;
       },
@@ -1204,6 +1208,7 @@ test('an arrival during a frame waits its turn instead of being refused or dropp
     socket.onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
 
     assert.deepEqual(duringWrite, [1], 'nothing was written for the frames that arrived during the write');
+    assert.equal(numberedWhileWriting, 1, 'and they were not parsed or numbered until their turn came');
     assert.deepEqual(written, [1, 2, 3], 'and then they ran in order, once each, before the frame returned');
     assert.deepEqual(acks, [1, 2, 3], 'with the acknowledgements in the same order');
 
@@ -1257,6 +1262,81 @@ test('a wait-list that fills up stops reception and says what was dropped', asyn
     assert.equal(stops.length, 1, 'the structure stopped instead of dropping an arrival in silence');
     assert.match(String(stops[0].reason), /wait-list/, 'and it says which wait-list filled up');
     assert.match(String(stops[0].reason), /message/, 'and which arrival it was');
+    store.close();
+  });
+});
+
+test('a timer that fires during a frame waits for it, and an abandoned socket is not heard', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const diagnostics = [];
+    const timers = [];
+    const sockets = [];
+    let fired = false;
+    let duringWrite = null;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      silenceDeadlineMs: 1_000,
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        timer.cleared = true;
+      },
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(frame.receive_seq);
+        if (!fired) {
+          fired = true;
+          const silence = timers.find((timer) => timer.ms === 1_000 && !timer.cleared);
+          silence.cleared = true;
+          silence.fn(); // the silence deadline passes while this frame is being written
+          duringWrite = diagnostics.length;
+        }
+        return true;
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+
+    structure.start();
+    sockets[0].onopen?.();
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+
+    assert.equal(duringWrite, 0, 'the timer s work did not run in the middle of the frame');
+    assert.equal(
+      diagnostics.some((diagnostic) => /silence deadline passed/.test(String(diagnostic.reason))),
+      true,
+      'and it ran once the frame was done',
+    );
+    const reconnect = timers.find((timer) => !timer.cleared && timer.ms > 0);
+    assert.ok(reconnect, 'the silence scheduled a replacement socket');
+    reconnect.cleared = true;
+    reconnect.fn();
+    assert.equal(sockets.length, 2, 'the silence replaced the socket, as it does');
+    const writesSoFar = written.length;
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+    assert.equal(written.length, writesSoFar, 'a frame from the abandoned socket is not heard');
     store.close();
   });
 });

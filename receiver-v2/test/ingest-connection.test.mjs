@@ -72,7 +72,13 @@ function harness(adapterOverrides = {}, options = {}) {
     silenceDeadlineMs: SILENCE_MS,
     stabilityMs: STABILITY_MS,
     onEnvelope: (envelope) => envelopes.push(envelope),
-    onGeneration: (info) => generations.push(info),
+    // The wiring's contract: the announcement is settled by calling `settle(true)`, which is what opens the
+    // socket; `settle(false)` - or returning `false` - refuses it and nothing is opened.
+    onGeneration: (info) => {
+      generations.push(info);
+      info.settle?.(true);
+      return true;
+    },
     onState: (info) => states.push(info.state),
     onSubscriptions: (info) => subscriptions.push(info),
     onDiagnostic: (info) => diagnostics.push(info),

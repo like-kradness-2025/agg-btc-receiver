@@ -73,9 +73,6 @@ export function createStructure({
   // spool, and only if the spool cannot hold it either does reception stop. (Across processes the
   // same decision is made when the channel reports a full queue.)
   let stopped = false;
-  // Raised only while this structure is calling into the connection it opened, so the callbacks that call
-  // comes back on are recognised as this operation's own continuation rather than an arrival from outside.
-  let drivingReception = false;
   let spooledFrames = 0;
   let refusedFrames = 0;
 
@@ -454,12 +451,6 @@ export function createStructure({
     });
   }
 
-  // What arrives on the socket is an entry point from outside, exactly like a caller's own call, so the two
-  // callbacks below take the store's execution right: a frame cannot be processed while another operation
-  // is running. The one exception is the socket this structure itself opens - `start()` calls down into the
-  // connection, which announces its generation and hands over what it already holds synchronously - and
-  // those are this operation's own continuation, so they run unguarded. `drivingReception` is raised only
-  // around that call, in this module's own closure, so nothing a caller or a hook can reach can raise it.
   // Every arrival from outside is handed to this executor. When the store is free the work runs now, inside
   // one take; when an operation is running it is kept, in order, and run when that operation's own work is
   // done - nothing is dropped, and nothing runs in the middle of a frame. A wait-list that fills up stops
@@ -501,15 +492,16 @@ export function createStructure({
     }
   };
 
-  const admitGuarded = wiring.guard('structure.accept', admitOnGeneration, () => {
-    onDiagnostic({
-      market,
-      reason: 'this connection arrived while another operation was in progress',
-    });
-    return false;
-  });
+  // Nothing here is a special case for the socket this structure opened itself: an event that arrives while
+  // an operation is running waits for it, including the announcement of the socket's own generation, which
+  // carries the continuation that opens it.
   const feedEntry = (envelope) => receiveEvent('message', () => feed(envelope));
-  const admitEntry = (details) => (drivingReception ? admitOnGeneration(details) : admitGuarded(details));
+  const admitEntry = (details) =>
+    receiveEvent('generation', () => {
+      const admitted = admitOnGeneration(details);
+      details.settle?.(admitted);
+      return admitted;
+    });
 
   const connection = createReceiveConnection({
     // The caller's options come first so that the wiring below cannot be replaced by them: a caller who
@@ -522,6 +514,7 @@ export function createStructure({
     venue,
     webSocketImpl,
     onEnvelope: feedEntry,
+    onEvent: (label, work) => receiveEvent(label, work),
     // Reception's own reports - a connection it refused to open, a socket it tore down, a frame it could
     // not parse - travel to the same caller that hears about the book, so a refusal that stops reception
     // is not something only the connection knows.
@@ -734,20 +727,10 @@ export function createStructure({
       // frames the structure can only refuse, and the stop is exactly the information that reception must not
       // start.
       if (stopped) return { started: false, reason: 'this structure has stopped' };
-      drivingReception = true;
-      try {
-        return connection.start();
-      } finally {
-        drivingReception = false;
-      }
+      return connection.start();
     },
     stop: () => {
-      drivingReception = true;
-      try {
-        connection.stop();
-      } finally {
-        drivingReception = false;
-      }
+      connection.stop();
       spool?.close();
     },
     /** A frame handed in directly, for a replay adapter or a dry run. */
