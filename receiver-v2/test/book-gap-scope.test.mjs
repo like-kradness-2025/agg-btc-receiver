@@ -26,7 +26,9 @@ test('a hole belongs to the connection that opened it', async () => {
   try {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     const book = openBook({ market: 'kraken_spot', stream: 'book', durability: store });
-    book.accept('conn-1', { firstSeq: 1 });
+    // The connection and the frames that claim it carry the same run and generation: a frame that
+    // disagrees with the accepted connection's identity is a different connection's frame, not data.
+    book.accept('conn-1', { generation: 1, firstSeq: 1 });
 
     book.apply({ envelope: envelope(1, 'conn-1'), changes: [] });
     const jumped = book.apply({ envelope: envelope(3, 'conn-1'), changes: [] });

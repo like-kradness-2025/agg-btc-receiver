@@ -56,6 +56,10 @@ function harness(adapterOverrides = {}, options = {}) {
   const connection = createReceiveConnection({
     adapter,
     market: 'kraken_spot',
+    // A connection is named from its run and its venue: the harness supplies both, and the one test that is
+    // about a reception without them overrides them with undefined.
+    runId: 'run-1',
+    venue: 'kraken',
     webSocketImpl,
     setTimer: (fn, ms) => {
       const timer = { fn, ms, unref() {} };
@@ -100,7 +104,7 @@ test('starting opens a socket, subscribes, and issues the first generation', () 
   h.connection.start();
   assert.equal(h.sockets.length, 1);
   assert.equal(h.connection.generation, 1);
-  assert.equal(h.connection.connectionId, 'kraken_spot:1');
+  assert.equal(h.connection.connectionId, 'run-1:kraken:kraken_spot:1');
   h.sockets[0].onopen();
   assert.deepEqual(h.sockets[0].sent, ['{"subscribe":"trades"}', '{"ping":1}']);
 });
@@ -114,7 +118,7 @@ test('data is stamped with the receive metadata the rest of the structure depend
   // The names here are the contract's names, not a private spelling: the same envelope goes on the
   // wire and into the book, so a test that reads camelCase would pin a shape nothing else uses.
   assert.deepEqual(h.envelopes.map((e) => e.receive_seq), [1, 2]);
-  assert.equal(h.envelopes[0].connection_id, 'kraken_spot:1');
+  assert.equal(h.envelopes[0].connection_id, 'run-1:kraken:kraken_spot:1');
   assert.ok(h.envelopes[0].recv_ts_ms > 0, 'the wall clock is stamped at the boundary');
   assert.ok(h.envelopes[1].recv_mono_ns > h.envelopes[0].recv_mono_ns, 'and the monotonic clock advances');
   assert.equal(h.envelopes[0].meta.first_seq, 1, 'so a book can anchor where this stream begins');
@@ -140,7 +144,7 @@ test('a replaced socket issues a new generation, and the old one is no longer he
   assert.equal(h.envelopes.length, before, 'nothing from an old socket is used');
 
   second.deliver('{"price":2}');
-  assert.equal(h.envelopes.at(-1).connection_id, 'kraken_spot:2');
+  assert.equal(h.envelopes.at(-1).connection_id, 'run-1:kraken:kraken_spot:2');
   assert.equal(h.envelopes.at(-1).receive_seq, 1, 'and the sequence starts again with the connection');
 });
 
@@ -204,4 +208,33 @@ test('attempts only reset once the link has actually held', () => {
   current.onopen();
   h.fireByDelay(STABILITY_MS); // the link held for the stability window
   assert.equal(h.connection.attempts, 0, 'and only then do attempts reset');
+});
+
+test('the announcement names the run and the venue, because a takeover is a question about runs', () => {
+  const h = harness({}, { runId: 'run-1', venue: 'kraken' });
+  h.connection.start();
+  assert.equal(h.connection.connectionId, 'run-1:kraken:kraken_spot:1', 'the run is part of the name');
+  const announced = h.generations.at(-1);
+  assert.equal(announced.runId, 'run-1', 'and it travels with the announcement');
+  assert.equal(announced.venue, 'kraken');
+  assert.equal(announced.firstSeq, 1);
+});
+
+test('a connection the wiring refuses never opens a socket', () => {
+  const h = harness({}, { onGeneration: () => false });
+  h.connection.start();
+  assert.equal(h.sockets.length, 0, 'nothing is opened for a connection that was not admitted');
+  assert.equal(h.connection.state, 'refused');
+  assert.ok(
+    h.diagnostics.some((d) => /not admitted downstream/.test(d.reason)),
+    'and the refusal is reported rather than silent',
+  );
+});
+
+test('reception will not name a connection without a run and a venue', () => {
+  // Both are part of the name (C2), and a name two runs can share is how a board and a watermark end up
+  // describing different data under one connection id. This configuration cannot receive, so it never opens.
+  const h = harness({}, { runId: undefined, venue: undefined });
+  assert.throws(() => h.connection.start(), /run and a venue/);
+  assert.equal(h.sockets.length, 0, 'and nothing was opened');
 });

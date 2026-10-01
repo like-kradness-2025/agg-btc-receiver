@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { makeEnvelope } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { openOrganizer } from '../src/organize/watermark.mjs';
+import { withInjectableWrites, WATERMARK_WRITE } from '../test-support/failing-store.mjs';
 
 const envelope = (seq, connectionId = 'conn-1') =>
   makeEnvelope({
@@ -19,7 +20,7 @@ const envelope = (seq, connectionId = 'conn-1') =>
     raw: `{"seq":${seq}}`,
   });
 
-async function withOrganizer(fn, options = {}) {
+async function withOrganizer(fn, options = {}, { acceptConnection = true } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'organize-'));
   try {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
@@ -34,6 +35,9 @@ async function withOrganizer(fn, options = {}) {
       },
       ...options,
     });
+    // Organization takes a connection explicitly: nothing is accepted by sight (C2), so every test that
+    // needs a working connection says so here. The test that is about this rule builds its own organizer.
+    if (acceptConnection) organizer.accept('conn-1');
     try {
       return await fn({ organizer, store, written });
     } finally {
@@ -57,6 +61,7 @@ test('data above a hole is kept, and the hole is written down', async () => {
     organizer.note(envelope(1));
     const above = organizer.note(envelope(3)); // 2 never arrived
     assert.deepEqual(written, [1, 3], 'the frame above the hole is still written down');
+    assert.equal(above.durable, true, 'and it is durable: the raw is safe even though nothing covers it yet');
     assert.equal(above.ack.upToSeq, 1, 'the acknowledgement stops at the hole, it does not cross it');
     assert.equal(above.ack.connectionId, 'conn-1');
     const gaps = organizer.openGaps();
@@ -103,6 +108,7 @@ test('the watermark survives a restart, so a replay is not acknowledged twice', 
       durability: first,
       writeRaw: () => true, // durable: the contract this module relies on
     });
+    one.accept('conn-1'); // an accepted connection, not one taken on sight
     one.note(envelope(1));
     one.note(envelope(2));
     first.close();
@@ -154,5 +160,229 @@ test('a raw write that is not durable moves neither the watermark nor the acknow
       assert.equal(after.ack.upToSeq, 1);
     },
     { writeRaw: () => durable },
+  );
+});
+
+test('nothing is organized before a connection is accepted, and no acknowledgement is invented', async () => {
+  await withOrganizer(
+    async ({ organizer, written }) => {
+      const refused = organizer.note(envelope(1));
+      assert.equal(refused.accepted, false, 'a frame from a connection nobody accepted is not taken');
+      assert.equal(refused.ack, null, 'and nothing is acknowledged for it');
+      assert.deepEqual(written, [], 'the canonical record is not written on the strength of its own arrival');
+      assert.equal(organizer.ackState.upToSeq, null);
+
+      // Once the connection is accepted, the same frame is written and acknowledged.
+      organizer.accept('conn-1');
+      const after = organizer.note(envelope(1));
+      assert.equal(after.durable, true);
+      assert.equal(after.ack.upToSeq, 1);
+      assert.deepEqual(written, [1]);
+    },
+    {},
+    { acceptConnection: false },
+  );
+});
+
+test('while the start of a connection is unknown the raw is safe and no ceiling is claimed', async () => {
+  await withOrganizer(
+    async ({ organizer, written }) => {
+      // The connection is accepted, but nobody has said where its numbering starts.
+      organizer.accept('conn-1', { firstSeq: null });
+      const held = organizer.note(envelope(1));
+      assert.equal(held.durable, true, 'the canonical record is written');
+      assert.equal(held.ack, null, 'but no ceiling is claimed for it');
+      assert.equal(organizer.ackState.upToSeq, null);
+
+      organizer.note(envelope(3));
+      const completed = organizer.accept('conn-1', { firstSeq: 1 });
+      assert.equal(completed.advanced, true, 'the completion moved the ceiling it could prove');
+      assert.equal(completed.upToSeq, 1, 'up to the contiguous frame, and not past the hole');
+      assert.equal(organizer.openGaps().length, 1, 'the hole it stopped at is written down');
+
+      const hole = organizer.note(envelope(2));
+      assert.equal(hole.ack.upToSeq, 3, '3 was already durable, so it comes out with the hole');
+      assert.deepEqual(organizer.openGaps(), [], 'and nothing is left open');
+      assert.deepEqual(written, [1, 3, 2]);
+    },
+    {},
+    { acceptConnection: false },
+  );
+});
+
+test('an origin arriving above a hole still releases what is held, and stops where the hole is', async () => {
+  await withOrganizer(
+    async ({ organizer }) => {
+      // The start of this connection's numbering has not arrived, but the frames above it are durable.
+      organizer.accept('conn-1', { firstSeq: null });
+      organizer.note(envelope(2));
+      organizer.note(envelope(3));
+
+      const completed = organizer.accept('conn-1', { firstSeq: 1 });
+      assert.equal(completed.advanced, false, 'there is nothing contiguous to claim yet');
+      assert.equal(completed.upToSeq, null, 'so no ceiling is claimed');
+      assert.deepEqual(
+        organizer.openGaps().map((gap) => ({ from: gap.missingFrom, to: gap.missingTo })),
+        [{ from: 1, to: 1 }],
+        'and the hole they are waiting for is written down rather than left in this process',
+      );
+
+      // The frame they were waiting for arrives: everything that was held comes out with it.
+      const arrival = organizer.note(envelope(1));
+      assert.equal(arrival.ack.upToSeq, 3, 'the frames held above the hole are released with it');
+      assert.deepEqual(organizer.openGaps(), [], 'and the hole is closed');
+    },
+    {},
+    { acceptConnection: false },
+  );
+});
+
+test('a completion whose write fails leaves the organizer as it was, and can be asked for again', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'organize-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const { durability, armWriteFailure } = withInjectableWrites(store);
+    const organizer = openOrganizer({
+      market: 'kraken_spot',
+      stream: 'trades',
+      durability,
+      writeRaw: () => true,
+    });
+    organizer.accept('conn-1', { firstSeq: null });
+    organizer.note(envelope(1));
+
+    // The write that would record the completion fails. Nothing may move - and the completion has to stay
+    // outstanding, because an answer nobody could write down is an answer the next caller has to be able
+    // to give again.
+    armWriteFailure(WATERMARK_WRITE);
+    assert.throws(() => organizer.accept('conn-1', { firstSeq: 1 }), /injected write failure/);
+    assert.equal(organizer.ackState.upToSeq, null, 'the ceiling did not move');
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark WHERE up_to_receive_seq IS NOT NULL').get().n,
+      0,
+      'and nothing was written down',
+    );
+
+    const retry = organizer.accept('conn-1', { firstSeq: 1 });
+    assert.equal(retry.advanced, true, 'asking again finishes it');
+    assert.equal(retry.upToSeq, 1);
+    assert.equal(organizer.currentAck().upToSeq, 1);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a frame from another run or generation is not written down, and does not hide the real one', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'organize-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const written = [];
+    const organizer = openOrganizer({
+      market: 'kraken_spot',
+      stream: 'trades',
+      durability: store,
+      writeRaw: (frame) => {
+        written.push(frame.receive_seq);
+        return true;
+      },
+    });
+    // The identity the board recorded for this connection: the organizer measures frames against it, because
+    // "the connection id matches" is not "this frame is this connection's".
+    organizer.accept('conn-1', { firstSeq: 1, runId: 'run-A', generation: 3 });
+
+    const frame = (seq, { runId = 'run-A', generation = 3 } = {}) =>
+      makeEnvelope({
+        market: 'kraken_spot',
+        stream: 'trades',
+        connectionId: 'conn-1',
+        runId,
+        venue: 'kraken',
+        generation,
+        receiveSeq: seq,
+        recvTsMs: 1_792_000_000_000 + seq,
+        recvMonoNs: 1_000_000 + seq,
+        raw: `{"seq":${seq}}`,
+      });
+
+    const otherRun = organizer.note(frame(1, { runId: 'run-B' }));
+    assert.equal(otherRun.accepted, false, 'another run is not this connection');
+    assert.match(otherRun.reason, /another run or generation/);
+    const otherGeneration = organizer.note(frame(1, { generation: 4 }));
+    assert.equal(otherGeneration.accepted, false, 'nor is another generation');
+    assert.deepEqual(written, [], 'nothing of theirs reached the canonical record');
+    assert.equal(organizer.ackState.upToSeq, null, 'and nothing was acknowledged');
+
+    // Their frame did not take the sequence our own frame needs: the real one is still durable.
+    const ours = organizer.note(frame(1));
+    assert.equal(ours.durable, true);
+    assert.equal(ours.ack.upToSeq, 1);
+    assert.deepEqual(written, [1]);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a frame the store cannot describe leaves the watermark where it was', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'organize-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const { durability, armWriteFailure } = withInjectableWrites(store);
+    const written = [];
+    const organizer = openOrganizer({
+      market: 'kraken_spot',
+      stream: 'trades',
+      durability,
+      writeRaw: (frame) => {
+        written.push(frame.receive_seq);
+        return true;
+      },
+    });
+    organizer.accept('conn-1', { firstSeq: 1 });
+
+    armWriteFailure(WATERMARK_WRITE);
+    assert.throws(() => organizer.note(envelope(1)), /injected write failure/);
+    assert.equal(organizer.ackState.upToSeq, null, 'the ceiling did not move');
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
+      0,
+      'and nothing was written',
+    );
+
+    // The same frame sent again is durable: the raw writer is append-safe on (connection, sequence), so the
+    // second write of the same frame is the contract working, not a second copy of it.
+    const retry = organizer.note(envelope(1));
+    assert.equal(retry.durable, true);
+    assert.equal(retry.ack.upToSeq, 1);
+    assert.deepEqual(written, [1, 1]);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an origin above a sequence already made durable is refused, and nothing is acknowledged', async () => {
+  await withOrganizer(
+    async ({ organizer, written }) => {
+      organizer.accept('conn-1', { firstSeq: null });
+      organizer.note(envelope(1));
+      organizer.note(envelope(3));
+      assert.deepEqual(written, [1, 3], 'both frames are durable');
+
+      // The start cannot be above a sequence this process already holds: acknowledging it would claim a range
+      // nobody received, and the frames below it would never be sent again.
+      const jumped = organizer.accept('conn-1', { firstSeq: 3 });
+      assert.equal(jumped.refusedOrigin, 3, 'the claim is refused rather than obeyed');
+      assert.equal(jumped.advanced, false);
+      assert.equal(organizer.ackState.upToSeq, null, 'and no ceiling was claimed');
+
+      const fitting = organizer.accept('conn-1', { firstSeq: 1 });
+      assert.equal(fitting.advanced, true, 'the origin that fits the frames is accepted');
+      assert.equal(fitting.upToSeq, 1, 'and the ceiling stops where the data does');
+      assert.equal(organizer.currentAck().upToSeq, 1);
+    },
+    {},
+    { acceptConnection: false },
   );
 });

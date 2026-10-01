@@ -58,14 +58,19 @@ test('a frame the board cannot anchor is held and reported, not quietly dropped'
       'it is reported as the loss it is',
     );
 
-    // The frame is offered again as soon as the connection is accepted - but it is still refused,
-    // because the board does not take an anchor for a connection it already knows. That is a real gap
-    // and it is pinned here rather than papered over: the frame stays held, still reported, and the
-    // count of what is pending stays honest.
+    // The origin arrives for the connection the board already knows: that is a completion, not a new
+    // connection, and it is exactly what the held frame was waiting for. The structure offers it again
+    // by itself and it is applied - the frame stays held until it can be applied, and it is counted as
+    // held for as long as that is true.
     structure.accept('conn-1', { firstSeq: 1 });
+    assert.equal(
+      structure.book.appliedBoundary.upToSeq,
+      1,
+      'the completion of the origin reached the frame that was waiting for it',
+    );
     const pending = structure.redeliverPending();
-    assert.equal(pending.applied, 0, 'accepting the same connection again does not give the board an anchor');
-    assert.equal(pending.stillPending, 1, 'so the frame is still held, and still counted');
+    assert.equal(pending.applied, 0, 'there is nothing left to apply');
+    assert.equal(pending.stillPending, 0, 'and nothing is left held');
     store.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

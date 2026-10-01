@@ -1,7 +1,7 @@
 /**
  * The book: keep the board, and be able to prove where it stands.
  *
- * Three rules decide everything here, each of them a correction of a way this could quietly lose
+ * Four rules decide everything here, each of them a correction of a way this could quietly lose
  * data while looking healthy.
  *
  * 1. The board is persisted in the same transaction as the position that describes it. A position
@@ -17,8 +17,13 @@
  *    serves because its snapshot was checked against the stream, not because frames kept arriving.
  *    Any doubt puts it back to syncing, and only an explicit, successful proof puts it back.
  *
- * Trust about connections is not decided here either. Reception issues the generation; this module
- * keeps the highest one it has been shown and accepts nothing that is not strictly newer.
+ * 4. Ownership is recorded, not inferred. Which run owns this board and where its connection's
+ *    numbering starts are written down before anything is applied and read back after a restart,
+ *    because a book that reopens without them cannot tell a legitimate successor from a replay of a
+ *    run that was replaced. Generation numbers order connections inside one run only; a different run
+ *    is admitted by an explicit takeover and by nothing else, and a retired run is refused whatever
+ *    number it quotes - retired in the store, so a restart does not forget who was already replaced.
+ *    A null run is an identity of its own: "we were never told the run" is not "any run will do".
  */
 
 const SYNCING = 'syncing';
@@ -31,7 +36,30 @@ CREATE TABLE IF NOT EXISTS applied_boundary (
   connection_id TEXT NOT NULL,
   generation INTEGER,
   up_to_receive_seq INTEGER,
+  run_id TEXT,
+  first_seq INTEGER,
   updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (market, stream)
+);
+CREATE TABLE IF NOT EXISTS retired_run (
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  retired_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (market, stream, run_id)
+);
+CREATE TABLE IF NOT EXISTS connection_identity (
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
+  run_id TEXT,
+  generation INTEGER,
+  PRIMARY KEY (market, stream, connection_id)
+);
+CREATE TABLE IF NOT EXISTS legacy_owner (
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  migrated_at_ms INTEGER NOT NULL,
   PRIMARY KEY (market, stream)
 );
 CREATE TABLE IF NOT EXISTS book_level (
@@ -85,6 +113,11 @@ export function createBoard() {
 export function openBook({ market, stream, durability, nowMs = () => Date.now() }) {
   if (!market || !stream) throw new TypeError('a book needs a market and a stream');
   if (!durability?.db) throw new TypeError('a book needs the durability store for its position');
+  // The book writes several records in one transaction, so it needs the store's transaction discipline
+  // rather than its own copy of it: a half-written ownership chain is not recoverable.
+  if (typeof durability.inTransaction !== 'function') {
+    throw new TypeError('a book needs the durability store and its transactions');
+  }
 
   durability.db.exec(BOOK_SCHEMA);
   const board = createBoard();
@@ -97,24 +130,134 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       .all(market, stream),
   );
 
+  // Two facts a boundary needs in order to mean the same thing after a restart: which run owns the
+  // board, and where that connection's numbering starts. A store written before they existed is
+  // migrated here by asking which columns it has rather than by assuming it is new; the question is asked
+  // inside the write lock, and nothing that fails is swallowed, because a half-migrated store that looks
+  // migrated is worse than one that refuses to open.
+  {
+    const columnNames = () =>
+      new Set(
+        durability.db.prepare('PRAGMA table_info(applied_boundary)').all().map((column) => column.name),
+      );
+    const ownershipColumns = [
+      ['run_id', 'TEXT'],
+      ['first_seq', 'INTEGER'],
+    ];
+    // The look before the transaction is only a reason to enter it: what is actually added is decided inside,
+    // with the write lock held, because another process may have migrated this same store since.
+    if (ownershipColumns.some(([name]) => !columnNames().has(name))) {
+      durability.inTransaction(() => {
+        // §6.2: the columns are read inside the transaction, so the set that is missing is the set at the
+        // moment of writing - with the write lock held, nothing else can be moving the store underneath.
+        const present = columnNames();
+        const created = new Set();
+        for (const [name, type] of ownershipColumns) {
+          if (present.has(name)) continue;
+          durability.db.exec(`ALTER TABLE applied_boundary ADD COLUMN ${name} ${type}`);
+          created.add(name);
+        }
+
+        // Only a transaction that created run_id itself can have rows whose NULL means "there was no column
+        // to write an owner in when this row was made": if the column was already there - even if this
+        // process's earlier look said otherwise, because another process migrated in between - then every row
+        // had its chance to record an owner, and a NULL in it is a recorded "no run". Marking those rows here
+        // would hand the board to an uninvited run on the next start, which is the one thing the marker
+        // exists to prevent.
+        if (!created.has('run_id')) return;
+        const boards = durability.db
+          .prepare('SELECT market, stream FROM applied_boundary WHERE run_id IS NULL')
+          .all();
+        const mark = durability.db.prepare(
+          'INSERT OR REPLACE INTO legacy_owner (market, stream, migrated_at_ms) VALUES (?, ?, ?)',
+        );
+        for (const board of boards) mark.run(board.market, board.stream, nowMs());
+      });
+    }
+  }
+
   const row = durability.db
-    .prepare('SELECT connection_id, generation, up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?')
+    .prepare(
+      `SELECT connection_id, generation, up_to_receive_seq, run_id, first_seq
+       FROM applied_boundary WHERE market = ? AND stream = ?`,
+    )
     .get(market, stream);
+
   let applied = row
-    ? { connectionId: row.connection_id, generation: row.generation ?? null, upToSeq: row.up_to_receive_seq ?? null }
-    : { connectionId: null, generation: null, upToSeq: null };
+    ? {
+        connectionId: row.connection_id,
+        generation: row.generation ?? null,
+        upToSeq: row.up_to_receive_seq ?? null,
+        runId: row.run_id ?? null,
+        firstSeq: row.first_seq ?? null,
+      }
+    : { connectionId: null, generation: null, upToSeq: null, runId: null, firstSeq: null };
+
+  // A run recorded in the store is the authority here. A NULL on a row that was written before the
+  // column existed says nothing about ownership - nobody was ever asked - so those boards are treated as
+  // unestablished, one board at a time, until the first explicit accept says who owns them. A NULL on a
+  // row written by this version is a recorded "no run", which is a different thing.
+  const ownerWasNeverRecorded =
+    durability.db
+      .prepare('SELECT 1 AS recorded FROM legacy_owner WHERE market = ? AND stream = ?')
+      .get(market, stream) !== undefined;
+  let ownerEstablished = row ? !ownerWasNeverRecorded : false;
+
+  // Runs that have been replaced, read back from the store: a run does not come back after a restart
+  // either, whatever number it quotes.
+  const retiredRuns = new Set(
+    durability.db
+      .prepare('SELECT run_id FROM retired_run WHERE market = ? AND stream = ?')
+      .all(market, stream)
+      .map((retired) => retired.run_id),
+  );
+
+  // A run name is never empty, so the empty string is how this store names the owner that has no run name. An
+  // owner is an owner whether it carries a name or not: the one without a name is replaced by a takeover and is
+  // refused afterwards like any other. It is stored as '' rather than NULL because a key cannot be NULL - SQLite
+  // would let many NULL rows stand for the same owner, and the retirement would not hold.
+  const RETIRED_UNNAMED = '';
 
   let phase = SYNCING; // a fresh or reopened book proves its boundary before serving
   let lastRefusal = null;
+  // The lowest sequence this book has been handed while the origin of the connection was still unknown. A
+  // frame that has arrived can only be at or after the origin, so an origin above it would skip past data
+  // the book has already seen - and completing the origin there is how those frames become permanently
+  // unapplicable, refused later as "already applied" while nothing ever applied them (§2.2).
+  let lowestSeenWithoutOrigin = null;
   // Frames that arrived ahead of a hole, kept rather than dropped: applying them now would move the
   // position past data that has not arrived and make that data permanently unapplicable, but
   // discarding them would mean the missing frame arrives and nothing else follows.
   const waiting = new Map(); // receive_seq -> { envelope, changes }
 
   const boundaryStatement = durability.db.prepare(
-    `INSERT OR REPLACE INTO applied_boundary (market, stream, connection_id, generation, up_to_receive_seq, updated_at_ms)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO applied_boundary
+       (market, stream, connection_id, generation, up_to_receive_seq, run_id, first_seq, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
+  const retireStatement = durability.db.prepare(
+    `INSERT OR REPLACE INTO retired_run (market, stream, run_id, retired_at_ms) VALUES (?, ?, ?, ?)`,
+  );
+  const clearUnrecordedOwnerStatement = durability.db.prepare(
+    'DELETE FROM legacy_owner WHERE market = ? AND stream = ?',
+  );
+  const identityStatement = durability.db.prepare(
+    `INSERT OR REPLACE INTO connection_identity (market, stream, connection_id, run_id, generation)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  const recordedIdentityStatement = durability.db.prepare(
+    'SELECT run_id, generation FROM connection_identity WHERE market = ? AND stream = ? AND connection_id = ?',
+  );
+  // A store that records an owner but no identity for the name it records was written before that record
+  // existed. The name is its own - the owner is right there in the row - so the identity is written down now
+  // rather than left open to being claimed by another run or generation. A store whose row predates the
+  // ownership columns is left alone: it has no established owner to write down yet.
+  if (row && ownerEstablished && recordedIdentityStatement.get(market, stream, row.connection_id) === undefined) {
+    durability.inTransaction(() => {
+      identityStatement.run(market, stream, row.connection_id, applied.runId, applied.generation);
+    });
+  }
+
   const levelUpsert = durability.db.prepare(
     `INSERT OR REPLACE INTO book_level (market, stream, side, price, size) VALUES (?, ?, ?, ?, ?)`,
   );
@@ -123,19 +266,50 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
   );
 
   /**
-   * Write down which connection is accepted now, before anything is applied.
+   * Write down who owns this board, and that the run it replaces is finished.
    *
-   * The generation is a fact about the connection, not a consequence of applying its data: waiting
-   * for a successful apply leaves a window in which a restart would accept the old generation again.
+   * The retirement, the end of "nobody ever recorded an owner here", and the new owner land in one
+   * transaction and in this order, so a crash cannot leave a store that has handed the board to a new
+   * run and forgotten that the old one was replaced. Nothing in memory changes until the commit has
+   * succeeded: a failed write must leave the book exactly as it was, not halfway into a takeover it did
+   * not complete.
    */
-  function persistAcceptance() {
-    boundaryStatement.run(market, stream, applied.connectionId, applied.generation, applied.upToSeq, nowMs());
+  function persistAcceptance(next, { retiredOwner = undefined, clearUnrecordedOwner = false } = {}) {
+    // undefined means there is nothing to retire; null is the owner that has no run name.
+    const retiring = retiredOwner !== undefined;
+    const retiredKey = retiredOwner ?? RETIRED_UNNAMED;
+    // A different connection, run or generation numbers from its own start: what was seen under the previous
+    // identity says nothing about where this one begins.
+    const identityChanged =
+      next.connectionId !== applied.connectionId ||
+      (next.generation ?? null) !== (applied.generation ?? null) ||
+      (next.runId ?? null) !== (applied.runId ?? null);
+    durability.inTransaction(() => {
+      if (retiring) retireStatement.run(market, stream, retiredKey, nowMs());
+      if (clearUnrecordedOwner) clearUnrecordedOwnerStatement.run(market, stream);
+      // The name and the identity it was accepted as are written down together with the position: a name is what
+      // frames are deduped by, so it must not be re-usable for another run or generation later (§2, C2).
+      identityStatement.run(market, stream, next.connectionId, next.runId ?? null, next.generation ?? null);
+      boundaryStatement.run(
+        market,
+        stream,
+        next.connectionId,
+        next.generation ?? null,
+        next.upToSeq ?? null,
+        next.runId ?? null,
+        next.firstSeq ?? null,
+        nowMs(),
+      );
+    });
+    // Only after the commit does the in-memory book follow the store.
+    if (retiring) retiredRuns.add(retiredKey);
+    if (identityChanged) lowestSeenWithoutOrigin = null;
+    applied = next;
   }
 
   /** Everything that makes one range durable: the levels and the position, in one transaction. */
   function commitRange({ changes, next }) {
-    durability.db.exec('BEGIN IMMEDIATE');
-    try {
+    durability.inTransaction(() => {
       for (const change of changes) {
         if (change.size === 0) levelDelete.run(market, stream, change.side, change.price);
         else levelUpsert.run(market, stream, change.side, change.price, change.size);
@@ -144,15 +318,13 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
         market,
         stream,
         next.connectionId,
-        next.generation,
-        next.upToSeq,
+        next.generation ?? null,
+        next.upToSeq ?? null,
+        next.runId ?? null,
+        next.firstSeq ?? null,
         nowMs(),
       );
-      durability.db.exec('COMMIT');
-    } catch (error) {
-      durability.db.exec('ROLLBACK');
-      throw error;
-    }
+    });
     // Only after the commit does the in-memory board follow the store.
     for (const change of changes) board.apply(change);
     applied = next;
@@ -166,9 +338,6 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       )
       .run(market, stream, applied.connectionId, waitingFor, seenSeq, nowMs());
   }
-
-  // Runs that have been replaced. A run does not come back, whatever number it quotes.
-  const supersededRuns = new Set();
 
   function closeGaps(upTo) {
     // C7: a hole belongs to the connection that opened it. Closing by sequence alone lets a new
@@ -208,44 +377,128 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
     stream,
     board,
 
-    /** Which connection this book is willing to accept: only a strictly newer generation replaces. */
+    /**
+     * Which connection this book is willing to accept.
+     *
+     * C11: generation numbers only order connections inside one run. A different run is not "older" or
+     * "newer", it is unrelated, and the only safe way to hand the book to it is to say so. Without this
+     * a restarted process (whose generation starts again) is refused as stale, and a replay of a dead
+     * run can take over by accident - both directions were reproduced in an audit, which is why the
+     * takeover is authorised by the caller and never inferred from a bigger number.
+     */
     accept(connectionId, { generation = null, firstSeq = null, runId = null, takeover = false } = {}) {
-      // C11: generation numbers only order connections inside one run. A different run is not "older"
-      // or "newer", it is unrelated, and the only safe way to hand the book to it is to say so. Without
-      // this, a restarted process (whose generation starts again) is refused as stale, and a replay of a
-      // dead run can take over by accident - both directions were reproduced in an audit.
-      const knownRun = applied.runId ?? null;
-      const sameRun = knownRun === null || runId === null || runId === knownRun;
-      if (runId !== null && supersededRuns.has(runId)) {
-        // A replaced run is finished. Letting it back in with a larger number would undo the takeover
-        // it lost, and a replay of its old frames would look newer than it is.
-        return { accepted: false, reason: 'this run was already replaced' };
+      // A replaced run is finished. Letting it back in with a larger number would undo the takeover it
+      // lost, and a replay of its old frames would look newer than it is.
+      if (retiredRuns.has(runId ?? RETIRED_UNNAMED)) {
+        return {
+          accepted: false,
+          reason:
+            runId === null
+              ? 'the owner without a run name was already replaced'
+              : 'this run was already replaced',
+        };
       }
+
+      // A name that disagrees with the identity announcing it is a contradiction, whoever is announcing it -
+      // and it is refused before any hand-over is considered. A takeover of a connection that holds this very
+      // name would reset the position for a run whose frames the organizer, still numbering under that name,
+      // would then treat as already durable: the board and the raw would describe different data under one
+      // name. A connection that really is new has a name of its own, because the name carries the run.
+      //
+      // This asks about an owner that is established: a board whose row predates the ownership columns has no
+      // owner to disagree with yet, and the accept that establishes one is exactly what should be allowed
+      // through - including for the name the store already carries.
+      if (
+        ownerEstablished &&
+        connectionId === applied.connectionId &&
+        (generation !== applied.generation || runId !== (applied.runId ?? null))
+      ) {
+        return { accepted: false, reason: 'this connection id disagrees with the identity accepting it' };
+      }
+
+      // A name belongs to the identity it was accepted as, for good. Letting the same name be re-used for
+      // another run or generation would apply frames of one identity to a board of another while the raw still
+      // holds the first one's data under that same name - and a frame under the old name would be answered as
+      // "already durable", so it would never be written again (C2, C8).
+      const recorded = recordedIdentityStatement.get(market, stream, connectionId);
+      if (
+        recorded !== undefined &&
+        ((recorded.run_id ?? null) !== runId || (recorded.generation ?? null) !== generation)
+      ) {
+        return { accepted: false, reason: 'this connection name has already been used for another identity' };
+      }
+
+      if (applied.connectionId === null) {
+        // Nothing has ever owned this board, so this connection does. The generation is recorded as the
+        // baseline rather than compared against a number that does not exist.
+        persistAcceptance({ connectionId, generation, firstSeq, runId, upToSeq: null });
+        ownerEstablished = true;
+        phase = SYNCING;
+        return { accepted: true, reason: 'first connection' };
+      }
+
+      if (!ownerEstablished) {
+        // This board's row predates the ownership columns, so who owns it is genuinely unknown - and the
+        // first explicit accept is what says. No takeover is demanded (there is nobody to take it from)
+        // and the generation it brings is taken as the baseline rather than compared. The board is kept:
+        // those levels are facts. The position is not, because it belongs to the numbering of a
+        // connection that cannot speak again - a run-scoped name is issued once. Claiming the board is
+        // what ends "nobody ever recorded an owner here", and it ends in the same transaction as the
+        // claim itself, so a failed claim leaves the board exactly as unestablished as it was.
+        persistAcceptance({ connectionId, generation, firstSeq, runId, upToSeq: null }, { clearUnrecordedOwner: true });
+        ownerEstablished = true;
+        waiting.clear();
+        phase = SYNCING;
+        return { accepted: true, reason: 'ownership established for a store that predates it' };
+      }
+
+      const ownerRun = applied.runId ?? null;
+      // Null is an identity, not a wildcard: a null run matches a null owner and nothing else.
+      const sameRun = ownerRun === runId;
       if (!sameRun && takeover !== true) {
         return { accepted: false, reason: 'a different run needs an explicit takeover' };
       }
       if (!sameRun) {
         // A takeover is not a comparison: the new run starts its own numbering, so the previous run's
-        // generation is cleared rather than beaten. Without this the new run's first connection looks
-        // older than the one it is replacing and the takeover is refused by the very rule that let it
-        // through the permission check.
-        if (knownRun !== null) supersededRuns.add(knownRun);
-        applied = { ...applied, generation: null };
-      }
-      const withFirst = { generation, firstSeq, runId };
-      if (applied.connectionId === null) {
-        applied = { connectionId, ...withFirst, upToSeq: null }; // runId travels with the connection
-        phase = SYNCING;
-        persistAcceptance();
-        return { accepted: true, reason: 'first connection' };
-      }
-      if (connectionId === applied.connectionId) return { accepted: true, reason: 'same connection' };
-      const supersedes = typeof generation === 'number' && (applied.generation === null || generation > applied.generation);
-      if (supersedes) {
-        applied = { connectionId, ...withFirst, upToSeq: null };
-        phase = SYNCING;
+        // generation is replaced rather than beaten, and the previous run is retired in the store.
+        persistAcceptance(
+          { connectionId, generation, firstSeq, runId, upToSeq: null },
+          { retiredOwner: ownerRun },
+        );
         waiting.clear();
-        persistAcceptance();
+        phase = SYNCING;
+        return { accepted: true, reason: 'a new run took the board over' };
+      }
+
+      // The same run, and the same connection: this is a reopen or a reconnect of a connection that is
+      // still current (a name that disagreed with its identity was refused above), and the only thing that
+      // can be completed is an origin nobody established yet.
+      if (connectionId === applied.connectionId && generation === applied.generation) {
+        if (applied.firstSeq === null && firstSeq !== null) {
+          // The start of this connection arrived after its frames did. Recording it changes no position,
+          // no hole and no phase: it is the anchor, not the data. It may not, however, be above a frame this
+          // book has already been handed - that would skip past data already seen, and §2.2 forbids moving an
+          // origin onto a sequence that has arrived.
+          if (lowestSeenWithoutOrigin !== null && firstSeq > lowestSeenWithoutOrigin) {
+            return { accepted: false, reason: 'this origin is beyond frames that have already arrived' };
+          }
+          persistAcceptance({ ...applied, firstSeq });
+          return { accepted: true, reason: 'the start of this connection is now known' };
+        }
+        if (applied.firstSeq !== null && firstSeq !== null && applied.firstSeq !== firstSeq) {
+          // An established origin is not renegotiable: moving it is how a hole gets jumped.
+          return { accepted: false, reason: 'the start of this connection is already established' };
+        }
+        return { accepted: true, reason: 'same connection' };
+      }
+
+      // A different connection inside the same run: only a strictly newer generation replaces it.
+      const supersedes =
+        typeof generation === 'number' && (applied.generation === null || generation > applied.generation);
+      if (supersedes) {
+        persistAcceptance({ connectionId, generation, firstSeq, runId, upToSeq: null });
+        waiting.clear();
+        phase = SYNCING;
         return { accepted: true, reason: 'superseded by a newer generation' };
       }
       lastRefusal = { connectionId, generation, atMs: nowMs(), reason: 'superseded connection' };
@@ -270,14 +523,35 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
       return { connectionId: applied.connectionId, upToSeq: applied.upToSeq };
     },
 
+    /** Runs this board has replaced, oldest first as far as the store remembers them. */
+    retiredRuns() {
+      // The owner without a run name is reported as null, which is the identity it was accepted as.
+      return [...retiredRuns].map((key) => (key === RETIRED_UNNAMED ? null : key));
+    },
+
     /**
      * Apply one envelope together with the level changes it carries.
+     *
+     * The frame must belong to this board and to the connection this book accepted - market, stream,
+     * run, generation and connection id are all part of that identity, and checking only the connection
+     * id is how a frame from a retired run, or a frame meant for another board, walks in on a
+     * technicality. That check comes before the duplicate test and before any hole is recorded, so a
+     * frame that is not ours never moves anything.
      *
      * Contiguous only: a frame whose predecessors are missing is refused and the hole is recorded,
      * because applying it would make the missing data permanently unapplicable. Duplicates are
      * no-ops. Applying data never changes the phase - only a proven boundary does.
      */
     apply({ envelope, changes = [] }) {
+      // Ownership comes first. A board whose row predates the ownership columns, or that has never been claimed,
+      // has no owner until an explicit accept says who it is - and a frame applied before that would be applied
+      // on behalf of nobody, which is exactly the state the ownership record and its marker exist to keep out.
+      if (!ownerEstablished) {
+        return { applied: false, reason: 'the owner of this board has not been established yet' };
+      }
+      if (envelope.market !== market || envelope.stream !== stream) {
+        return { applied: false, reason: 'this frame belongs to another board' };
+      }
       if (envelope.connection_id !== applied.connectionId) {
         // A connection is taken over only by an explicit accept. Accepting on sight is how a frame from
         // a connection nobody agreed to trust walks straight into the book, which is what a restarted
@@ -286,12 +560,42 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
           applied.connectionId === null ? 'no connection has been accepted yet' : 'connection not accepted';
         return { applied: false, reason };
       }
+      if ((envelope.run_id ?? null) !== (applied.runId ?? null)) {
+        return { applied: false, reason: 'this frame belongs to another run' };
+      }
+      if ((envelope.generation ?? null) !== (applied.generation ?? null)) {
+        return { applied: false, reason: 'this frame belongs to another generation' };
+      }
       const seq = envelope.receive_seq;
       if (applied.upToSeq !== null && seq <= applied.upToSeq) {
         return { applied: false, reason: 'already applied' };
       }
 
-      const firstSeq = applied.firstSeq ?? envelope.first_seq ?? envelope.meta?.first_seq ?? null;
+      // Whatever else happens, a frame this book has been handed is the ceiling on where this connection's
+      // numbering can start: the origin is at or before it. Recorded here - before any declaration is judged -
+      // so that a declaration refused for being too high cannot be replaced by a later one that skips this very
+      // frame, which would leave it refused for ever as already applied (§2.2).
+      if (applied.firstSeq === null) {
+        lowestSeenWithoutOrigin = lowestSeenWithoutOrigin === null ? seq : Math.min(lowestSeenWithoutOrigin, seq);
+      }
+
+      // The origin this frame declares is a fact about the connection, so it is written down the moment
+      // it is relied on - not kept in memory until some later frame happens to move the position. An
+      // origin that lived only in memory could be completed differently afterwards, and completing it to
+      // a sequence that has already arrived is a way to jump a hole this book has already recorded.
+      if (applied.firstSeq === null && envelope.meta?.first_seq != null) {
+        const declared = envelope.meta.first_seq;
+        // A connection's numbering starts at or before the first frame that carries it, so a frame declaring an
+        // origin above its own sequence contradicts itself - and one above a sequence already handed over
+        // contradicts that. Either way the frames below the declaration would be lost if it won, so it is
+        // refused rather than believed.
+        if (declared > seq || (lowestSeenWithoutOrigin !== null && declared > lowestSeenWithoutOrigin)) {
+          return { applied: false, reason: 'the origin this frame declares is beyond frames that have already arrived' };
+        }
+        persistAcceptance({ ...applied, firstSeq: declared });
+      }
+
+      const firstSeq = applied.firstSeq ?? envelope.meta?.first_seq ?? null;
       if (applied.upToSeq === null) {
         if (firstSeq === null) {
           // Nowhere to anchor the boundary. Starting at whatever arrived first would be guessing at
@@ -313,7 +617,12 @@ export function openBook({ market, stream, durability, nowMs = () => Date.now() 
         return { applied: false, reason: 'gap before this sequence', waitingFor: applied.upToSeq + 1 };
       }
 
-      commitRange({ changes, next: { ...applied, connectionId: applied.connectionId, upToSeq: seq } });
+      // The origin this frame is anchored on is recorded with the position it makes durable: a boundary
+      // whose start is only in memory is a boundary that cannot be shown again after a restart.
+      commitRange({
+        changes,
+        next: { ...applied, connectionId: applied.connectionId, upToSeq: seq, firstSeq },
+      });
       closeGaps(seq);
       const alsoApplied = drainWaiting();
       return { applied: true, reason: 'applied', alsoApplied };

@@ -133,15 +133,15 @@ export function createReceiveConnection({
 
   function stamp(raw) {
     receiveSeq += 1;
-    // The envelope is built by the one factory that knows the identity, never assembled here. When a
-    // run and a venue are configured the factory derives a run-scoped connection id, so a restarted
-    // process cannot take over the name of a connection that has already been written down; the
-    // generation travels with the envelope instead of riding along as a loose extra.
-    const derivedIdentity = runId && venue;
+    // The envelope is built by the one factory that knows the identity, never assembled here. The name is
+    // derived by the factory from the run, the venue, the market and the generation - the same four things
+    // the connection was named from - so a restarted process cannot take over the name of a connection that
+    // has already been written down, and the generation travels with the envelope instead of riding along
+    // as a loose extra.
     return makeEnvelope({
       market,
       stream: adapter.stream ?? 'unknown',
-      connectionId: derivedIdentity ? null : connectionId,
+      connectionId: null,
       runId,
       venue,
       generation,
@@ -235,15 +235,35 @@ export function createReceiveConnection({
     if (closed) return;
     if (socket) teardownSocket(reason);
     generation += 1;
-    // The name of the connection is the same one the envelope will carry: the run, the venue, the
-    // market and the generation. Naming it twice from two rules is how a book ends up accepting one
-    // id and being handed frames labelled with another.
-    connectionId =
-      runId && venue ? `${runId}:${venue}:${market}:${generation}` : `${market}:${generation}`;
+    // The name of a connection is the run, the venue, the market and the generation (C2). There is no
+    // fallback: a name built from the market and the generation alone is a name two runs can both hold, and
+    // a hand-over of one then looks like a reconnect of the other - which is how a board and a watermark end
+    // up describing different data under one name.
+    connectionId = `${runId}:${venue}:${market}:${generation}`;
     receiveSeq = 0;
     firstSeq = 1;
     attempts += 1;
-    onGeneration({ market, generation, connectionId, reason, firstSeq });
+    // The run and the venue travel with the announcement: without them the book is told which
+    // connection proposes to take over but not which run it belongs to, and a takeover - which is a
+    // question about runs, not about connections - cannot be decided from that.
+    const admitted = onGeneration({
+      market,
+      generation,
+      connectionId,
+      reason,
+      firstSeq,
+      runId,
+      venue,
+    });
+    if (admitted === false) {
+      // A connection nobody downstream admitted must not start receiving. Opening the socket anyway
+      // would make this process speak - and stamp frames - for a connection the book refused, and the
+      // frames of a refused connection are refused again further down, after they have been counted as
+      // received.
+      setState('refused', reason);
+      onDiagnostic({ market, generation, reason: 'this connection was not admitted downstream' });
+      return;
+    }
     setState('connecting', reason);
 
     const delay = delayForAttempt(attempts);
@@ -294,6 +314,12 @@ export function createReceiveConnection({
 
   return {
     start() {
+      // A connection cannot be named without the run and the venue it belongs to: the name is what makes it
+      // unique across processes, and without it two runs on the same market would share one identity. This
+      // is a configuration that cannot receive, so it is refused before any socket exists.
+      if (!runId || !venue) {
+        throw new TypeError('reception needs a run and a venue to name its connections');
+      }
       closed = false;
       replaceSocket('start');
     },

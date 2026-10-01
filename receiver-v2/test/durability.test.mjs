@@ -4,6 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { DatabaseSync } from 'node:sqlite';
+
 import { openDurability } from '../src/durability.mjs';
 
 async function withStore(fn) {
@@ -14,6 +16,43 @@ async function withStore(fn) {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test('a failure while invalidating a previous run reports itself, not the cleanup that follows', async () => {
+  await withStore(async (dbPath) => {
+    // A store with an unfinished run in it, so opening it again has something to invalidate.
+    const first = openDurability({ path: dbPath, runId: 'run-1' });
+    first.beginRun();
+    first.close();
+
+    // The invalidation write fails, and so does the rollback that tries to undo it. What the caller must
+    // hear about is the write: a failure that hides behind its own cleanup is a failure nobody can fix.
+    class RollbackThatFails extends DatabaseSync {
+      prepare(sql, ...rest) {
+        const statement = super.prepare(sql, ...rest);
+        if (/UPDATE run_marker/.test(sql)) {
+          return {
+            run: () => {
+              throw new Error('the invalidation could not be written');
+            },
+            get: (...args) => statement.get(...args),
+            all: (...args) => statement.all(...args),
+          };
+        }
+        return statement;
+      }
+
+      exec(sql, ...rest) {
+        if (/ROLLBACK/i.test(String(sql))) throw new Error('and the rollback failed as well');
+        return super.exec(sql, ...rest);
+      }
+    }
+
+    assert.throws(
+      () => openDurability({ path: dbPath, runId: 'run-2', Database: RollbackThatFails }),
+      /could not be written/,
+    );
+  });
+});
 
 test('a run that closes cleanly is the one a restart can trust', async () => {
   await withStore(async (dbPath) => {

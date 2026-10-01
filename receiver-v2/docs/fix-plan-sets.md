@@ -40,6 +40,7 @@
 ## 2.1 引退履歴の保存と原子性（Astra 指摘③）
 
 - 保存先は**専用テーブル** `retired_run (market, stream, run_id, retired_at_ms, PRIMARY KEY (market, stream, run_id))`。板のキー（market/stream）で引き、**複数の引退 run を保持**できる。
+- **run 名を持たない所有者も同じ表に引退記録する**（run 名は非空なので、**空文字**＝どの run も名乗れない値として保存する。NULL は主キーにできず、SQLite では複数行が並んで引退が効かなくなる）。復元時は空文字を「run 名を持たない所有者」として読み、その owner からの **takeover も拒否**する（引退は所有の話なので、名前の有無で扱いを変えない）。
 - takeover の確定手順は固定する: **①旧 run の引退記録 ②新しい owner（`run_id`/`first_seq`）の保存 ③境界行の更新**を**同一トランザクション**で行い、**成功した後にだけ**メモリ（`applied`・履歴集合）を更新する。
   現状は `state.mjs:232` で保存前に履歴と所有状態を書き換えているため、**この順序を逆にする**。
 - 失敗時は DB・メモリとも旧状態を維持（部分適用を作らない）。
@@ -134,11 +135,18 @@
 ## 7. ④の認可配線と ①の再試行契約（Astra 判定 2026-09-25 を反映）
 
 **④ 認可を「実際の受信開始」へ渡す（Astra 指摘の要修正を反映）**
-- 発行は `structure.accept` ✓。条件は `!admitted && options.runId === runId && ownerRun != null && ownerRun !== runId` ✓。
+- 発行は `structure.accept` ✓。条件は `!admitted && options.runId === runId && ownerRun !== runId` ✓
+  （**Astra 判定 2026-10-01**により `ownerRun != null` を外した: 保存済みの NULL 所有者は「未確立」ではなく
+  「run 名を持たない記録済みの所有者」であり、そこから通常 run へ移るには C11 の明示 takeover が要る。
+  この条件を外さないと、その板は受信を永久に拒否し続ける）。
   **呼び出し元の `options.takeover` では上書きさせない** ✓。`runId` は非空必須、`ownerRun` は板の現在値。
+  未確立扱い（初回 accept・旧6列由来で run_id が NULL の行）は §2.3 のまま: takeover は要求しない。
 - **旧復旧の完了が前提**: entry point が ①新 run 生成＋`beginRun()` ②旧 spool を流し切る ③旧境界を確定 してから `accept` を呼ぶ ✓。
 - **実際の `onGeneration` で新 run を認可し、**`accept` が成功するまで**受信開始を阻止**する ✓。
   （現状は `structure.mjs:185` が拒否をログするだけで、`connection.mjs:246` から socket 開始へ進む ✗）
+- **受理できない接続は黙って止まらない**: structure は拒否を `onStop` にも上げる ✓。
+  それを停止・非ゼロ終了へ変換するのは supervisor／entry point の仕事であり、両者は未実装なので
+  そこはセット3以降の完了条件として残る（受信が止まったまま誰も気づかない、を作らない）。
 - `admitted` は**板ごとの「今回の新 run」**に限定する ✓。**旧 run の復旧 accept では消費しない** ✓
   （消費すると新 run への交代が拒否され得る）。
 - `admitted` は**板の保存が成功した直後にだけ**立てる ✓（保存失敗では立てず、DB・メモリとも旧状態を維持 ✓）。

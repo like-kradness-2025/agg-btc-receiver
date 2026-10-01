@@ -19,6 +19,12 @@
  *
  * The process split is a deployment matter: the same contracts run over sockets between three
  * processes or, as here, in one for a test or a dry run against a replaying adapter.
+ *
+ * The one decision the wiring owns alone is admission: which run may speak for this board. It is
+ * issued here, at the moment a new run actually starts receiving, from the board's own recorded owner
+ * - never by a caller asking, and never from a bigger number. Until it is issued, reception does not
+ * start, because a connection nobody admitted would have every one of its frames refused downstream,
+ * after they had been counted as received.
  */
 
 import { openBook } from '../book/state.mjs';
@@ -35,6 +41,8 @@ export function createStructure({
   rawWriter,
   spoolDir = null,
   maxQueuedFrames = 5_000,
+  runId = null,
+  venue = null,
   onAck = () => {},
   onGap = () => {},
   onStop = () => {},
@@ -43,6 +51,14 @@ export function createStructure({
 }) {
   if (!durability?.db) throw new TypeError('the structure needs the durability store');
   if (typeof rawWriter !== 'function') throw new TypeError('the structure needs a raw writer');
+  // A structure that organizes one stream while its adapter carries another can only produce frames the
+  // board will refuse as belonging to another board - after they have been written to the raw. The
+  // mismatch is therefore refused here, before the book and the spool exist.
+  if (adapter?.stream && adapter.stream !== stream) {
+    throw new TypeError(
+      `the structure organizes the ${stream} stream, but its adapter carries ${adapter.stream}`,
+    );
+  }
 
   const book = openBook({ market, stream, durability });
   const spool = spoolDir ? createSpool({ dir: spoolDir }) : null;
@@ -65,6 +81,49 @@ export function createStructure({
     },
     capacity: () => (stopped ? 'stopped' : 'ok'),
   });
+
+  // The run this structure has already admitted for this board. A takeover is issued once per run: the
+  // second connection of the same run is a change of connection, not a new claim on the board, and the
+  // run this process is not running cannot be admitted by this process at all.
+  let admittedRunId = null;
+
+  // A completion the caller has not taken delivery of yet. It is held until onAck returns, because the
+  // notification is the one part of a completion that can fail on its own, and a repair that only works
+  // the first time is a repair that is lost with the failure. Kept in memory on purpose: a ledger that
+  // survives a crash belongs with the durable delivery ledger, not here.
+  let pendingOriginAck = null;
+
+  /**
+   * Tell the organizer which connection it is organizing, and what the board knows about where that
+   * connection's numbering starts.
+   *
+   * The origin is taken from the board rather than from the caller: two places deciding where a
+   * connection starts is exactly how the raw position and the applied position drift apart. A
+   * completion is acknowledged only for the ceiling it actually moved - the contiguous durable one -
+   * because an acknowledgement that carried anything else would claim more than is durable, and asking
+   * again delivers an acknowledgement whose notification failed.
+   */
+  function followConnection(connectionId, { origin = null } = {}) {
+    // The board's own identity, not a second opinion from the caller: if the organizer measured a frame
+    // against anything else, a frame from another run or generation would be written to the canonical
+    // record on the strength of a connection id that happens to match.
+    const boundary = book.appliedBoundary;
+    const organized = organizer.accept(connectionId, {
+      firstSeq: origin,
+      runId: boundary.runId ?? null,
+      generation: boundary.generation ?? null,
+    });
+    if (organized?.advanced === true) {
+      const ack = organizer.currentAck();
+      if (ack) pendingOriginAck = ack;
+    }
+    if (pendingOriginAck !== null && pendingOriginAck.connectionId === connectionId) {
+      const ack = pendingOriginAck;
+      onAck(ack);
+      pendingOriginAck = null; // only once the caller has taken it
+    }
+    return organized;
+  }
 
   // The board's own vocabulary, by exact name - taken from the board, not guessed at. A pattern loose
   // enough to catch one wording also catches "first sequence unknown", which is a frame that is
@@ -110,6 +169,12 @@ export function createStructure({
           envelope: { ...envelope, generation: envelope.generation },
           changes: adapter.changesFor ? adapter.changesFor(envelope) : [],
         });
+        // The board may have anchored its boundary on the origin this frame declares. The organizer has
+        // to hear the same origin: the ceiling lives there, and a start that reached only the board
+        // would leave every frame durable and unacknowledged, waiting for a start that has arrived.
+        if (book.appliedBoundary.firstSeq !== null) {
+          followConnection(envelope.connection_id, { origin: book.appliedBoundary.firstSeq });
+        }
         // Two refusals are the book working as designed: a frame it already holds, and a frame it is
         // holding until the hole before it is filled. Those are states, not losses.
         //
@@ -180,35 +245,77 @@ export function createStructure({
     ...receiveOptions,
     adapter,
     market,
+    runId,
+    venue,
     webSocketImpl,
     onEnvelope: feed,
-    onGeneration: ({ connectionId, generation, firstSeq }) => {
+    // Reception's own reports - a connection it refused to open, a socket it tore down, a frame it could
+    // not parse - travel to the same caller that hears about the book, so a refusal that stops reception
+    // is not something only the connection knows.
+    onDiagnostic: (diagnostic) => onDiagnostic(diagnostic),
+    onGeneration: ({ connectionId, generation, firstSeq, runId: incomingRunId }) => {
       // Acceptance goes through the same route as a caller's accept(), so there is one behaviour rather
       // than a manual path and an automatic path that quietly differ. The generation is announced
       // before the connection's frames arrive, which is when the book needs to hear about it.
-      const accepted = api.accept(connectionId, { generation, firstSeq: firstSeq ?? null });
+      //
+      // The takeover is issued here and only here. It is not a comparison of generations - the new run
+      // starts its own numbering - so it needs two facts the book cannot see: that the connection
+      // belongs to the run *this* process is running, and that the board is currently owned by a
+      // different run. The recorded owner may be NULL - a run-less owner this store wrote down - and that
+      // is still an owner: the board has to be handed over explicitly (C11), which is exactly what this
+      // condition does, rather than being refused for ever. Recovering an older run's board is not a
+      // takeover and must not consume the authorisation, or the run that actually replaces it would then
+      // be refused.
+      const ownerRun = book.appliedBoundary.runId ?? null;
+      const takeover = admittedRunId === null && runId !== null && incomingRunId === runId && ownerRun !== runId;
+      const accepted = admit(connectionId, { generation, firstSeq: firstSeq ?? null, runId: incomingRunId }, { takeover });
       if (!accepted.accepted) {
         onDiagnostic({ market, reason: `the book did not accept this connection: ${accepted.reason}` });
+        // Reception is not allowed to start: a connection the book refused would have every frame of it
+        // refused further down, after it had been stamped and counted as received. And it is not allowed
+        // to be silent either: a receiver that has stopped receiving without saying so is worse than one
+        // that stopped loudly. Turning this into a stop and a non-zero exit is the supervisor's job, and
+        // there is no supervisor or entry point yet - this is as far up as the wiring can carry it today.
+        onStop({ market, reason: `this connection was not admitted: ${accepted.reason}` });
+        return false;
       }
+      admittedRunId = incomingRunId;
+      return true;
     },
   });
+
+  /**
+   * Accept a connection: one route for the manual case and the automatic one, so there is no second
+   * behaviour that quietly differs from the first.
+   *
+   * The takeover is not a caller's argument. A caller may name a connection, declare a generation and
+   * complete an origin; handing this board to a different run is authorised where reception actually
+   * starts, because that is the only place that knows which run is running here.
+   */
+  function admit(connectionId, options, { takeover = false } = {}) {
+    const accepted = book.accept(connectionId, { ...options, takeover });
+    if (accepted?.accepted) {
+      // Every part of the structure follows the same connection. The organizer kept its own idea of
+      // which connection it was working on, so it is told here - with the origin the board actually
+      // anchored to, not the one a caller hoped for - rather than left to infer it from whichever frame
+      // happens to arrive first.
+      followConnection(connectionId, { origin: book.appliedBoundary.firstSeq ?? null });
+      // And the held frames were refused because the book did not know this connection; now that it
+      // does, they are offered again without anyone having to remember to ask, because a repair that
+      // depends on somebody calling it is a repair that does not happen.
+      if (unapplied.size > 0) api.redeliverPending();
+    }
+    return accepted;
+  }
 
   const api = {
     market,
     /** Accept a connection explicitly. Frames from any other connection are refused by the book. */
     accept: (connectionId, options = {}) => {
-      const accepted = book.accept(connectionId, options);
-      if (accepted && accepted.accepted) {
-        // Every part of the structure follows the same connection. The organizer kept its own idea of
-        // which connection it was working on, so it is told here rather than left to infer it from
-        // whichever frame happens to arrive first.
-        if (typeof organizer.accept === 'function') organizer.accept(connectionId);
-        // And the held frames were refused because the book did not know this connection; now that it
-        // does, they are offered again without anyone having to remember to ask, because a repair that
-        // depends on somebody calling it is a repair that does not happen.
-        if (unapplied.size > 0) api.redeliverPending();
-      }
-      return accepted;
+      // A caller may not hand this board to another run by asking: that authorisation is issued where
+      // reception actually starts, from the board's own recorded owner and the run that is running here.
+      const { takeover: _ignoredTakeover, ...callerOptions } = options;
+      return admit(connectionId, callerOptions);
     },
     /**
      * Offer the held frames to the book again, oldest first. What was refused because the book did not

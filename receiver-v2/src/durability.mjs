@@ -80,30 +80,42 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   // Only an unfinished generation is invalidated. A run that closed cleanly keeps that fact: erasing
   // it would hide the very thing the marker exists to record.
   const invalidate = db.prepare('UPDATE run_marker SET state = ?, at_ms = ? WHERE state = ?');
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  // Through the same transaction discipline as everything else: a rollback that fails must not replace the
+  // error that caused it, or the reason this store could not open is lost behind the attempt to clean up.
+  inTransaction(() => {
     invalidate.run(STATE_INVALIDATED, nowMs(), STATE_RUNNING);
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
+  });
 
-  /** Run fn inside one transaction: the caller uses this so a record cannot land alone. */
+  /**
+   * Run fn inside one transaction, so that a record cannot land alone.
+   *
+   * Exposed because every module that owns part of this store needs the same discipline, and because a
+   * BEGIN that never succeeded must not be rolled back (there is nothing to roll back) and a rollback
+   * that fails must not replace the error that caused it.
+   */
   function inTransaction(fn) {
-    db.exec('BEGIN IMMEDIATE');
+    let begun = false;
     try {
+      db.exec('BEGIN IMMEDIATE');
+      begun = true;
       const result = fn();
       db.exec('COMMIT');
       return result;
     } catch (error) {
-      db.exec('ROLLBACK');
+      if (begun) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // the original failure is the one to report
+        }
+      }
       throw error;
     }
   }
 
   return {
     db,
+    inTransaction,
 
     /** Mark this generation as the live one. Called once, before any data is trusted. */
     beginRun() {

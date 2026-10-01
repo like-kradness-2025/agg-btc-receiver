@@ -36,6 +36,10 @@ test('a resend of durable data is still offered to the board', async () => {
       },
     });
 
+    // Organization follows an explicitly accepted connection: nothing is taken on sight (C2), and the
+    // frames it is handed carry the identity the board recorded for that connection.
+    organizer.accept('conn-1', { generation: 1 });
+
     const first = organizer.note(envelope(1));
     assert.equal(first.durable, true, 'the first copy is written');
 
