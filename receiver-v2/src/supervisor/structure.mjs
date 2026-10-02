@@ -57,13 +57,8 @@ export function createStructure({
   maxWaitingEvents = 1_000,
   ...receiveOptions
 }) {
-  // The store is the structure's own: given a path, it opens it here and never hands it out, so nothing a
-  // caller holds is a way to write around the structure. (The wiring may still pass one it opened itself -
-  // the tests do - and that path stays inside the module either way.)
-  const store =
-    durability ?? (path ? openDurability({ path, runId, ...(Database ? { Database } : {}) }) : null);
-  if (!store) throw new TypeError('the structure needs a path for its store');
-  durability = store;
+  // The checks that can refuse the configuration run before anything is opened: a construction that never
+  // runs must not leave a store - or a file - behind for the next attempt to trip over.
   if (typeof rawWriter !== 'function') throw new TypeError('the structure needs a raw writer');
   // A structure that organizes one stream while its adapter carries another can only produce frames the
   // board will refuse as belonging to another board - after they have been written to the raw. The
@@ -73,9 +68,56 @@ export function createStructure({
       `the structure organizes the ${stream} stream, but its adapter carries ${adapter.stream}`,
     );
   }
+  if (!durability && !path) throw new TypeError('the structure needs a path for its store');
+
+  // The store is the structure's own: given a path, it opens it here and never hands it out, so nothing a
+  // caller holds is a way to write around the structure. (The wiring may still pass one it opened itself -
+  // the tests do - and that path stays inside the module either way.)
+  const openedHere = !durability;
+  const store = durability ?? openDurability({ path, runId, ...(Database ? { Database } : {}) });
+  durability = store;
+
+  let claimed = false;
+  /**
+   * Run one construction step that can fail.
+   *
+   * A structure that is never returned is a store nobody can close: this attempt undoes what it did to
+   * the store - the claim it took, and, when it opened the store itself, the store - so the next
+   * construction can take the file. A store the caller handed in is left open: it was never this
+   * attempt's to end, and the caller still holds it.
+   */
+  function constructing(step) {
+    try {
+      return step();
+    } catch (error) {
+      if (claimed) {
+        try {
+          internalsOf(durability).releaseStructureOwner({ market, stream });
+        } catch {
+          // The store cannot be reached to release; there is nothing this attempt can undo.
+        }
+      }
+      if (openedHere) {
+        try {
+          internalsOf(durability).close();
+        } catch {
+          // The original failure is the one to report; a store that will not close stays held on purpose.
+        }
+      }
+      throw error;
+    }
+  }
 
   // The right, the transactions and the observation come from the wiring, never from the object handed in.
-  const wiring = internalsOf(durability);
+  // The claim is taken here too: a store serves one structure per board, and a second structure over the
+  // same board would share its position and outlive the first close. (Boards that differ are separate
+  // pages of one store, and each claims for itself.)
+  const wiring = constructing(() => {
+    const internals = internalsOf(durability);
+    internals.claimStructureOwner({ market, stream });
+    claimed = true;
+    return internals;
+  });
 
   // Backpressure is decided here rather than inside a buffer. In one process the roles are called
   // synchronously, so the pressure shows up as the raw writer refusing: the frame then goes to the
@@ -90,30 +132,32 @@ export function createStructure({
   // calls can find the store free. The right is the store's own; nothing here adds a second flag for it.
   // The private routes are collected as the parts are built: the part objects themselves carry none of
   // them, and neither does anything a caller is handed - see `internal/wiring.mjs`.
-  const { book, ledger, organizer } = wiring.whileChange(() => ({
-    book: constructorOf('book')({ market, stream, durability, nowMs }, wiring),
-    // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
-    // this process, because the frames it names are only recoverable while that knowledge survives a crash.
-    ledger: constructorOf('ledger')({ durability, market, stream, nowMs }, wiring),
-    organizer: constructorOf('organizer')(
-      {
-        market,
-        stream,
-        durability,
-        writeRaw: (envelope) => {
-          const written = rawWriter(envelope);
-          return written === true; // only a durable write may be acknowledged
+  const { book, ledger, organizer } = constructing(() =>
+    wiring.whileChange(() => ({
+      book: constructorOf('book')({ market, stream, durability, nowMs }, wiring),
+      // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
+      // this process, because the frames it names are only recoverable while that knowledge survives a crash.
+      ledger: constructorOf('ledger')({ durability, market, stream, nowMs }, wiring),
+      organizer: constructorOf('organizer')(
+        {
+          market,
+          stream,
+          durability,
+          writeRaw: (envelope) => {
+            const written = rawWriter(envelope);
+            return written === true; // only a durable write may be acknowledged
+          },
+          capacity: () => (stopped ? 'stopped' : 'ok'),
+          nowMs,
         },
-        capacity: () => (stopped ? 'stopped' : 'ok'),
-        nowMs,
-      },
-      wiring,
-    ),
-  }));
+        wiring,
+      ),
+    })),
+  );
   const bookInternal = internalsOf(book);
   const ledgerInternal = internalsOf(ledger);
   const organizerInternal = internalsOf(organizer);
-  const spool = spoolDir ? createSpool({ dir: spoolDir }) : null;
+  const spool = spoolDir ? constructing(() => createSpool({ dir: spoolDir })) : null;
 
   // The run this structure has already admitted for this board. A takeover is issued once per run: the
   // second connection of the same run is a change of connection, not a new claim on the board, and the
@@ -536,24 +580,26 @@ export function createStructure({
       return admitted;
     });
 
-  const connection = createReceiveConnection({
-    // The caller's options come first so that the wiring below cannot be replaced by them: a caller who
-    // could override onEnvelope could bypass the book entirely, and a caller who could override
-    // onGeneration could take a connection without the book ever hearing about it.
-    ...receiveOptions,
-    adapter,
-    market,
-    runId,
-    venue,
-    webSocketImpl,
-    onEnvelope: feedEntry,
-    onEvent: (label, work) => receiveEvent(label, work),
-    // Reception's own reports - a connection it refused to open, a socket it tore down, a frame it could
-    // not parse - travel to the same caller that hears about the book, so a refusal that stops reception
-    // is not something only the connection knows.
-    onDiagnostic: (diagnostic) => onDiagnostic(diagnostic),
-    onGeneration: admitEntry,
-  });
+  const connection = constructing(() =>
+    createReceiveConnection({
+      // The caller's options come first so that the wiring below cannot be replaced by them: a caller who
+      // could override onEnvelope could bypass the book entirely, and a caller who could override
+      // onGeneration could take a connection without the book ever hearing about it.
+      ...receiveOptions,
+      adapter,
+      market,
+      runId,
+      venue,
+      webSocketImpl,
+      onEnvelope: feedEntry,
+      onEvent: (label, work) => receiveEvent(label, work),
+      // Reception's own reports - a connection it refused to open, a socket it tore down, a frame it could
+      // not parse - travel to the same caller that hears about the book, so a refusal that stops reception
+      // is not something only the connection knows.
+      onDiagnostic: (diagnostic) => onDiagnostic(diagnostic),
+      onGeneration: admitEntry,
+    }),
+  );
 
   // What a caller is handed for the connection: its reads only. Starting and stopping reception are change
   // operations of the structure, not of the connection a caller holds - a connection replaced from inside an
@@ -850,15 +896,21 @@ export function createStructure({
       connection.stop();
       spool?.close();
     },
-    /** The termination of the structure: reception, the spool, and the store it owns. */
+    /** The termination of the structure: reception, the spool, and the store it opened itself. */
     close: () => {
-      // The structure owns its store, so it is also what ends it: reception first, then the store, and the
-      // file is free only after the close that succeeded.
+      // The structure ends the store it opened itself; a store a caller handed in is the caller's to end -
+      // the structure stops using it and gives its board back. Reception first, and the file is free only
+      // after the close that succeeded.
       connection.stop();
       spool?.close();
-      // The store's own close would be refused inside this operation; the wiring's is the same close without
-      // a second take.
-      wiring.close();
+      if (openedHere) {
+        // The store's own close would be refused inside this operation; the wiring's is the same close
+        // without a second take.
+        wiring.close();
+      }
+      // The board is given back last: a close that failed can be tried again, and until it succeeds the
+      // board is still this structure's.
+      wiring.releaseStructureOwner({ market, stream });
     },
     /** A frame handed in directly, for a replay adapter or a dry run. */
     feed,
@@ -947,7 +999,7 @@ export function createStructure({
   // accepts first, which is exactly the order a recovery is written in. It is driven through the guarded
   // name, so the recovery holds the store while it runs: a hook it calls cannot start a second operation and
   // hand the same frame to the same module twice.
-  api.resume();
+  constructing(() => api.resume());
 
   // The parts themselves, for the wiring: a test that drives a part directly (a book's own accept, a
   // ledger's own record) goes through this, and nothing a caller is handed reaches it.

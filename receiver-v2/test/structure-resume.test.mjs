@@ -326,8 +326,6 @@ test('the frame is written down as an intent before the raw is touched', async (
 test('a frame whose raw write was refused leaves nothing owed', async () => {
   await withStore(async ({ path }) => {
     const store = openDurability({ path, runId: 'run-1' });
-    const structure = build(store);
-    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // A raw writer that refuses the write: the intent written before the attempt has to come back out,
     // or a restart would deliver a frame the canonical record never took.
     const refusing = createStructure({

@@ -136,6 +136,11 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   let registered = false;
   let closed = false;
   const right = { busy: false };
+  // The boards a structure serves from this store. A second structure over the same board in the same
+  // store would share its position and outlive the first close, so it is refused; boards that differ
+  // are separate pages of one store (the tables are keyed by the board) and claim separately. The claim
+  // lives in this closure, so every wrapper of the store carries the same one.
+  const structureOwners = new Set();
   try {
     db = new Database(dbPath);
 
@@ -452,6 +457,23 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     // termination) closes the store inside it, and the public name would refuse that as a second operation.
     close: internal.close,
     REENTRANT_OPERATION,
+    /**
+     * One structure serves a board from a store at a time. A second structure over the same board in the
+     * same store - under any object that names it, a wrapper included - is refused before it can share
+     * the board's position or outlive the first one's close.
+     */
+    claimStructureOwner({ market, stream }) {
+      const board = JSON.stringify([market, stream]);
+      if (structureOwners.has(board)) {
+        const error = new Error('this store already serves this board from another structure in this process');
+        error.code = REENTRANT_OPERATION;
+        throw error;
+      }
+      structureOwners.add(board);
+    },
+    releaseStructureOwner({ market, stream }) {
+      structureOwners.delete(JSON.stringify([market, stream]));
+    },
   });
   return exported;
 }

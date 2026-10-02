@@ -9,6 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -662,25 +663,29 @@ test('the private routes are not handed over with the module, in an argument or 
 
 test('the recovery a new structure runs holds the store while it runs', async () => {
   await withStore(async (dir) => {
-    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
-    const injectable = withInjectableWrites(store);
+    const path = join(dir, 'state.sqlite');
+    const store = openDurability({ path, runId: 'run-1' });
     const first = build(store, {});
     first.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     // A frame the raw may not hold: an intent, which is what a crash between the raw and its confirmation
     // leaves behind, and what the next structure has to offer back through the organizer.
     assert.equal(partsOf(first).ledger.record(envelope(1), 'about to be written', 'intent').recorded, true);
+    // The next structure takes its own store, as a restarted process does: a store belongs to one
+    // structure at a time, and a closed one is not taken again.
+    store.close();
+    const nextStore = openDurability({ path, runId: 'run-2' });
 
     const { openOrganizer } = await import('../src/organize/watermark.mjs');
     const other = openOrganizer({
       market: 'kraken_spot',
       stream: 'trades',
-      durability: store,
+      durability: nextStore,
       writeRaw: () => true,
     });
     const observed = [];
-    build(store, {
+    build(nextStore, {
       onRawWrite: () => {
-        observed.push({ inChange: store.inChange() });
+        observed.push({ inChange: nextStore.inChange() });
         // A public change operation, driven from inside the recovery: exactly what the construction-time
         // recovery not holding the store would let through.
         observed.push({ refusal: other.note(envelope(99), {})?.code ?? null });
@@ -690,7 +695,7 @@ test('the recovery a new structure runs holds the store while it runs', async ()
     assert.ok(observed.length >= 2, 'the recovery re-offered the intent through the raw writer');
     assert.equal(observed[0].inChange, true, 'the recovery holds the store while it runs');
     assert.equal(observed[1].refusal, 'REENTRANT_OPERATION', 'so no change operation can start from inside it');
-    store.close();
+    nextStore.close();
   });
 });
 
@@ -1499,16 +1504,168 @@ test('the structure creates its store from a path, holds the file, and closes it
   });
 });
 
+test('a store serves one structure per board', async () => {
+  await withStore(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const store = openDurability({ path, runId: 'run-1' });
+    store.beginRun();
+    const first = build(store, {});
+    // The same board again - and a wrapper that names the same store - is refused: a second structure
+    // would share the board's position and outlive the first close.
+    assert.throws(
+      () => build(store, {}),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'the board belongs to the structure that has it',
+    );
+    assert.throws(
+      () => build(withInjectableWrites(store).durability, {}),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'and a wrapper of the store is the same store',
+    );
+    // A different board is a separate page of the same store: one market's boards share one store, and
+    // each board is taken on its own.
+    const other = createStructure({
+      market: 'kraken_spot',
+      stream: 'book',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: { url: 'ws://venue.test/ws', stream: 'book', parse: () => ({ kind: 'data' }) },
+      durability: store,
+      spoolDir: null,
+      webSocketImpl: function unused() {
+        throw new Error('this test opens no socket');
+      },
+      rawWriter: () => true,
+    });
+    other.close();
+    // Closing one board's structure gives that board back - not the store, and not another board.
+    assert.throws(
+      () => build(store, {}),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'the first board is still held after the other board closes',
+    );
+
+    // The first structure keeps working while the other board was there.
+    assert.equal(
+      first.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 }).accepted,
+      true,
+      'the structure that owns its board keeps working',
+    );
+
+    // Closing gives the board back and leaves the store open - a store a caller handed in is the
+    // caller's to end - so the same board can be taken again from the same store.
+    first.close();
+    const again = build(store, {});
+    again.close();
+
+    // Given a path instead, the structure opens the file itself: a second owner of that file is refused,
+    // and its own close is what frees the file for the construction that follows (a restart reopens it).
+    store.close();
+    const owned = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      path,
+      adapter: { url: 'ws://venue.test/ws', stream: 'trades', parse: () => ({ kind: 'data' }) },
+      spoolDir: null,
+      webSocketImpl: function unused() {
+        throw new Error('this test opens no socket');
+      },
+      rawWriter: () => true,
+    });
+    assert.throws(
+      () =>
+        createStructure({
+          market: 'kraken_spot',
+          stream: 'trades',
+          runId: 'run-1',
+          venue: 'kraken',
+          path,
+          adapter: { url: 'ws://venue.test/ws', stream: 'trades', parse: () => ({ kind: 'data' }) },
+          spoolDir: null,
+          webSocketImpl: function unused() {
+            throw new Error('this test opens no socket');
+          },
+          rawWriter: () => true,
+        }),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'the file the structure opened is held',
+    );
+    owned.close();
+    const nextStore = openDurability({ path, runId: 'run-2' });
+    const next = build(nextStore, {});
+    next.close();
+    nextStore.close();
+  });
+});
+
+test('a structure that fails to construct leaves no store behind', async () => {
+  await withStore(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const base = {
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      path,
+      webSocketImpl: function unused() {
+        throw new Error('this test opens no socket');
+      },
+    };
+    const adapter = { url: 'ws://venue.test/ws', stream: 'trades', parse: () => ({ kind: 'data' }) };
+
+    // The check that can refuse the configuration runs before anything is opened: no file appears.
+    assert.throws(
+      () => createStructure({ ...base, adapter, rawWriter: null }),
+      /raw writer/,
+      'the configuration cannot construct',
+    );
+    assert.equal(existsSync(path), false, 'and nothing was opened for it');
+
+    // A failure after the store is open takes the store down with it: this adapter cannot be built into a
+    // connection, and the construction that follows is the proof that the file came free again.
+    assert.throws(
+      () =>
+        createStructure({
+          ...base,
+          adapter: { url: 'ws://venue.test/ws', stream: 'trades' },
+          rawWriter: () => true,
+        }),
+      /adapter that can parse/,
+      'the construction fails after the store is open',
+    );
+    const structure = createStructure({ ...base, adapter, rawWriter: () => true });
+    structure.close();
+
+    // A store the caller handed in is the caller's: the failed attempt releases its claim and leaves the
+    // store open, so the retry with a working configuration takes the same store - and the caller closes
+    // it, as the caller also opened it.
+    const store = openDurability({ path: join(dir, 'other.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    assert.throws(
+      () =>
+        createStructure({
+          ...base,
+          path: null,
+          durability: store,
+          adapter: { url: 'ws://venue.test/ws', stream: 'trades' },
+          rawWriter: () => true,
+        }),
+      /adapter that can parse/,
+    );
+    const retry = build(store, {});
+    retry.close();
+    store.close();
+  });
+});
+
 test('nothing a caller supplies is handed the store, a part, or a private route', async () => {
   await withStore(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     store.beginRun();
     const seen = [];
     const record = (label, ...args) => seen.push({ label, args });
-    const structure = build(store, {
-      written: [],
-      onAck: (...args) => record('onAck', ...args),
-    });
     // The hooks a caller supplies: what they receive is data, never the store, a part, or a route. The
     // connection's own observations are among them, because the socket is driven here too. The raw
     // writer takes the frame (`true`), so reception carries on and the socket really opens.
