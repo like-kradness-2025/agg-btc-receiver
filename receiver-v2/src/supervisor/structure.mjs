@@ -62,7 +62,7 @@ export function createStructure({
   // the tests do - and that path stays inside the module either way.)
   const store =
     durability ?? (path ? openDurability({ path, runId, ...(Database ? { Database } : {}) }) : null);
-  if (!store?.db) throw new TypeError('the structure needs a path for its store');
+  if (!store) throw new TypeError('the structure needs a path for its store');
   durability = store;
   if (typeof rawWriter !== 'function') throw new TypeError('the structure needs a raw writer');
   // A structure that organizes one stream while its adapter carries another can only produce frames the

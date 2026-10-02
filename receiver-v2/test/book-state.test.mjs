@@ -8,6 +8,8 @@ import { makeEnvelope } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { openBook } from '../src/book/state.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
 const envelope = (seq, connectionId = 'conn-1', extra = {}) =>
   makeEnvelope({
     market: 'kraken_spot',
@@ -45,7 +47,7 @@ test('a contiguous range applies, and the board travels with the position', asyn
     assert.equal(book.appliedBoundary.upToSeq, 3);
     assert.equal(book.board.size('bid', 103), 3);
     // The same transaction wrote both, so the store and the board agree.
-    const levels = store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n;
+    const levels = internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n;
     assert.equal(levels, 3, 'every applied range is in the store too');
     store.close();
   });

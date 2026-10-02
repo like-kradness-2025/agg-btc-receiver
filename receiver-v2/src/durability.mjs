@@ -436,8 +436,14 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   // `internal/wiring.mjs`, and not on this object. A module that called `store.guard(...)` on the object a
   // caller holds would hand its unguarded route to whoever replaced that method: the route would then be
   // callable from inside a frame, and the same frame would be written twice.
-  const exported = { ...api, inChange, REENTRANT_OPERATION };
+  // Neither the database handle nor the transaction helper is handed out: a caller gets a store it can ask
+  // about (and its own change operations), and the wiring gets the rest through `internal/wiring.mjs`.
+  const { db: _db, inTransaction: _inTransaction, ...publicApi } = api;
+  const exported = { ...publicApi, inChange, REENTRANT_OPERATION };
   bindInternals(exported, {
+    // The database handle travels only on this path: a module runs its statements through it, and a caller
+    // is never handed a way to write around the structure.
+    db,
     guard,
     inTransaction,
     inChange,

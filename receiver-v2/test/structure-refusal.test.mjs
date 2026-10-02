@@ -267,7 +267,7 @@ test('a store that records an owner but no identity for its name does not let th
       }),
       changes: [{ side: 'bid', price: 101, size: 1 }],
     });
-    before.db.exec('DELETE FROM connection_identity');
+    internalsOf(before).db.exec('DELETE FROM connection_identity');
     before.close();
 
     const store = openDurability({ path: dbPath, runId: 'A' });

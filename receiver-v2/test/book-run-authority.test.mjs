@@ -118,7 +118,7 @@ test('a store that predates the ownership columns is migrated, and then keeps it
 
     const first = openDurability({ path: dbPath, runId: 'run-A' });
     const book = openBook({ market: 'kraken_spot', stream: 'book', durability: first });
-    const columns = first.db
+    const columns = internalsOf(first).db
       .prepare('PRAGMA table_info(applied_boundary)')
       .all()
       .map((column) => column.name);
@@ -147,7 +147,7 @@ test('a store that predates the ownership columns is migrated, and then keeps it
     // handle - one file is held by one handle at a time - and the restart below confirms it outlived the
     // process that wrote it.
     assert.equal(
-      first.db
+      internalsOf(first).db
         .prepare('SELECT first_seq FROM applied_boundary WHERE market = ? AND stream = ?')
         .get('kraken_spot', 'book').first_seq,
       1,
@@ -194,7 +194,7 @@ test('a store that predates the ownership columns is migrated, and then keeps it
     assert.equal(taken.accepted, true);
     assert.equal(reopened.appliedBoundary.runId, 'run-B');
     assert.deepEqual(
-      second.db
+      internalsOf(second).db
         .prepare('SELECT run_id FROM retired_run WHERE market = ? AND stream = ?')
         .all('kraken_spot', 'book')
         .map((row) => row.run_id),
@@ -261,7 +261,7 @@ test('a write that fails leaves the store and the book exactly as they were', as
     const settled = {
       boundary: { ...book.appliedBoundary },
       phase: book.phase,
-      levels: store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n,
+      levels: internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n,
       gaps: book.openGaps().length,
     };
     assert.equal(settled.gaps, 1, 'the frame above a hole is held, which is the state being kept');
@@ -272,7 +272,7 @@ test('a write that fails leaves the store and the book exactly as they were', as
       assert.equal(book.board.size('bid', 100), 1, 'the board still holds what it held');
       assert.equal(book.board.size('bid', 200), null, 'and nothing it did not hold');
       assert.equal(book.openGaps().length, settled.gaps, 'the holes are the same holes');
-      const row = store.db
+      const row = internalsOf(store).db
         .prepare('SELECT connection_id, generation, up_to_receive_seq, run_id, first_seq FROM applied_boundary WHERE market = ? AND stream = ?')
         .get('kraken_spot', 'book');
       assert.deepEqual(
@@ -291,7 +291,7 @@ test('a write that fails leaves the store and the book exactly as they were', as
       /injected write failure/,
     );
     assert.equal(book.appliedBoundary.runId, 'run-A', 'the board was not handed over');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM retired_run').get().n, 0, 'and no run was retired');
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM retired_run').get().n, 0, 'and no run was retired');
     unchanged();
 
     // ①b the retirement record itself: a takeover that cannot write it down is not a takeover.
@@ -301,7 +301,7 @@ test('a write that fails leaves the store and the book exactly as they were', as
       /injected write failure/,
     );
     assert.equal(book.appliedBoundary.runId, 'run-A');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM retired_run').get().n, 0);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM retired_run').get().n, 0);
     unchanged();
 
     // ② the owner's own record: the new connection's acceptance cannot land halfway.
@@ -318,7 +318,7 @@ test('a write that fails leaves the store and the book exactly as they were', as
     );
     unchanged();
     assert.equal(
-      store.db.prepare('SELECT COUNT(*) AS n FROM book_level WHERE price = 200').get().n,
+      internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level WHERE price = 200').get().n,
       0,
       'the level written in the same transaction was rolled back with it',
     );
@@ -436,7 +436,7 @@ test('a takeover that fails takes nothing with it, including what the board was 
       /injected write failure/,
     );
     assert.equal(book.appliedBoundary.runId, 'run-A');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM retired_run').get().n, 0);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM retired_run').get().n, 0);
 
     const filled = book.apply({
       envelope: envelope(2, 'conn-1', 1, 'run-A'),
@@ -478,7 +478,7 @@ test('a store that is only missing one ownership column keeps the owner it alrea
     const book = openBook({ market: 'kraken_spot', stream: 'book', durability: store });
     assert.equal(book.appliedBoundary.runId, 'run-A', 'the owner the store recorded is the authority');
     assert.equal(
-      store.db.prepare('PRAGMA table_info(applied_boundary)').all().some((column) => column.name === 'first_seq'),
+      internalsOf(store).db.prepare('PRAGMA table_info(applied_boundary)').all().some((column) => column.name === 'first_seq'),
       true,
       'and the missing column was added',
     );
@@ -617,12 +617,15 @@ test('a store another process migrates mid-way keeps the owner that process reco
 
       const store = openDurability({ path, runId: 'run-A' });
       let raced = false;
+      // The interception is installed through the wiring: the modules run their statements through
+      // `internalsOf(store).db`, so a wrapper that only replaced the public `db` would not be read.
       const racing = {
         ...store,
-        db: {
-          exec: (sql, ...rest) => store.db.exec(sql, ...rest),
+      };
+      const racingDb = {
+          exec: (sql, ...rest) => internalsOf(store).db.exec(sql, ...rest),
           prepare: (sql, ...rest) => {
-            const statement = store.db.prepare(sql, ...rest);
+            const statement = internalsOf(store).db.prepare(sql, ...rest);
             if (!/PRAGMA table_info/.test(sql)) return statement;
             return {
               get: (...args) => statement.get(...args),
@@ -638,11 +641,8 @@ test('a store another process migrates mid-way keeps the owner that process reco
               },
             };
           },
-        },
       };
-      // The wrapper is the wiring's own: it re-binds to the store's private routes, because a module takes
-      // the right and the transactions from the wiring rather than from the object it is handed.
-      bindInternals(racing, internalsOf(store));
+      bindInternals(racing, { ...internalsOf(store), db: racingDb });
       const book = openBook({ market: 'kraken_spot', stream: 'book', durability: racing });
       return { store, book };
     };
@@ -652,7 +652,7 @@ test('a store another process migrates mid-way keeps the owner that process reco
     const both = await raceWith('both', ['run_id TEXT', 'first_seq INTEGER']);
     assert.equal(both.book.appliedBoundary.connectionId, 'kraken_spot:1', 'the store opened');
     assert.equal(
-      both.store.db.prepare('SELECT COUNT(*) AS n FROM legacy_owner').get().n,
+      internalsOf(both.store).db.prepare('SELECT COUNT(*) AS n FROM legacy_owner').get().n,
       0,
       'nothing was re-marked as a board nobody recorded an owner for',
     );
@@ -664,7 +664,7 @@ test('a store another process migrates mid-way keeps the owner that process reco
     // Only run_id there: the migration still has to add first_seq, which is the whole reason the missing set
     // is read inside the transaction rather than remembered from before it.
     const partial = await raceWith('partial', ['run_id TEXT']);
-    const columns = partial.store.db
+    const columns = internalsOf(partial.store).db
       .prepare('PRAGMA table_info(applied_boundary)')
       .all()
       .map((column) => column.name);
@@ -917,7 +917,7 @@ test('a board whose owner has not been established takes no frames at all', asyn
     assert.match(early.reason, /has not been established/);
     assert.equal(book.board.size('bid', 100), null, 'nothing reached the board');
     assert.equal(
-      store.db
+      internalsOf(store).db
         .prepare('SELECT up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?')
         .get('kraken_spot', 'book').up_to_receive_seq,
       7,
@@ -990,7 +990,7 @@ test('an owner without a run name is replaced for good, and does not come back a
       board.accept('B:v:m:1', { runId: 'B', generation: 1, firstSeq: 1, takeover: true }).accepted,
       true,
     );
-    assert.deepEqual(seeding.db.prepare('SELECT run_id FROM retired_run').all().map((r) => r.run_id), ['']);
+    assert.deepEqual(internalsOf(seeding).db.prepare('SELECT run_id FROM retired_run').all().map((r) => r.run_id), ['']);
     seeding.close();
 
     const store = openDurability({ path: dbPath, runId: 'writer-2' });

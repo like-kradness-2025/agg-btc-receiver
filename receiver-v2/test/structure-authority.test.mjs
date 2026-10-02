@@ -8,6 +8,8 @@ import { openBook } from '../src/book/state.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { createStructure } from '../src/supervisor/structure.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
 test('a process that runs as a named run takes over a board whose recorded owner has no run', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'authority-'));
   try {
@@ -61,7 +63,7 @@ test('a process that runs as a named run takes over a board whose recorded owner
     // The owner it replaced had no run name, but it is an owner all the same: the retirement is written down
     // against the empty name, which no run can carry, so it cannot walk back in later (C11).
     assert.deepEqual(
-      store.db.prepare('SELECT run_id FROM retired_run').all().map((row) => row.run_id),
+      internalsOf(store).db.prepare('SELECT run_id FROM retired_run').all().map((row) => row.run_id),
       [''],
       'the run-less owner was retired, under the name no run can carry',
     );

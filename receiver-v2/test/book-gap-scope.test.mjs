@@ -8,6 +8,8 @@ import { openBook } from '../src/book/state.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { makeEnvelope } from '../src/envelope.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
 const envelope = (seq, connectionId, generation = 1) =>
   makeEnvelope({
     market: 'kraken_spot',
@@ -40,7 +42,7 @@ test('a hole belongs to the connection that opened it', async () => {
     book.apply({ envelope: envelope(1, 'conn-2', 2), changes: [] });
     book.apply({ envelope: envelope(2, 'conn-2', 2), changes: [] });
 
-    const open = store.db
+    const open = internalsOf(store).db
       .prepare('SELECT COUNT(*) AS n FROM book_gap WHERE connection_id = ? AND filled_at_ms IS NULL')
       .get('conn-1').n;
     assert.equal(open, 1, 'the new connection numbering past the hole did not fill it');

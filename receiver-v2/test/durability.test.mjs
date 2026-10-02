@@ -8,6 +8,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { openDurability } from '../src/durability.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'durability-'));
   try {
@@ -77,7 +79,7 @@ test('starting a new run invalidates the previous marker before anything else', 
     // The previous run never completed: opening again must not leave it looking clean.
     const second = openDurability({ path: dbPath, runId: 'run-2' });
     assert.equal(second.lastCompleteRun(), null, 'an unfinished run is not a clean one');
-    const states = second.db.prepare('SELECT run_id, state FROM run_marker ORDER BY at_ms').all();
+    const states = internalsOf(second).db.prepare('SELECT run_id, state FROM run_marker ORDER BY at_ms').all();
     assert.equal(states.find((row) => row.run_id === 'run-1').state, 'invalidated');
     second.close();
   });

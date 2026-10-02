@@ -107,8 +107,8 @@ test('a frame handed in from inside another frame s write is refused, and its de
     assert.equal(refusals[0].code, 'REENTRANT_OPERATION', 'as a change operation already in progress');
     assert.equal(structure.stats.stopped, false, 'a refusal is not a stop');
     assert.deepEqual(written, ['conn-1:1'], 'the refused frame never reached the raw');
-    assert.equal(store.db.prepare('SELECT first_seq FROM applied_boundary').get().first_seq, 1, 'the origin is the accepted one');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 1);
+    assert.equal(internalsOf(store).db.prepare('SELECT first_seq FROM applied_boundary').get().first_seq, 1, 'the origin is the accepted one');
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 1);
     store.close();
   });
 });
@@ -137,7 +137,7 @@ test('a frame handed in from inside the ledger s own write is refused, and the o
     assert.equal(refusals.length, 1, 'the second frame was handed in from inside the confirmation');
     assert.equal(refusals[0].code, 'REENTRANT_OPERATION');
     assert.equal(structure.stats.stopped, false, 'no second transaction was attempted, so nothing stopped');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 1, 'the refused frame left nothing behind');
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 1, 'the refused frame left nothing behind');
     store.close();
   });
 });
@@ -177,17 +177,17 @@ test('a file is held by one handle: a second open is refused, and nothing is wri
     }
     // Nothing of a second open was written, and the run that was live is still the live run.
     assert.equal(
-      first.db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get('run-1').state,
+      internalsOf(first).db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get('run-1').state,
       'running',
       'the store was not opened a second time',
     );
-    assert.equal(first.db.prepare("SELECT COUNT(*) AS n FROM run_marker WHERE run_id = 'run-2'").get().n, 0);
+    assert.equal(internalsOf(first).db.prepare("SELECT COUNT(*) AS n FROM run_marker WHERE run_id = 'run-2'").get().n, 0);
 
     // And the file is free again once the handle is closed.
     first.close();
     const again = openDurability({ path, runId: 'run-3' });
     again.beginRun();
-    assert.equal(again.db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 2);
+    assert.equal(internalsOf(again).db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 2);
     again.close();
   });
 });
@@ -257,7 +257,7 @@ test('the execution right is released, so the next frame is processed normally',
     assert.equal(next.applied, true, 'the right was released with the refused call');
     assert.equal(structure.stats.owed, 0);
     assert.deepEqual(written, ['conn-1:1', 'conn-1:2']);
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 2);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 2);
     store.close();
   });
 });
@@ -300,8 +300,8 @@ test('a change attempted on any public surface from inside a frame is refused', 
     }
     assert.equal(seen.structureStart.started, false, 'and starting reception is refused as a start');
     assert.equal(structure.stats.stopped, false, 'none of them stopped reception');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM delivery_ledger').get().n, 0, 'and none of them wrote');
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 1);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM delivery_ledger').get().n, 0, 'and none of them wrote');
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_level').get().n, 1);
     assert.equal(structure.book.appliedBoundary.upToSeq, 1, 'the ceiling the frame moved is the only one');
     store.close();
   });
@@ -334,11 +334,11 @@ test('opening a module from inside a frame is refused before anything is written
     assert.equal(attempts[0].code, 'REENTRANT_OPERATION', 'with our own code, not a SQL error');
     // The refusal came before any write of its own: the other board has no tables and no rows.
     assert.equal(
-      store.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE 'organized_watermark%' AND name != 'organized_watermark'").get().n,
+      internalsOf(store).db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE 'organized_watermark%' AND name != 'organized_watermark'").get().n,
       0,
       'nothing of the refused module was written',
     );
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n, 1, 'and this board has its own row');
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n, 1, 'and this board has its own row');
     // Opening it outside the frame works: the refusal was about the moment, not the store.
     const opened = openOrganizer({ market: 'other', stream: 'trades', durability: store, writeRaw: () => true });
     opened.accept('other:1', { firstSeq: 1, runId: 'run-1', generation: 1 });
@@ -393,11 +393,11 @@ test('opening the store from inside a frame is refused, and the live run is unto
     assert.notEqual(attempts[0].message, 'database is locked', 'and not as a lock contention');
     // Nothing of the second open was written: the live run is still the live run.
     assert.equal(
-      store.db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get('run-1').state,
+      internalsOf(store).db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get('run-1').state,
       'running',
       'the run that was live is not invalidated',
     );
-    assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM run_marker WHERE run_id = 'run-2'").get().n, 0);
+    assert.equal(internalsOf(store).db.prepare("SELECT COUNT(*) AS n FROM run_marker WHERE run_id = 'run-2'").get().n, 0);
     store.close();
   });
 });
@@ -456,7 +456,7 @@ test('a hard link created while the store is live is refused before anything is 
     );
     assert.equal(first.applied, true, 'the frame that was being processed completed');
     assert.equal(
-      store.db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get('run-1').state,
+      internalsOf(store).db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get('run-1').state,
       'running',
       'the live run is untouched',
     );
@@ -515,7 +515,7 @@ test('a relative URI is refused only where it means the same file', async () => 
       process.chdir(elsewhere);
       const there = openDurability({ path: 'file:state.sqlite', runId: 'run-3' });
       there.close();
-      assert.equal(here.db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 1, 'the held file is untouched');
+      assert.equal(internalsOf(here).db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 1, 'the held file is untouched');
     } finally {
       process.chdir(cwd);
       here.close();
@@ -537,7 +537,7 @@ test('a relative name is refused only where it means the same file', async () =>
       // The same relative name, a different directory, a different file: this is not the held one.
       const there = openDurability({ path: 'state.sqlite', runId: 'run-2' });
       there.close();
-      assert.equal(here.db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 1, 'the held file is untouched');
+      assert.equal(internalsOf(here).db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 1, 'the held file is untouched');
     } finally {
       process.chdir(cwd);
       here.close();
@@ -621,7 +621,7 @@ test('a re-open from inside the store s own initialisation is refused', async ()
     assert.equal(attempts[0].opened, false, 'the file was already held when the clock was called');
     assert.equal(attempts[0].code, 'REENTRANT_OPERATION');
     store.beginRun();
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 1, 'only this run is written');
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n, 1, 'only this run is written');
     store.close();
   });
 });
@@ -798,39 +798,18 @@ test('a lying observation cannot let a module open while the store is held', asy
   });
 });
 
-test('a caller s transaction cannot begin while a change operation is being processed', async () => {
+test('the store a caller is handed offers no transaction of its own', async () => {
   await withStore(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
-    store.beginRun();
-    const injectable = withInjectableWrites(store);
-    const attempts = [];
-    const stops = [];
-    let armed = true;
-    let structure = null;
-    injectable.onWrite((sql) => {
-      if (!armed || !LEDGER_CONFIRM_WRITE.test(sql)) return;
-      armed = false;
-      try {
-        store.inTransaction(() => structure.feed(envelope(2)));
-        attempts.push({ refused: false });
-      } catch (error) {
-        attempts.push({ refused: true, code: error.code });
-      }
-    });
-    structure = build(injectable.durability, { written: [], onStop: () => stops.push(1) });
-    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
-    const first = structure.feed(envelope(1));
-
-    assert.equal(attempts.length, 1, 'the transaction was attempted from inside the frame s write');
-    assert.equal(attempts[0].refused, true, 'and refused');
-    assert.equal(attempts[0].code, 'REENTRANT_OPERATION', 'by us, not by SQLite');
-    assert.equal(stops.length, 0, 'so no nested BEGIN was attempted and nothing stopped');
-    assert.equal(first.durable, true, 'the frame that was being processed completed');
-    assert.equal(first.applied, true, 'and reached the board');
+    // A caller's transaction was a change operation; it is not handed out at all now, so there is nothing to
+    // refuse and nothing to nest. The wiring keeps the one it needs for an operation it already owns.
+    assert.equal(store.inTransaction, undefined, 'no transaction helper is handed out');
+    assert.equal(store.db, undefined, 'and no database handle either');
+    assert.equal(typeof internalsOf(store).inTransaction, 'function', 'the wiring keeps the transaction');
+    assert.equal(typeof internalsOf(store).db, 'object', 'and the handle it runs statements through');
     store.close();
   });
 });
-
 test('opening a module holds the store while its initialisation runs', async () => {
   await withStore(async (dir) => {
     const { openOrganizer } = await import('../src/organize/watermark.mjs');
@@ -1317,7 +1296,7 @@ test('the structure creates its store from a path, holds the file, and closes it
     const reopened = openDurability({ path, runId: 'run-3' });
     reopened.beginRun();
     assert.equal(
-      reopened.db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n >= 1,
+      internalsOf(reopened).db.prepare('SELECT COUNT(*) AS n FROM run_marker').get().n >= 1,
       true,
       'the store it wrote survived the close',
     );

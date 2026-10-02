@@ -65,7 +65,6 @@ CREATE TABLE IF NOT EXISTS organize_gap (
  * routes to whoever replaced the method. Unbound means unopenable, before anything is written.
  */
 export function openOrganizer(options) {
-  if (!options?.durability?.db) throw new TypeError('an organizer needs the durability store');
   const wiring = internalsOf(options.durability);
   return wiring.whileChange(() => openOrganizerWithin(options, wiring));
 }
@@ -83,7 +82,6 @@ function openOrganizerWithin(options, wiring) {
     capacity = () => 'ok',
   } = options;
   if (!market || !stream) throw new TypeError('an organizer needs a market and a stream');
-  if (!durability?.db) throw new TypeError('an organizer needs the durability store');
   // The ceiling and the holes it implies are written together, so this module needs the store's
   // transaction discipline rather than a second copy of it.
 
@@ -108,19 +106,19 @@ function openOrganizerWithin(options, wiring) {
       organize_gap: ['stream'],
     };
     for (const [table, columnsNeeded] of Object.entries(required)) {
-      const columns = durability.db.prepare(`PRAGMA table_info(${table})`).all();
+      const columns = wiring.db.prepare(`PRAGMA table_info(${table})`).all();
       if (columns.length === 0) continue;
       const names = new Set(columns.map((column) => column.name));
       if (columnsNeeded.every((column) => names.has(column))) continue;
       let legacy = `${table}_legacy`;
       let suffix = 2;
       const taken = (name) =>
-        durability.db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !==
+        wiring.db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !==
         undefined;
       while (taken(legacy)) legacy = `${table}_legacy_${suffix++}`;
-      durability.db.exec(`ALTER TABLE ${table} RENAME TO ${legacy}`);
+      wiring.db.exec(`ALTER TABLE ${table} RENAME TO ${legacy}`);
     }
-    durability.db.exec(ORGANIZE_SCHEMA);
+    wiring.db.exec(ORGANIZE_SCHEMA);
   });
 
   let connectionId = null;
@@ -149,7 +147,7 @@ function openOrganizerWithin(options, wiring) {
   // frame the raw never took.
   function persist(ceiling, start = baselineSeq) {
     if (connectionId === null) return;
-    durability.db
+    wiring.db
       .prepare(
         `INSERT OR REPLACE INTO organized_watermark
            (connection_id, market, stream, up_to_receive_seq, first_seq, updated_at_ms)
@@ -159,7 +157,7 @@ function openOrganizerWithin(options, wiring) {
   }
 
   function recordGap(from, to) {
-    durability.db
+    wiring.db
       .prepare(
         `INSERT INTO organize_gap
            (connection_id, market, stream, missing_from, missing_to, detected_at_ms, reason)
@@ -173,7 +171,7 @@ function openOrganizerWithin(options, wiring) {
    * it stops being open when the durable position is at or past its end, whatever filled it.
    */
   function closeGapsUpTo(upTo) {
-    durability.db
+    wiring.db
       .prepare(
         `UPDATE organize_gap SET filled_at_ms = ?
          WHERE connection_id = ? AND market = ? AND stream = ? AND filled_at_ms IS NULL AND missing_to <= ?`,
@@ -391,7 +389,7 @@ function openOrganizerWithin(options, wiring) {
       connectionId = connectionIdNext;
       if (nextRunId === undefined) identityRunId = null;
       if (nextGeneration === undefined) identityGeneration = null;
-      const row = durability.db
+      const row = wiring.db
         .prepare(
           `SELECT up_to_receive_seq, first_seq FROM organized_watermark
             WHERE connection_id = ? AND market = ? AND stream = ?`,
@@ -537,7 +535,7 @@ function openOrganizerWithin(options, wiring) {
 
     /** Holes seen and not yet filled: the ranges this process cannot claim to have. */
     openGaps() {
-      return durability.db
+      return wiring.db
         .prepare(
           `SELECT missing_from, missing_to, detected_at_ms, reason FROM organize_gap
            WHERE connection_id = ? AND market = ? AND stream = ? AND filled_at_ms IS NULL

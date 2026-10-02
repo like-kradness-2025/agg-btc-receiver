@@ -76,7 +76,6 @@ export const OWED = 'owed';
  * routes to whoever replaced the method. Unbound means unopenable, before anything is written.
  */
 export function openDeliveryLedger(options) {
-  if (!options?.durability?.db) throw new TypeError('the delivery ledger needs the durability store');
   const wiring = internalsOf(options.durability);
   return wiring.whileChange(() => openDeliveryLedgerWithin(options, wiring));
 }
@@ -88,12 +87,11 @@ function openDeliveryLedgerWithin(options, wiring) {
     durability, market, stream, nowMs = () => Date.now()
   } = options;
   if (!market || !stream) throw new TypeError('the delivery ledger needs a market and a stream');
-  if (!durability?.db) throw new TypeError('the delivery ledger needs the durability store');
 
 
-  durability.db.exec(LEDGER_SCHEMA);
+  wiring.db.exec(LEDGER_SCHEMA);
 
-  const recordStatement = durability.db.prepare(
+  const recordStatement = wiring.db.prepare(
     `INSERT OR IGNORE INTO delivery_ledger
        (market, stream, connection_id, receive_seq, run_id, venue, generation,
         recv_ts_ms, recv_mono_ns, raw, meta, reason, state, recorded_at_ms)
@@ -101,37 +99,37 @@ function openDeliveryLedgerWithin(options, wiring) {
   );
   // A state change, never a re-insert: an entry's place in the queue is where its frame arrived, and a
   // frame confirmed late must not be delivered last because of it.
-  const confirmStatement = durability.db.prepare(
+  const confirmStatement = wiring.db.prepare(
     'UPDATE delivery_ledger SET state = ? WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ?',
   );
-  const releaseStatement = durability.db.prepare(
+  const releaseStatement = wiring.db.prepare(
     `DELETE FROM delivery_ledger
       WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq <= ? AND receive_seq >= ?`,
   );
-  const dropStatement = durability.db.prepare(
+  const dropStatement = wiring.db.prepare(
     'DELETE FROM delivery_ledger WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ?',
   );
-  const pendingStatement = durability.db.prepare(
+  const pendingStatement = wiring.db.prepare(
     `SELECT connection_id, receive_seq, run_id, venue, generation, recv_ts_ms, recv_mono_ns, raw, meta,
             reason, state
        FROM delivery_ledger
       WHERE market = ? AND stream = ?
       ORDER BY rowid`,
   );
-  const byStateStatement = durability.db.prepare(
+  const byStateStatement = wiring.db.prepare(
     `SELECT connection_id, receive_seq, run_id, venue, generation, recv_ts_ms, recv_mono_ns, raw, meta,
             reason, state
        FROM delivery_ledger
       WHERE market = ? AND stream = ? AND state = ?
       ORDER BY rowid`,
   );
-  const oneStatement = durability.db.prepare(
+  const oneStatement = wiring.db.prepare(
     `SELECT connection_id, receive_seq, run_id, venue, generation, recv_ts_ms, recv_mono_ns, raw, meta,
             reason, state
        FROM delivery_ledger
       WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ?`,
   );
-  const countStatement = durability.db.prepare(
+  const countStatement = wiring.db.prepare(
     'SELECT COUNT(*) AS owed FROM delivery_ledger WHERE market = ? AND stream = ?',
   );
 

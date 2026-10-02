@@ -122,7 +122,6 @@ export function createBoard() {
  * routes to whoever replaced the method. Unbound means unopenable, before anything is written.
  */
 export function openBook(options) {
-  if (!options?.durability?.db) throw new TypeError('a book needs the durability store');
   const wiring = internalsOf(options.durability);
   return wiring.whileChange(() => openBookWithin(options, wiring));
 }
@@ -134,18 +133,17 @@ function openBookWithin(options, wiring) {
     market, stream, durability, nowMs = () => Date.now()
   } = options;
   if (!market || !stream) throw new TypeError('a book needs a market and a stream');
-  if (!durability?.db) throw new TypeError('a book needs the durability store for its position');
   // The book writes several records in one transaction, so it needs the store's transaction discipline
   // rather than its own copy of it: a half-written ownership chain is not recoverable.
 
 
-  durability.db.exec(BOOK_SCHEMA);
+  wiring.db.exec(BOOK_SCHEMA);
   const board = createBoard();
 
   // The board comes back from the store, not from a caller's memory, and it comes back together with
   // the position it was written with.
   board.restore(
-    durability.db
+    wiring.db
       .prepare('SELECT side, price, size FROM book_level WHERE market = ? AND stream = ?')
       .all(market, stream),
   );
@@ -158,7 +156,7 @@ function openBookWithin(options, wiring) {
   {
     const columnNames = () =>
       new Set(
-        durability.db.prepare('PRAGMA table_info(applied_boundary)').all().map((column) => column.name),
+        wiring.db.prepare('PRAGMA table_info(applied_boundary)').all().map((column) => column.name),
       );
     const ownershipColumns = [
       ['run_id', 'TEXT'],
@@ -174,7 +172,7 @@ function openBookWithin(options, wiring) {
         const created = new Set();
         for (const [name, type] of ownershipColumns) {
           if (present.has(name)) continue;
-          durability.db.exec(`ALTER TABLE applied_boundary ADD COLUMN ${name} ${type}`);
+          wiring.db.exec(`ALTER TABLE applied_boundary ADD COLUMN ${name} ${type}`);
           created.add(name);
         }
 
@@ -185,10 +183,10 @@ function openBookWithin(options, wiring) {
         // would hand the board to an uninvited run on the next start, which is the one thing the marker
         // exists to prevent.
         if (!created.has('run_id')) return;
-        const boards = durability.db
+        const boards = wiring.db
           .prepare('SELECT market, stream FROM applied_boundary WHERE run_id IS NULL')
           .all();
-        const mark = durability.db.prepare(
+        const mark = wiring.db.prepare(
           'INSERT OR REPLACE INTO legacy_owner (market, stream, migrated_at_ms) VALUES (?, ?, ?)',
         );
         for (const board of boards) mark.run(board.market, board.stream, nowMs());
@@ -196,7 +194,7 @@ function openBookWithin(options, wiring) {
     }
   }
 
-  const row = durability.db
+  const row = wiring.db
     .prepare(
       `SELECT connection_id, generation, up_to_receive_seq, run_id, first_seq
        FROM applied_boundary WHERE market = ? AND stream = ?`,
@@ -218,7 +216,7 @@ function openBookWithin(options, wiring) {
   // unestablished, one board at a time, until the first explicit accept says who owns them. A NULL on a
   // row written by this version is a recorded "no run", which is a different thing.
   const ownerWasNeverRecorded =
-    durability.db
+    wiring.db
       .prepare('SELECT 1 AS recorded FROM legacy_owner WHERE market = ? AND stream = ?')
       .get(market, stream) !== undefined;
   let ownerEstablished = row ? !ownerWasNeverRecorded : false;
@@ -226,7 +224,7 @@ function openBookWithin(options, wiring) {
   // Runs that have been replaced, read back from the store: a run does not come back after a restart
   // either, whatever number it quotes.
   const retiredRuns = new Set(
-    durability.db
+    wiring.db
       .prepare('SELECT run_id FROM retired_run WHERE market = ? AND stream = ?')
       .all(market, stream)
       .map((retired) => retired.run_id),
@@ -250,22 +248,22 @@ function openBookWithin(options, wiring) {
   // discarding them would mean the missing frame arrives and nothing else follows.
   const waiting = new Map(); // receive_seq -> { envelope, changes }
 
-  const boundaryStatement = durability.db.prepare(
+  const boundaryStatement = wiring.db.prepare(
     `INSERT OR REPLACE INTO applied_boundary
        (market, stream, connection_id, generation, up_to_receive_seq, run_id, first_seq, updated_at_ms)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  const retireStatement = durability.db.prepare(
+  const retireStatement = wiring.db.prepare(
     `INSERT OR REPLACE INTO retired_run (market, stream, run_id, retired_at_ms) VALUES (?, ?, ?, ?)`,
   );
-  const clearUnrecordedOwnerStatement = durability.db.prepare(
+  const clearUnrecordedOwnerStatement = wiring.db.prepare(
     'DELETE FROM legacy_owner WHERE market = ? AND stream = ?',
   );
-  const identityStatement = durability.db.prepare(
+  const identityStatement = wiring.db.prepare(
     `INSERT OR REPLACE INTO connection_identity (market, stream, connection_id, run_id, generation)
      VALUES (?, ?, ?, ?, ?)`,
   );
-  const recordedIdentityStatement = durability.db.prepare(
+  const recordedIdentityStatement = wiring.db.prepare(
     'SELECT run_id, generation FROM connection_identity WHERE market = ? AND stream = ? AND connection_id = ?',
   );
   // A store that records an owner but no identity for the name it records was written before that record
@@ -278,10 +276,10 @@ function openBookWithin(options, wiring) {
     });
   }
 
-  const levelUpsert = durability.db.prepare(
+  const levelUpsert = wiring.db.prepare(
     `INSERT OR REPLACE INTO book_level (market, stream, side, price, size) VALUES (?, ?, ?, ?, ?)`,
   );
-  const levelDelete = durability.db.prepare(
+  const levelDelete = wiring.db.prepare(
     'DELETE FROM book_level WHERE market = ? AND stream = ? AND side = ? AND price = ?',
   );
 
@@ -351,7 +349,7 @@ function openBookWithin(options, wiring) {
   }
 
   function recordGap(waitingFor, seenSeq) {
-    durability.db
+    wiring.db
       .prepare(
         `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
          VALUES (?, ?, ?, ?, ?, ?)`,
@@ -363,7 +361,7 @@ function openBookWithin(options, wiring) {
     // C7: a hole belongs to the connection that opened it. Closing by sequence alone lets a new
     // connection's numbering fill a hole a dead one left behind, which reads as "the missing data
     // arrived" when nothing of the sort happened.
-    durability.db
+    wiring.db
       .prepare(
         `UPDATE book_gap SET filled_at_ms = ?
          WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL AND waiting_for <= ?`,
@@ -659,7 +657,7 @@ function openBookWithin(options, wiring) {
 
     /** Holes this book is waiting for. Unfilled ones are what it cannot claim to have. */
     openGaps() {
-      return durability.db
+      return wiring.db
         .prepare(
           `SELECT waiting_for, seen_seq, detected_at_ms FROM book_gap
            WHERE market = ? AND stream = ? AND filled_at_ms IS NULL ORDER BY waiting_for`,
@@ -698,7 +696,7 @@ function openBookWithin(options, wiring) {
       // board, and something in between them is still missing; serving it as ready is how a gap gets
       // forgotten. Holes of older connections are deliberately not consulted here - those are history,
       // and they must not stop a new connection from recovering.
-      const openForThisConnection = durability.db
+      const openForThisConnection = wiring.db
         .prepare(
           `SELECT COUNT(*) AS n FROM book_gap
            WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL`,

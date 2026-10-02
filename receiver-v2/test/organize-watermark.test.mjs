@@ -9,6 +9,8 @@ import { openDurability } from '../src/durability.mjs';
 import { openOrganizer } from '../src/organize/watermark.mjs';
 import { withInjectableWrites, WATERMARK_WRITE } from '../test-support/failing-store.mjs';
 
+import { internalsOf } from '../src/internal/wiring.mjs';
+
 const envelope = (seq, connectionId = 'conn-1') =>
   makeEnvelope({
     market: 'kraken_spot',
@@ -258,7 +260,7 @@ test('a completion whose write fails leaves the organizer as it was, and can be 
     assert.throws(() => organizer.accept('conn-1', { firstSeq: 1 }), /injected write failure/);
     assert.equal(organizer.ackState.upToSeq, null, 'the ceiling did not move');
     assert.equal(
-      store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark WHERE up_to_receive_seq IS NOT NULL').get().n,
+      internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark WHERE up_to_receive_seq IS NOT NULL').get().n,
       0,
       'and nothing was written down',
     );
@@ -345,7 +347,7 @@ test('a frame the store cannot describe leaves the watermark where it was', asyn
     assert.throws(() => organizer.note(envelope(1)), /injected write failure/);
     assert.equal(organizer.ackState.upToSeq, null, 'the ceiling did not move');
     assert.equal(
-      store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
+      internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
       0,
       'and nothing was written',
     );

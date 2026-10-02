@@ -266,7 +266,7 @@ test('nothing is acknowledged for a frame whose debt to the board could not be w
     assert.equal(structure.stats.framesWrittenDown, 0, 'nothing was counted as written down either');
     assert.equal(stops.length, 1, 'reception stops rather than carrying on with a frame of unknown fate');
     assert.equal(
-      store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
+      internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
       0,
       'the claim and the debt are one commit: neither of them landed',
     );
@@ -311,7 +311,7 @@ test('the frame is written down as an intent before the raw is touched', async (
           // What the store says about this frame at the moment the raw write is attempted: a crash here
           // must leave an entry behind, so the entry cannot be written after the write returns.
           intents: subject.ledger.pending({ state: 'intent' }).map((entry) => entry.receiveSeq),
-          watermarks: store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
+          watermarks: internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
         }),
     });
     structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
@@ -588,7 +588,7 @@ test('the claim on the raw and the confirmation are one commit', async () => {
     assert.equal(result.accepted, false, 'the frame is not reported as handled');
     assert.deepEqual(acks, [], 'nothing is acknowledged for a claim that did not land');
     assert.equal(
-      store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
+      internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n,
       0,
       'the claim was rolled back with it: neither half of the commit is left behind',
     );
@@ -1085,7 +1085,7 @@ test('a hole filled on one board does not close the other board hole', async () 
     books.note(frame('book', 1));
     assert.equal(books.openGaps().length, 0, 'the hole on this board is filled');
     assert.equal(trades.openGaps().length, 1, "the other board's hole is not");
-    const rows = store.db
+    const rows = internalsOf(store).db
       .prepare('SELECT stream, filled_at_ms FROM organize_gap ORDER BY id')
       .all()
       .map((row) => ({ stream: row.stream, filled: row.filled_at_ms !== null }));
@@ -1160,13 +1160,13 @@ test('a store written before the board owned its tables is migrated, not crashed
     );
     assert.equal(structure.organizer.ackState.upToSeq, null, 'nothing was inherited from an ambiguous name');
     assert.deepEqual(
-      store.db.prepare('SELECT up_to_receive_seq FROM organized_watermark_legacy').all().map((row) => row.up_to_receive_seq),
+      internalsOf(store).db.prepare('SELECT up_to_receive_seq FROM organized_watermark_legacy').all().map((row) => row.up_to_receive_seq),
       [7],
       'and what the old store said is kept, not discarded',
     );
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM organize_gap_legacy').get().n, 1);
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM organize_gap').get().n, 0);
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n, 0);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organize_gap_legacy').get().n, 1);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organize_gap').get().n, 0);
+    assert.equal(internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM organized_watermark').get().n, 0);
     assert.equal(
       structure.feed(envelope(1, { connectionId: legacyConnection })).durable,
       true,
@@ -1272,20 +1272,20 @@ test('a second migration keeps what the first set aside', async () => {
     build(store);
     // What an earlier migration set aside is still there, under a name of its own - a re-migration must not
     // overwrite the very evidence it exists to keep.
-    const rows = store.db
+    const rows = internalsOf(store).db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'organized_watermark_legacy%' ORDER BY name",
       )
       .all()
       .map((row) => row.name);
     assert.deepEqual(rows, ['organized_watermark_legacy', 'organized_watermark_legacy_2']);
-    const positions = store.db
+    const positions = internalsOf(store).db
       .prepare('SELECT up_to_receive_seq FROM organized_watermark_legacy_2')
       .all()
       .map((row) => row.up_to_receive_seq);
     assert.deepEqual(positions, [9], 'and the newer one was set aside too');
     assert.deepEqual(
-      store.db.prepare('SELECT up_to_receive_seq FROM organized_watermark_legacy').all().map((row) => row.up_to_receive_seq),
+      internalsOf(store).db.prepare('SELECT up_to_receive_seq FROM organized_watermark_legacy').all().map((row) => row.up_to_receive_seq),
       [7],
       'and what the earlier migration set aside is still there, unchanged',
     );
@@ -1321,7 +1321,7 @@ test('a connection whose frames are still held keeps its start across a restart'
     // position, which is the state a restore must not read as "start unknown".
     assert.equal(before.note(make('trades', 7)).ack, null);
     assert.deepEqual(
-      first.db.prepare('SELECT up_to_receive_seq, first_seq FROM organized_watermark').all().map((row) => [row.up_to_receive_seq, row.first_seq]),
+      internalsOf(first).db.prepare('SELECT up_to_receive_seq, first_seq FROM organized_watermark').all().map((row) => [row.up_to_receive_seq, row.first_seq]),
       [[null, 5]],
     );
     first.close();
@@ -1377,7 +1377,7 @@ test('opening one board does not move a live board holes aside', async () => {
     assert.deepEqual(books.openGaps(), [], 'the other board has no holes of its own');
     assert.equal(trades.openGaps().length, 1, "and this board's hole is still there");
     assert.equal(
-      store.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE 'organize_gap_legacy%'").get().n,
+      internalsOf(store).db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE 'organize_gap_legacy%'").get().n,
       0,
       'nothing was moved aside',
     );
