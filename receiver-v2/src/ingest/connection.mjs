@@ -93,10 +93,17 @@ export function createReceiveConnection({
   /** Judged by silence, not by volume: no data and no heartbeat for the deadline means dead. */
   function armSilenceTimer() {
     clearSilenceTimer();
+    // The deadline belongs to the socket that was receiving when it was armed. By the time it fires -
+    // or by the time the event it hands over is run, which may be after an operation in between - the
+    // socket may have been replaced, and a deadline that passed for an abandoned connection says
+    // nothing about the one receiving now.
+    const armedFor = socket;
+    const armedGeneration = generation;
     silentTimer = setTimer(() => {
       silentTimer = null;
       if (closed) return;
       onEvent('silence-timer', () => {
+        if (closed || socket !== armedFor || generation !== armedGeneration) return;
         onDiagnostic({
           market,
           generation,
@@ -123,10 +130,15 @@ export function createReceiveConnection({
    */
   function armStabilityTimer() {
     clearStabilityTimer();
+    // Like the silence deadline: this window is about the link that was open when it started. A socket
+    // replaced in the meantime has not held for anything, so its timer must not reset the attempts.
+    const armedFor = socket;
+    const armedGeneration = generation;
     stabilityTimer = setTimer(() => {
       stabilityTimer = null;
       if (closed) return;
       onEvent('stability-timer', () => {
+        if (closed || socket !== armedFor || generation !== armedGeneration) return;
         attempts = 0;
         onDiagnostic({ market, generation, reason: 'link held long enough to reset attempts' });
       });
@@ -282,7 +294,12 @@ export function createReceiveConnection({
         socket = next;
         next.onopen = () => {
         if (socket !== next) return;
+        const fromGeneration = generation;
         onEvent('open', () => {
+          // Checked again where the work runs: a socket that was replaced while this announcement
+          // waited is not receiving any more, and subscribing on it would talk to a connection that
+          // is already gone.
+          if (closed || socket !== next || generation !== fromGeneration) return;
           noteHeard();
           setState('subscribing');
           for (const message of adapter.subscribeMessages?.() ?? []) next.send(message);
@@ -298,20 +315,45 @@ export function createReceiveConnection({
         const raw = typeof payload === 'string' ? payload : Buffer.from(payload);
         const atMs = wallClockMs();
         const atNs = monotonicNs();
-        onEvent('message', () => handleMessage(raw, atMs, atNs));
+        const fromGeneration = generation;
+        onEvent('message', () => {
+          // Checked here again, at the moment the work runs: while this arrival waited its turn the
+          // socket may have been replaced, and a frame of an older generation must not be stamped as
+          // the new connection's - that would write the past into the raw under the current name.
+          if (closed || socket !== next || generation !== fromGeneration) return;
+          handleMessage(raw, atMs, atNs);
+        });
       };
       next.onerror = (error) => {
         if (socket !== next) return;
-        onEvent('error', () => onFailure({ market, generation, error, attempts }));
+        const fromGeneration = generation;
+        onEvent('error', () => {
+          if (closed || socket !== next || generation !== fromGeneration) return;
+          onFailure({ market, generation, error, attempts });
+        });
       };
         next.onclose = () => {
           if (socket !== next) return;
-          onEvent('close', () => replaceSocket('closed'));
+          const fromGeneration = generation;
+          onEvent('close', () => {
+            if (closed || socket !== next || generation !== fromGeneration) return;
+            replaceSocket('closed');
+          });
         };
       };
       if (delay === 0) start();
       else {
-        const timer = setTimer(() => onEvent('reconnect-timer', start), delay);
+        // The replacement is scheduled for one generation. If that generation has been replaced again
+        // by the time the timer runs - or a socket is somehow already open for it - opening one here
+        // would receive for a connection that is not the current one.
+        const opensGeneration = generation;
+        const timer = setTimer(
+          () => onEvent('reconnect-timer', () => {
+            if (closed || generation !== opensGeneration || socket !== null) return;
+            start();
+          }),
+          delay,
+        );
         if (typeof timer.unref === 'function') timer.unref();
       }
     };

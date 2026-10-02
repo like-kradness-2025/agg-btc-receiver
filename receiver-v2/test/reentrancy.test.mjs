@@ -1145,6 +1145,7 @@ test('a timer that fires during a frame waits for it, and an abandoned socket is
     const sockets = [];
     let fired = false;
     let duringWrite = null;
+    let silenceTimer = null;
     const structure = createStructure({
       market: 'kraken_spot',
       stream: 'trades',
@@ -1177,6 +1178,7 @@ test('a timer that fires during a frame waits for it, and an abandoned socket is
           fired = true;
           const silence = timers.find((timer) => timer.ms === 1_000 && !timer.cleared);
           silence.cleared = true;
+          silenceTimer = silence;
           silence.fn(); // the silence deadline passes while this frame is being written
           duringWrite = diagnostics.length;
         }
@@ -1206,6 +1208,13 @@ test('a timer that fires during a frame waits for it, and an abandoned socket is
     const writesSoFar = written.length;
     sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
     assert.equal(written.length, writesSoFar, 'a frame from the abandoned socket is not heard');
+    // And its own deadline, fired after the replacement, is not acted on: the silence belonged to a
+    // connection that is no longer receiving, so it neither reports nor replaces anything.
+    const socketsBefore = sockets.length;
+    const diagnosticsBefore = diagnostics.length;
+    silenceTimer.fn();
+    assert.equal(sockets.length, socketsBefore, 'an abandoned socket s deadline replaces no socket');
+    assert.equal(diagnostics.length, diagnosticsBefore, 'and it reports nothing about the new connection');
     store.close();
   });
 });
@@ -1358,6 +1367,184 @@ test('nothing a caller supplies is handed the store, a part, or a private route'
         );
       }
     }
+    store.close();
+  });
+});
+
+test('a frame that waited on the replaced socket is dropped, not stamped as the new generation', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const timers = [];
+    const sockets = [];
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      silenceDeadlineMs: 1_000,
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        timer.cleared = true;
+      },
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(`${frame.generation}:${frame.receive_seq}`);
+        if (written.length === 1) {
+          // The silence deadline passes while this frame is being written, and then B arrives on the same
+          // socket - both wait their turn, and the silence replaces the socket before B runs. B belongs to
+          // the old connection and must not be stamped as the new generation's first frame.
+          const silence = timers.find((timer) => timer.ms === 1_000 && !timer.cleared);
+          silence.cleared = true;
+          silence.fn();
+          sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+        }
+        return true;
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    sockets[0].onopen?.();
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+
+    assert.equal(structure.connection.generation, 2, 'the silence replaced the socket');
+    assert.deepEqual(written, ['1:1'], 'the frame that waited from the abandoned socket never reached the raw');
+    assert.equal(structure.connection.receiveSeq, 0, 'nothing was numbered under the new generation');
+    assert.equal(structure.book.appliedBoundary.upToSeq, null, 'and nothing was applied under it');
+    const closeOutcome = store.close();
+    assert.equal(closeOutcome, undefined, 'the store closed (a refusal comes back as a value, not a throw)');
+  });
+});
+
+test('an arrival kept when a hook threw runs before the next arrival, not after it', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const sockets = [];
+    let fired = false;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(JSON.parse(frame.raw.toString('utf8')).seq);
+        return true;
+      },
+      onState: ({ state }) => {
+        if (state === 'subscribing' && !fired) {
+          fired = true;
+          // B arrives from inside the open processing, and then this hook throws. The exception is the
+          // caller's to see, and B was accepted: it keeps its place ahead of whatever arrives next.
+          sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+          throw new Error('hook failure');
+        }
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    assert.throws(() => sockets[0].onopen?.(), /hook failure/, 'the exception reached the caller');
+    assert.deepEqual(written, [], 'the arrival that was kept did not run in the middle of the failure');
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) });
+
+    assert.deepEqual(written, [2, 3], 'the kept arrival ran first, and the later one after it');
+    assert.equal(structure.stats.stopped, false, 'nothing here is a stop');
+    store.close();
+  });
+});
+
+test('a wait-list that overflows closes the socket and stops outside the frame, once', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const stops = [];
+    const sockets = [];
+    let inHook = false;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      maxWaitingEvents: 1,
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() { this.closes = (this.closes ?? 0) + 1; } };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(frame.receive_seq);
+        if (written.length === 1) {
+          inHook = true;
+          // One slot is the whole wait-list: B fills it, C overflows it.
+          sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+          sockets[0].onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) });
+          inHook = false;
+        }
+        return true;
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: (stop) => stops.push({ ...stop, duringHook: inHook, closes: sockets[0].closes ?? 0 }),
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    sockets[0].onopen?.();
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+
+    assert.equal(stops.length, 1, 'the structure stopped exactly once');
+    assert.match(String(stops[0].reason), /wait-list/, 'and it says which wait-list filled up');
+    assert.match(String(stops[0].reason), /message/, 'and which arrival it was');
+    assert.equal(stops[0].duringHook, false, 'the stop was carried out after the frame, not from inside a hook');
+    assert.equal(stops[0].closes, 1, 'and the socket was closed by it');
+    assert.equal(structure.connection.state, 'stopped', 'reception really is stopped, not only recorded as stopped');
+    assert.equal(structure.stats.stopped, true);
+    assert.deepEqual(written, [1, 2], 'the arrival that fit the wait-list ran; the overflowed one was the dropped one');
     store.close();
   });
 });

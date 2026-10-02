@@ -463,24 +463,48 @@ export function createStructure({
   // Every arrival from outside is handed to this executor. When the store is free the work runs now, inside
   // one take; when an operation is running it is kept, in order, and run when that operation's own work is
   // done - nothing is dropped, and nothing runs in the middle of a frame. A wait-list that fills up stops
-  // reception and says what was dropped, because silence would look like a quiet stream.
+  // reception; the stop is recorded where it happens and carried out once the operation that overflowed it
+  // is over, because silence would look like a quiet stream and a notification must not come from inside a
+  // frame - the caller's own hook.
   const waiting = [];
   let draining = false;
+  // The first arrival that did not fit, recorded but not answered for yet: the answer is a stop, and a stop
+  // called from here would be called from inside the arrival that overflowed the list.
+  let overflowed = null;
+
+  /** The stop a full wait-list owes, carried out where the operation that overflowed it has ended. */
+  function settleOverflow() {
+    if (overflowed === null || stopped) return;
+    const label = overflowed;
+    overflowed = null;
+    stopReception(`the wait-list for arrivals is full (${maxWaitingEvents}); ${label} was dropped`);
+  }
+
   const receiveEvent = (label, work) => {
     if (wiring.inChange() !== true) {
-      // Free: this arrival is an operation of its own, and whatever arrived while it ran follows it.
-      return wiring.whileChange(() => {
-        const result = work();
-        drainWaiting();
-        return result;
-      });
+      // Free: what waited - arrivals an operation that threw left behind - goes before this arrival, so
+      // nothing that was already accepted is overtaken by what came after it. Then this arrival is an
+      // operation of its own, and whatever arrived while it ran follows it. An exception from the work is
+      // the caller's to see, not this executor's to swallow.
+      let result;
+      try {
+        result = wiring.whileChange(() => {
+          drainWaiting();
+          const outcome = work();
+          drainWaiting();
+          return outcome;
+        });
+      } finally {
+        // Out of the executor, the right released: a full wait-list stops reception here, where no arrival
+        // and no caller's hook is running.
+        settleOverflow();
+      }
+      return result;
     }
     if (waiting.length >= maxWaitingEvents) {
-      stopped = true;
-      onStop({
-        market,
-        reason: `the wait-list for arrivals is full (${maxWaitingEvents}); ${label} was dropped`,
-      });
+      // Recorded only: the stop belongs to the operation this arrival arrived during, and it is carried
+      // out when that operation has finished, not from inside it.
+      if (overflowed === null) overflowed = label;
       return false;
     }
     waiting.push({ label, work });
@@ -852,13 +876,18 @@ export function createStructure({
   const stopInternal = api.stop;
   // A window takes the right, runs the operation, and then lets the arrivals that waited for it through -
   // all inside the same take, so an arrival is never processed in the middle of the frame that was running.
+  // The wait is emptied even when the operation throws, and a full wait-list is answered for here as well:
+  // an overflow that happened during a window is the same stop, carried out the same way.
   const window = (name, run, refusalShape) =>
     wiring.guard(
       name,
       (...args) => {
-        const result = run(...args);
-        drainWaiting();
-        return result;
+        try {
+          return run(...args);
+        } finally {
+          drainWaiting();
+          settleOverflow();
+        }
       },
       refusalShape,
     );
