@@ -1303,3 +1303,61 @@ test('the structure creates its store from a path, holds the file, and closes it
     reopened.close();
   });
 });
+
+test('nothing a caller supplies is handed the store, a part, or a private route', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const seen = [];
+    const record = (label, ...args) => seen.push({ label, args });
+    const structure = build(store, {
+      written: [],
+      onAck: (...args) => record('onAck', ...args),
+    });
+    // The hooks a caller supplies: what they receive is data, never the store, a part, or a route.
+    const hooks = [
+      ['rawWriter', (...args) => record('rawWriter', ...args)],
+      ['onAck', (...args) => record('onAck', ...args)],
+      ['onGap', (...args) => record('onGap', ...args)],
+      ['onStop', (...args) => record('onStop', ...args)],
+      ['onDiagnostic', (...args) => record('onDiagnostic', ...args)],
+    ];
+    const second = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      durability: store,
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: () => [],
+      },
+      webSocketImpl: function fakeSocket(url) {
+        return { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+      },
+      rawWriter: hooks[0][1],
+      onAck: hooks[1][1],
+      onGap: hooks[2][1],
+      onStop: hooks[3][1],
+      onDiagnostic: hooks[4][1],
+    });
+    second.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    second.feed(envelope(1));
+    second.close();
+
+    assert.ok(seen.length > 0, 'the hooks were called');
+    const forbidden = [store, second, second.book, second.organizer, second.ledger, second.connection];
+    for (const { label, args } of seen) {
+      for (const argument of args) {
+        assert.equal(
+          forbidden.includes(argument),
+          false,
+          `${label} was handed the store, a part, or a connection`,
+        );
+      }
+    }
+    store.close();
+  });
+});
