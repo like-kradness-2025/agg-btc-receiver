@@ -225,8 +225,15 @@ export function createStructure({
   // counters, and not the same question as what is still owed - that is the ledger's own count - because an
   // intent a refused raw write takes back was still written down once.
   let framesWrittenDown = 0;
-  // Frames whose connection is gone: durable in the raw, never going to be applied, kept as a record.
-  const skipped = [];
+
+  /**
+   * Write down that this frame can never be applied. The entry carries the decision from here on, so a
+   * restart repeats neither the decision nor the report: the report is made where the decision is made.
+   */
+  function recordNeverApplicable(connectionId, receiveSeq, reason) {
+    const { decided } = ledgerInternal.skip(connectionId, receiveSeq, reason);
+    if (decided) onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: receiveSeq });
+  }
 
   /**
    * Write down that the raw holds this frame and the board does not have it yet - or, before the write is
@@ -359,14 +366,7 @@ export function createStructure({
       !HELD_BY_BOOK.has(applied.reason)
     ) {
       if (NEVER_APPLICABLE.has(applied.reason)) {
-        if (!skipped.some((known) => known.seq === target.receive_seq && known.connectionId === target.connection_id)) {
-          skipped.push({ connectionId: target.connection_id, seq: target.receive_seq, reason: applied.reason });
-          onGap({
-            market,
-            reason: `this frame can never be applied: ${applied.reason}`,
-            seq: target.receive_seq,
-          });
-        }
+        recordNeverApplicable(target.connection_id, target.receive_seq, applied.reason);
         return { ...note, ...applied };
       }
       // Reported once per frame: a resend repeats the same refusal, and repeating the report turns one lost
@@ -422,7 +422,11 @@ export function createStructure({
       // bytes, meta or identity for it afterwards would let the canonical record and the board describe
       // different data under one key.
       const target = stored === null ? envelope : envelopeFromEntry(stored);
-      if (stored !== null && stored.state === OWED) {
+      // A resend is served from the entry whenever the raw is already known to hold the frame - an owed
+      // entry, or one whose permanent loss is already decided. Only an intent is still a question, and only
+      // it goes back through the organizer: a skipped frame sent through it would be rewritten to the raw
+      // and reported again, which is the noise the decision exists to end.
+      if (stored !== null && stored.state !== INTENT) {
         return deliver(target, {
           accepted: true,
           alreadyDurable: true,
@@ -798,29 +802,36 @@ export function createStructure({
      */
     redeliverPending: () => {
       if (closed) return { applied: 0, refused: true, reason: 'this structure is closed' };
-      // Three answers, kept apart on purpose: what reached the board, what the board is holding until
-      // a hole is filled, and what will never apply because the connection it belongs to is gone. The
-      // previous version called the second one "redelivered" and threw the third one away, which is
-      // how a frame that never arrived gets counted as one that did.
+      // Four answers, kept apart on purpose and exclusive by construction: every owed entry the pass is
+      // offered leaves as exactly one of applied, held, skipped or unadmitted. What reached the board is
+      // applied; what the board is holding stays owed, and so does anything else it refuses for now; what
+      // belongs to a connection that is gone will never be applied and is written down as a permanent
+      // loss; and what no connection has been accepted for yet is neither a delivery nor a loss - it may
+      // still be admitted, so it waits. Summing the four counts is the pass's own account of what it was
+      // offered, so a frame that never arrived is never counted as one that did.
       let appliedCount = 0;
       let heldCount = 0;
       let skippedCount = 0;
+      let unadmittedCount = 0;
       // Only what the raw is confirmed to hold: an intent is a frame the raw may not have, and delivering
       // it would put the board ahead of the canonical record.
       for (const entry of ledger.pending({ state: OWED })) {
+        if (book.appliedBoundary.connectionId === null) {
+          // Nobody has been accepted for this board yet. The frame may yet be admitted - it is not a loss
+          // and must not be recorded as one, because a report says what happened, and nothing has.
+          unadmittedCount += 1;
+          continue;
+        }
         if (entry.connectionId !== book.appliedBoundary.connectionId) {
-          // Its connection was replaced, so nothing will ever accept it. That is a permanent loss, and it
-          // is reported as one instead of being held for a delivery that cannot happen. The entry itself
-          // stays in the ledger: it is the durable record of that loss, and deciding how a permanent loss
-          // is written down for good belongs with the classification of skipped frames, not here.
-          if (!skipped.some((known) => known.seq === entry.receiveSeq && known.connectionId === entry.connectionId)) {
-            skipped.push({ connectionId: entry.connectionId, seq: entry.receiveSeq, reason: entry.reason });
-            onGap({
-              market,
-              reason: `the connection this frame belonged to is gone: ${entry.reason}`,
-              seq: entry.receiveSeq,
-            });
-          }
+          // The owner is established and it belongs to another connection: the run this frame arrived in
+          // never comes back, so nothing will ever accept it. That is a permanent loss, and the decision
+          // is written down where it is made - the entry keeps the row, and the ledger is what says the
+          // loss is known. A restart repeats neither the decision nor the report.
+          recordNeverApplicable(
+            entry.connectionId,
+            entry.receiveSeq,
+            `the connection this frame belonged to is gone: ${entry.reason}`,
+          );
           skippedCount += 1;
           continue;
         }
@@ -831,16 +842,27 @@ export function createStructure({
           envelopeFromEntry(entry),
           { accepted: true, alreadyDurable: true, reason: 'the raw already holds this frame', ack: null },
         );
-        if (result.applied === true) {
+        if (result.applied === true || result.reason === ALREADY_APPLIED) {
           appliedCount += 1;
-        } else if (result.reason && HELD_BY_BOOK.has(result.reason)) {
+        } else if (result.reason && NEVER_APPLICABLE.has(result.reason)) {
+          // deliver wrote the decision down itself, through the same helper.
+          skippedCount += 1;
+        } else {
+          // The board is holding it until the hole before it is filled, or its start is known, or refused
+          // it for another reason: either way it stays owed, and a failed attempt costs nothing.
           heldCount += 1;
         }
       }
       // Whatever the board now holds stops being owed, released by position: the ceiling the board
       // reached covers exactly the contiguous frames it applied.
       releaseDelivered();
-      return { applied: appliedCount, held: heldCount, skipped: skippedCount, stillPending: ledger.size() };
+      return {
+        applied: appliedCount,
+        held: heldCount,
+        skipped: skippedCount,
+        unadmitted: unadmittedCount,
+        stillPending: ledger.size(),
+      };
     },
     /**
      * A restart resumes from the board's applied position (C8, C11): everything the raw holds and the
@@ -849,8 +871,9 @@ export function createStructure({
      * The frames go straight to the book rather than back through the organizer. The organizer's own
      * record says the raw already holds them - that is what the ledger entry means - and asking it to
      * take the frame again would write it to the raw a second time for no gain. What the book takes is
-     * released by position; what it cannot take yet (a hole it waits behind, a connection that is no
-     * longer its own) stays owed, which is exactly what the store is for.
+     * released by position; what it cannot take yet stays in the store, which is exactly what the store
+     * is for - a hole it waits behind is still owed, and a connection that is gone is written down as
+     * the permanent loss it is.
      */
     resume: () => {
       if (closed) return { delivered: 0, refused: true, reason: 'this structure is closed' };

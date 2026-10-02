@@ -274,28 +274,49 @@ test('nothing is acknowledged for a frame whose debt to the board could not be w
   });
 });
 
-test('a frame the raw keeps and the board can never take is owed, and stays owed', async () => {
+test('a frame the raw keeps and the board can never take is written down as a permanent loss', async () => {
   await withStore(async ({ path }) => {
     const first = openDurability({ path, runId: 'run-1' });
     const gaps = [];
-    const before = build(first, { gaps });
+    const written = [];
+    const before = build(first, { gaps, rawWritten: written });
     // This connection's numbering starts at 5, so a frame below it is durable in the raw and can never be
-    // applied to the board. That is a loss, and the store is where a loss is written down.
+    // applied to the board. That is a loss, and the entry is where a loss is written down - a decision the
+    // process that made it can no longer take with it.
     before.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 5 });
     const below = before.feed(envelope(3, { meta: null }));
     assert.equal(below.applied, false);
     assert.equal(below.reason, 'below the first sequence');
     assert.equal(before.stats.owed, 1, 'the frame is accounted for rather than dropped');
+    assert.equal(before.ledger.find('conn-1', 3).state, 'skipped', 'and the entry carries the decision');
     assert.equal(
       gaps.filter((gap) => String(gap.reason).includes('can never be applied')).length,
       1,
       'and it is reported once as a permanent loss',
     );
+
+    // A resend of the same frame is the same fact: the decision stands, so it is neither written to the
+    // raw again nor reported again.
+    const again = before.feed(envelope(3, { meta: null }));
+    assert.equal(again.reason, 'below the first sequence');
+    assert.deepEqual(written, [3], 'the raw was asked for it once');
+    assert.equal(
+      gaps.filter((gap) => String(gap.reason).includes('can never be applied')).length,
+      1,
+      'and the report is not repeated',
+    );
     first.close();
 
     const second = openDurability({ path, runId: 'run-2' });
-    const after = build(second);
+    const fresh = [];
+    const after = build(second, { gaps: fresh });
     assert.equal(after.stats.owed, 1, 'the record of the loss outlives the process that saw it');
+    assert.equal(after.ledger.find('conn-1', 3).state, 'skipped', 'and still says what it is');
+    assert.equal(
+      fresh.filter((gap) => String(gap.reason).includes('can never be applied')).length,
+      0,
+      'so a restart repeats neither the decision nor the report',
+    );
     second.close();
   });
 });
@@ -1044,6 +1065,7 @@ test('a frame below the connection first sequence is written, and recorded as a 
       1,
       'and that is recorded as the loss it is',
     );
+    assert.equal(structure.ledger.find('conn-1', 3).state, 'skipped', 'and it is the entry that carries it');
     store.close();
   });
 });

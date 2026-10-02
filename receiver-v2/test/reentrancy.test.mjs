@@ -287,6 +287,7 @@ test('a change attempted on any public surface from inside a frame is refused', 
         seen.ledgerConfirm = partsOf(subject).ledger.confirm(envelope(1));
         seen.ledgerRelease = partsOf(subject).ledger.release({ connectionId: 'conn-1', firstSeq: 1, upToSeq: 1 });
         seen.ledgerDrop = partsOf(subject).ledger.drop('conn-1', 1);
+        seen.ledgerSkip = partsOf(subject).ledger.skip('conn-1', 1, 'a test decision');
         seen.bookApply = partsOf(subject).book.apply({ envelope: envelope(2), changes: [{ side: 'bid', price: 102, size: 2 }] });
         seen.bookAccept = partsOf(subject).book.accept('conn-9', { runId: 'run-1', generation: 9, firstSeq: 1 });
         seen.bookBeginSync = partsOf(subject).book.beginSync();
@@ -1257,6 +1258,7 @@ test('the views a caller is handed cannot change what the structure is doing', a
       ['ledger.confirm', structure.ledger.confirm],
       ['ledger.release', structure.ledger.release],
       ['ledger.drop', structure.ledger.drop],
+      ['ledger.skip', structure.ledger.skip],
       ['connection.start', structure.connection.start],
       ['connection.stop', structure.connection.stop],
     ]) {

@@ -7,6 +7,10 @@ import { join } from 'node:path';
 import { makeEnvelope } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { createStructure } from '../src/supervisor/structure.mjs';
+import { internalsOf } from '../src/internal/wiring.mjs';
+
+/** The parts of a structure, for a test that plants a ledger entry directly: the wiring's private side. */
+const partsOf = (structure) => internalsOf(structure);
 
 /** A frame that declares no origin: the raw takes it, the board has nothing to anchor to yet. */
 const bare = (seq, connectionId = 'conn-1') =>
@@ -300,10 +304,287 @@ test('an origin above the frames already received is refused, and they are appli
     assert.equal(after.applied, 0, 'offering them again applies nothing a second time');
     assert.equal(after.held, 0, 'and nothing new is waiting behind a hole');
     assert.deepEqual(structure.book.openGaps(), [], 'with no hole left behind');
-    // The entry that the book itself drained is still offered once more and refused as already applied: sorting
-    // what a redelivery finds into applied / held / never-applicable is set 4 of the plan, and until then the
-    // one thing that must hold is that nothing is lost - the position and the board above say it is not.
+    // The board drained them and the release took them: nothing is owed, so a pass is offered nothing. The
+    // four-way sort says what a redelivery reached, and here it reached everything during admission - the
+    // position and the board above are the proof that nothing was lost.
     assert.equal(structure.book.appliedBoundary.upToSeq, 3);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a debt no connection has been accepted for is not a loss, and is delivered once its connection is', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'redeliver-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const gaps = [];
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (envelope) => [{ side: 'bid', price: 100 + envelope.receive_seq, size: 1 }],
+      },
+      durability: store,
+      webSocketImpl: function unused() {
+        throw new Error('this test feeds frames directly');
+      },
+      rawWriter: () => true,
+      spoolDir: null,
+      onAck: () => {},
+      onGap: (gap) => gaps.push(gap),
+      onStop: () => {},
+    });
+
+    // A frame the raw already holds, with no connection accepted for the board yet. It is owed, and it may
+    // yet be admitted - which is a wait, not a loss, and must not be written down as one.
+    assert.equal(
+      partsOf(structure).ledger.record(bare(1), 'durable in the raw and never delivered').recorded,
+      true,
+    );
+    const waiting = structure.redeliverPending();
+    assert.equal(waiting.unadmitted, 1, 'the frame waits for a connection instead of being written off');
+    assert.equal(waiting.applied, 0);
+    assert.equal(waiting.held, 0);
+    assert.equal(waiting.skipped, 0, 'nothing is written down as a loss');
+    assert.equal(
+      waiting.applied + waiting.held + waiting.skipped + waiting.unadmitted,
+      1,
+      'and it leaves the pass as exactly one outcome',
+    );
+    assert.equal(structure.ledger.find('conn-1', 1).state, 'owed', 'the entry is left owed');
+    assert.equal(
+      gaps.filter((gap) => String(gap.reason).includes('can never be applied')).length,
+      0,
+      'a wait is not reported as a loss',
+    );
+
+    // Its connection is admitted, and the structure's own redelivery hands the frame to the board.
+    const accepted = structure.accept('conn-1', { firstSeq: 1 });
+    assert.equal(accepted.accepted, true);
+    assert.equal(structure.book.appliedBoundary.upToSeq, 1, 'the frame the debt stands for reaches the board');
+    assert.equal(structure.book.board.size('bid', 101), 1);
+
+    // The entry goes once the raw's own record vouches for the frame as well: recovery is what brings the
+    // two positions together, and the release follows it.
+    assert.equal(structure.resume().applied, 1, 'a recovery pass counts the delivery it finds already made');
+    assert.equal(structure.ledger.find('conn-1', 1), null, 'and the entry is released');
+    assert.equal(structure.stats.owed, 0);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a frame whose connection is gone is written down as a loss once, and a restart does not repeat it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'redeliver-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const gaps = [];
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: () => [],
+      },
+      durability: store,
+      webSocketImpl: function unused() {
+        throw new Error('this test feeds frames directly');
+      },
+      rawWriter: () => true,
+      spoolDir: null,
+      onAck: () => {},
+      onGap: (gap) => gaps.push(gap),
+      onStop: () => {},
+    });
+    structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    // The raw holds a frame of this connection that never reached the board.
+    assert.equal(
+      partsOf(structure).ledger.record(bare(1), 'durable in the raw and never delivered').recorded,
+      true,
+    );
+
+    // A newer generation takes the board over: the connection the frame belongs to never comes back, so
+    // the frame is a permanent loss - and the decision is written down in the entry, once.
+    assert.equal(structure.accept('conn-2', { runId: 'run-1', generation: 2, firstSeq: 1 }).accepted, true);
+    const loss = structure.ledger.find('conn-1', 1);
+    assert.equal(loss.state, 'skipped', 'the loss is written down in the entry itself');
+    assert.match(loss.reason, /the connection this frame belonged to is gone/);
+    assert.match(loss.reason, /durable in the raw and never delivered/, 'and it carries why the frame was owed');
+    assert.equal(
+      gaps.filter((gap) => String(gap.reason).includes('can never be applied')).length,
+      1,
+      'and it is reported once',
+    );
+
+    // The decision is kept: offering the debt again decides nothing and reports nothing.
+    const again = structure.redeliverPending();
+    assert.equal(again.skipped, 0, 'a decided loss is not offered again');
+    assert.equal(again.unadmitted, 0);
+    assert.equal(structure.ledger.find('conn-1', 1).state, 'skipped');
+    assert.equal(gaps.filter((gap) => String(gap.reason).includes('can never be applied')).length, 1);
+
+    // A restart repeats neither the decision nor the report: the entry already carries both.
+    structure.close();
+    store.close();
+
+    const reopened = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-2' });
+    const fresh = [];
+    const after = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: () => [],
+      },
+      durability: reopened,
+      webSocketImpl: function unused() {
+        throw new Error('this test feeds frames directly');
+      },
+      rawWriter: () => true,
+      spoolDir: null,
+      onAck: () => {},
+      onGap: (gap) => fresh.push(gap),
+      onStop: () => {},
+    });
+    assert.equal(after.ledger.find('conn-1', 1).state, 'skipped', 'the record of the loss outlives the process');
+    assert.equal(
+      fresh.filter((gap) => String(gap.reason).includes('can never be applied')).length,
+      0,
+      'and opening it says nothing new',
+    );
+    assert.equal(after.redeliverPending().skipped, 0, 'nor does a pass over it');
+    assert.equal(fresh.filter((gap) => String(gap.reason).includes('can never be applied')).length, 0);
+    after.close();
+    reopened.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('one pass sorts every owed frame into exactly one of applied, held, skipped and unadmitted', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'redeliver-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: () => [],
+      },
+      durability: store,
+      webSocketImpl: function unused() {
+        throw new Error('this test feeds frames directly');
+      },
+      rawWriter: () => true,
+      spoolDir: null,
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+    });
+    structure.accept('conn-1', { firstSeq: 1 });
+
+    // Three debts: one the board can take at once, one it must hold until the hole before it is filled, and
+    // one whose connection was replaced before it could be delivered.
+    assert.equal(partsOf(structure).ledger.record(bare(1), 'owed').recorded, true);
+    assert.equal(partsOf(structure).ledger.record(bare(5), 'owed').recorded, true);
+    assert.equal(partsOf(structure).ledger.record(bare(1, 'conn-2'), 'owed').recorded, true);
+    const offered = structure.ledger.pending({ state: 'owed' }).length;
+    assert.equal(offered, 3, 'three debts are owed');
+
+    const result = structure.redeliverPending();
+    assert.equal(result.applied, 1, 'the frame at the start of the numbering is applied');
+    assert.equal(result.held, 1, 'the frame above the hole stays owed');
+    assert.equal(result.skipped, 1, 'the frame of the replaced connection is written down as a loss');
+    assert.equal(result.unadmitted, 0, 'with an owner established nothing waits for one');
+    assert.equal(
+      result.applied + result.held + result.skipped + result.unadmitted,
+      offered,
+      'the four outcomes are exclusive and exhaustive',
+    );
+    assert.equal(structure.book.appliedBoundary.upToSeq, 1);
+    assert.equal(structure.ledger.find('conn-1', 5).state, 'owed', 'the held frame is still owed');
+    assert.equal(structure.ledger.find('conn-2', 1).state, 'skipped', 'and the loss is in the ledger');
+
+    // A second pass over the same board: the frame the board already holds is counted as applied, not
+    // dropped, and the held frame is still held - the buckets account for every owed entry each pass.
+    const stillOwed = structure.ledger.pending({ state: 'owed' }).length;
+    const second = structure.redeliverPending();
+    assert.equal(second.applied, 1, 'already applied is a delivery the pass can account for');
+    assert.equal(second.held, 1);
+    assert.equal(second.skipped, 0, 'a decided loss is not decided again');
+    assert.equal(second.applied + second.held + second.skipped + second.unadmitted, stillOwed);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('owed frames are offered back in the order they arrived, not by sequence', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'redeliver-'));
+  try {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const written = [];
+    const offered = [];
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (envelope) => {
+          offered.push(envelope.receive_seq);
+          return [{ side: 'bid', price: 100 + envelope.receive_seq, size: 1 }];
+        },
+      },
+      durability: store,
+      webSocketImpl: function unused() {
+        throw new Error('this test feeds frames directly');
+      },
+      rawWriter: (frame) => {
+        written.push(frame.receive_seq);
+        return true;
+      },
+      spoolDir: null,
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+    });
+
+    // The origin is not known yet, so every frame is durable in the raw and owed to the board - and they
+    // arrive out of sequence order.
+    structure.accept('conn-1');
+    for (const seq of [5, 3, 1]) {
+      assert.match(structure.feed(bare(seq)).reason, /first sequence unknown/);
+    }
+    assert.deepEqual(written, [5, 3, 1], 'the writer was called in arrival order');
+    assert.deepEqual(offered, [5, 3, 1], 'and so was the board, as each frame arrived');
+
+    // The origin arrives and the structure offers the debts back by itself. The order is the order they were
+    // written down - never the clock, and never sorted by sequence, which would offer the frame at 1 before
+    // the frame at 5 that arrived first.
+    offered.length = 0;
+    assert.equal(structure.accept('conn-1', { firstSeq: 1 }).accepted, true);
+    assert.deepEqual(offered, [5, 3, 1], 'the redelivery keeps the arrival order');
+    assert.deepEqual(offered, written, 'the order the writer is called is the order the frames come back in');
+    assert.equal(structure.book.appliedBoundary.upToSeq, 1, 'the frame at the start is applied');
+    assert.deepEqual(
+      structure.ledger.pending({ state: 'owed' }).map((entry) => entry.receiveSeq),
+      [5, 3],
+      'and the frames behind the hole wait in arrival order too',
+    );
     store.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

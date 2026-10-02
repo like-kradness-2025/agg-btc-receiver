@@ -36,7 +36,9 @@
  * it can never be applied, so it is a permanent loss and stays here as the record of one - up to the
  * board's applied ceiling. That ceiling only moves contiguously (§2.2), so releasing up to it cannot
  * release a frame above a hole. Entries belonging to another connection are left alone: nothing here
- * decides that a permanent loss is finished with.
+ * decides that a permanent loss is finished with. What is written down, once and only where the decision
+ * is made, is that a frame will never be applied: the entry keeps its row and changes its state, so a
+ * restart repeats neither the decision nor the report.
  */
 
 import { bindConstructor, bindInternals, internalsOf } from '../internal/wiring.mjs';
@@ -65,6 +67,7 @@ CREATE INDEX IF NOT EXISTS delivery_ledger_arrival
 
 export const INTENT = 'intent';
 export const OWED = 'owed';
+export const SKIPPED = 'skipped';
 
 /**
  * Open the delivery ledger. Opening it writes to the store, so the whole initialisation is one change operation: the
@@ -101,6 +104,12 @@ function openDeliveryLedgerWithin(options, wiring) {
   // frame confirmed late must not be delivered last because of it.
   const confirmStatement = wiring.db.prepare(
     'UPDATE delivery_ledger SET state = ? WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ?',
+  );
+  // A decision, never a removal: a frame that will never be applied stays in the ledger as the record of
+  // that loss, and the first decision keeps the row - a state that is already `skipped` changes nothing.
+  const skipStatement = wiring.db.prepare(
+    `UPDATE delivery_ledger SET state = 'skipped', reason = ?
+      WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ? AND state <> 'skipped'`,
   );
   const releaseStatement = wiring.db.prepare(
     `DELETE FROM delivery_ledger
@@ -209,6 +218,17 @@ function openDeliveryLedgerWithin(options, wiring) {
     return { dropped: result.changes };
   }
 
+  /**
+   * Write down that this frame will never be applied. The first decision keeps the row: the entry is the
+   * record of a permanent loss, and a frame whose loss is already written down is the same fact offered
+   * again - a later reason does not rewrite it. Returns whether this call was the decision, so that the
+   * report about it is made once rather than once per attempt.
+   */
+  function skip(connectionId, receiveSeq, reason) {
+    const result = skipStatement.run(reason, market, stream, connectionId, receiveSeq);
+    return { decided: result.changes === 1 };
+  }
+
   /** Everything still written down, in arrival order - the order the board is fed in. */
   function pending({ state = null } = {}) {
     const rows =
@@ -225,6 +245,7 @@ function openDeliveryLedgerWithin(options, wiring) {
     confirm,
     release,
     drop,
+    skip,
     find,
     pending,
     size() {
@@ -240,11 +261,13 @@ function openDeliveryLedgerWithin(options, wiring) {
     confirm: api.confirm,
     release: api.release,
     drop: api.drop,
+    skip: api.skip,
   };
   api.record = wiring.guard('ledger.record', internal.record);
   api.confirm = wiring.guard('ledger.confirm', internal.confirm);
   api.release = wiring.guard('ledger.release', internal.release);
   api.drop = wiring.guard('ledger.drop', internal.drop);
+  api.skip = wiring.guard('ledger.skip', internal.skip);
 
   bindInternals(api, internal);
   return api;
