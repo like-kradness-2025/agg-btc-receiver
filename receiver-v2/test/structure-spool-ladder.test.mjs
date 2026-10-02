@@ -372,3 +372,35 @@ test('reaching the bound is not passing it, in either half', async () => {
     { spool: false, nowMs: () => clock, ledgerRetentionMs: 5 * 60 * 1000, ledgerRetentionBytes: 100 },
   );
 });
+
+test('the age half of the bound is re-applied on the reception road too', async () => {
+  let clock = 1_000_000;
+  await withStructure(
+    async ({ structure, health, gaps, parts }) => {
+      health.accepting = true;
+      // One entry, well inside the byte bound: only its age can act on it.
+      assert.equal(
+        parts.ledger.record(envelope(2, { meta: null, raw: 'x'.repeat(40) }), 'durable and held').recorded,
+        true,
+      );
+      const states = () =>
+        new Map(structure.ledger.pending().map((entry) => [entry.receiveSeq, entry.state]));
+
+      clock += 5 * 60 * 1000;
+      assert.equal(structure.feed(envelope(3, { meta: null })).durable, true, 'a frame arrives at the bound');
+      assert.equal(states().get(2), 'owed', 'exactly at the age bound is still inside it');
+
+      clock += 1; // one millisecond further, and the age half has been passed
+      assert.equal(structure.feed(envelope(4, { meta: null })).durable, true, 'and another frame arrives');
+      assert.equal(states().get(2), 'skipped', 'the oldest entry is declared missing by the arrival itself');
+      assert.equal(states().get(3), 'owed');
+      assert.equal(states().get(4), 'owed');
+      assert.equal(
+        gaps.filter((gap) => String(gap.reason).includes('retention bound')).length,
+        1,
+        'reported once, where the decision is made',
+      );
+    },
+    { spool: false, nowMs: () => clock, ledgerRetentionMs: 5 * 60 * 1000, ledgerRetentionBytes: 10_000 },
+  );
+});
