@@ -44,7 +44,7 @@ const envelope = (seq, { connectionId = CONNECTION, raw, meta = { first_seq: 1 }
  */
 async function withStructure(
   fn,
-  { spool = true, nowMs, ledgerRetentionMs, ledgerRetentionBytes, refuseSeqs = [] } = {},
+  { spool = true, nowMs, ledgerRetentionMs, ledgerRetentionBytes, refuseSeqs = [], socket = false } = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'ladder-'));
   const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
@@ -52,6 +52,7 @@ async function withStructure(
   const gaps = [];
   const stops = [];
   const health = { accepting: false };
+  let fake = null;
   const structure = createStructure({
     market: 'kraken_spot',
     stream: 'trades',
@@ -64,9 +65,15 @@ async function withStructure(
       changesFor: (frame) => [{ side: 'bid', price: 100 + frame.receive_seq, size: 1 }],
     },
     durability: store,
-    webSocketImpl: function unused() {
-      throw new Error('this test feeds frames directly');
-    },
+    webSocketImpl: socket
+      ? function fakeSocket(url) {
+          // A socket this test can drive, so a frame's road in is the reception road rather than feed().
+          fake = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+          return fake;
+        }
+      : function unused() {
+          throw new Error('this test feeds frames directly');
+        },
     rawWriter: (frame) => {
       if (!health.accepting) return false;
       // One frame can be refused while the rest are taken: a walk has to stop at the record it could not
@@ -86,7 +93,17 @@ async function withStructure(
   });
   structure.accept(CONNECTION, { runId: 'run-1', generation: 1, firstSeq: 1 });
   try {
-    return await fn({ structure, store, rawWritten, gaps, stops, health, dir, parts: internalsOf(structure) });
+    return await fn({
+      structure,
+      store,
+      rawWritten,
+      gaps,
+      stops,
+      health,
+      dir,
+      parts: internalsOf(structure),
+      socket: () => fake,
+    });
   } finally {
     structure.stop();
     store.close();
@@ -231,6 +248,11 @@ test('a decided loss is not counted against the bound again', async () => {
       assert.equal(states.get(2), 'owed', 'and the fresh entry survives: the decided bytes are not counted');
       assert.equal(structure.ledger.size(), 2, 'both rows are still written down');
       assert.equal(
+        structure.ledger.heldSize().bytes,
+        40,
+        'and what is held for delivery does not include the decided row',
+      );
+      assert.equal(
         gaps.filter((gap) => String(gap.reason).includes('retention bound')).length,
         0,
         'and nothing is reported as newly lost',
@@ -267,5 +289,86 @@ test('a drain stops at a record the raw refuses, and does not consume past it', 
       assert.equal(structure.ledger.find(CONNECTION, 2), null, 'and none for the one behind it');
     },
     { refuseSeqs: [1] },
+  );
+});
+
+test('a frame that arrives on the socket climbs the ladder too, not only one a caller hands in', async () => {
+  await withStructure(
+    async ({ structure, socket, health, rawWritten }) => {
+      structure.start();
+      socket().onopen?.();
+      // The raw refuses, so the frame is spilled rather than dropped.
+      socket().onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+      assert.equal(structure.stats.spooledFrames, 1, 'the frame that arrived on the socket was spilled');
+      assert.ok(structure.spool.bytes > 0, 'and the spool holds it');
+
+      // The raw is healthy again, and the frame that finds this out arrives on the socket - not from a
+      // caller. The repair has to hang off the road in, or the spilled frame waits for a caller who is
+      // never coming.
+      health.accepting = true;
+      socket().onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+      assert.equal(structure.book.appliedBoundary.upToSeq, 2, 'both frames reached the board');
+      assert.deepEqual(rawWritten, [2, 1], 'the raw took the arrival, then the frame it had refused');
+      assert.equal(structure.spool.bytes, 0, 'and the spool was drained by that arrival itself');
+    },
+    { socket: true },
+  );
+});
+
+test('the bound is re-applied while frames keep arriving, with no spool and no explicit drain', async () => {
+  await withStructure(
+    async ({ structure, health, gaps, parts }) => {
+      health.accepting = true;
+      // Three entries the ledger holds for delivery, 40 bytes each.
+      for (const seq of [2, 3, 4]) {
+        assert.equal(
+          parts.ledger.record(envelope(seq, { meta: null, raw: 'x'.repeat(40) }), 'durable and held').recorded,
+          true,
+        );
+      }
+      assert.equal(structure.ledger.size(), 3);
+
+      // The next frame arrives normally: its write is the moment the bound is applied. Nothing asks for a
+      // drain, and there is no spool in play - an ordinary frame has to be enough.
+      assert.equal(structure.feed(envelope(5, { meta: null })).durable, true);
+      const states = new Map(structure.ledger.pending().map((entry) => [entry.receiveSeq, entry.state]));
+      assert.equal(states.get(2), 'skipped', 'the oldest entry past the bound was declared missing');
+      assert.equal(states.get(3), 'owed', 'and what is left is back inside it');
+      assert.equal(states.get(4), 'owed');
+      assert.equal(states.get(5), 'owed');
+      assert.equal(
+        gaps.filter((gap) => String(gap.reason).includes('retention bound')).length,
+        1,
+        'the loss is reported once, where the decision is made',
+      );
+    },
+    { spool: false, ledgerRetentionBytes: 100 },
+  );
+});
+
+test('reaching the bound is not passing it, in either half', async () => {
+  let clock = 1_000_000;
+  await withStructure(
+    async ({ structure, gaps, parts }) => {
+      // Exactly at the byte bound and exactly at the age bound: neither half has been passed, so nothing
+      // is declared missing. One byte - or one millisecond - further, and the oldest entry goes.
+      assert.equal(
+        parts.ledger.record(envelope(1, { meta: null, raw: 'x'.repeat(100) }), 'durable and held').recorded,
+        true,
+      );
+      clock += 5 * 60 * 1000;
+      assert.equal(structure.drainSpool().swept, 0, 'exactly at the bound is inside it');
+
+      assert.equal(
+        parts.ledger.record(envelope(2, { meta: null, raw: 'y' }), 'durable and held').recorded,
+        true,
+      );
+      assert.equal(structure.drainSpool().swept, 1, 'one byte past it, and the oldest is declared missing');
+      const states = new Map(structure.ledger.pending().map((entry) => [entry.receiveSeq, entry.state]));
+      assert.equal(states.get(1), 'skipped');
+      assert.equal(states.get(2), 'owed', 'and the one inside the bound survives');
+      assert.equal(gaps.filter((gap) => String(gap.reason).includes('retention bound')).length, 1);
+    },
+    { spool: false, nowMs: () => clock, ledgerRetentionMs: 5 * 60 * 1000, ledgerRetentionBytes: 100 },
   );
 });

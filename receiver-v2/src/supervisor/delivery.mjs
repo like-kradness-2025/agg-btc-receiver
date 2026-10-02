@@ -144,13 +144,14 @@ function openDeliveryLedgerWithin(options, wiring) {
   const countStatement = wiring.db.prepare(
     'SELECT COUNT(*) AS owed FROM delivery_ledger WHERE market = ? AND stream = ?',
   );
-  // The retention bound's two halves: how much raw the ledger is still holding, and how old the oldest
-  // entry is. Both are asked of the store rather than kept in this process, because a restart is exactly
-  // when the bound has to be re-applied to what is still written down.
+  // The retention bound's two halves: how much raw the ledger is still *holding for delivery*, and how old
+  // the oldest of it is. A decided loss keeps its row as the record of a loss and is not something still
+  // held, so it is not counted here. Both are asked of the store rather than kept in this process, because
+  // a restart is exactly when the bound has to be re-applied to what is still written down.
   const heldSizeStatement = wiring.db.prepare(
     `SELECT COALESCE(SUM(length(raw)), 0) AS held_bytes, MIN(recorded_at_ms) AS oldest_ms
        FROM delivery_ledger
-      WHERE market = ? AND stream = ?`,
+      WHERE market = ? AND stream = ? AND state <> 'skipped'`,
   );
   // The oldest entries first, each with the bytes it is holding, so a sweep can decide - oldest first -
   // which ones the bound has passed. The store's own row order breaks ties, never a clock that can step.

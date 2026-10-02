@@ -294,12 +294,11 @@ export function createStructure({
     const entries = ledger.oldestEntries();
     let remaining = 0;
     for (const entry of entries) if (entry.state !== SKIPPED) remaining += entry.bytes;
-    const now = nowMs();
     let swept = 0;
     for (const entry of entries) {
       if (entry.state === SKIPPED) continue; // already decided: its loss is written down
-      const tooOld = now - entry.recordedAtMs > ledgerRetentionMs;
-      const tooMuch = remaining > ledgerRetentionBytes;
+      const tooOld = pastTimeBound(entry.recordedAtMs);
+      const tooMuch = pastByteBound(remaining);
       if (!tooOld && !tooMuch) break; // this one, and everything newer, is inside the bound
       const reason = tooOld
         ? `the delivery ledger's retention bound passed this frame: it is older than ${ledgerRetentionMs} ms`
@@ -381,6 +380,36 @@ export function createStructure({
   function maybeDrainSpool() {
     if (spool === null || spool.bytes === 0 || drainingSpool) return;
     drainSpoolInternal();
+  }
+
+  /** Past the bound means strictly past it: reaching the bound is not passing it. One place, so the
+   *  cheap check below and the walk that acts on it cannot disagree about where the bound is. */
+  const pastTimeBound = (recordedAtMs) => nowMs() - recordedAtMs > ledgerRetentionMs;
+  const pastByteBound = (heldBytes) => heldBytes > ledgerRetentionBytes;
+
+  /**
+   * Re-apply the retention bound when the ledger's own numbers say it may have been passed. The aggregate
+   * is one scan of one table with no sort; the oldest-first walk behind it runs only when that cheap answer
+   * says the bound is plausibly crossed, so an ordinary frame pays one aggregate and nothing else.
+   */
+  function maybeSweepRetention() {
+    if (ledger.size() === 0) return { swept: 0 };
+    const held = ledger.heldSize();
+    if (held.oldestMs === null) return { swept: 0 };
+    if (!pastTimeBound(held.oldestMs) && !pastByteBound(held.bytes)) return { swept: 0 };
+    return sweepRetentionInternal();
+  }
+
+  /**
+   * The moment after a frame's own write succeeded: the ladder can climb and the bound can be re-applied.
+   * It runs wherever a frame is handled - a socket arrival, a caller's feed, a replay - because a repair
+   * that happens on one road in and not another is a repair that does not happen; and it runs inside the
+   * operation that wrote the frame, never from a caller's hook.
+   */
+  function healAfterFrame(result) {
+    if (!result || (result.durable !== true && result.alreadyDurable !== true)) return;
+    maybeDrainSpool();
+    maybeSweepRetention();
   }
 
   /**
@@ -723,7 +752,14 @@ export function createStructure({
   // Nothing here is a special case for the socket this structure opened itself: an event that arrives while
   // an operation is running waits for it, including the announcement of the socket's own generation, which
   // carries the continuation that opens it.
-  const feedEntry = (envelope) => receiveEvent('message', () => feed(envelope));
+  // A frame the socket delivered and a frame a caller handed in take the same road once the write has
+  // happened: the ladder is climbed and the bound re-applied there - one place, not one per entrance.
+  const feedAndHeal = (envelope) => {
+    const result = feed(envelope);
+    healAfterFrame(result);
+    return result;
+  };
+  const feedEntry = (envelope) => receiveEvent('message', () => feedAndHeal(envelope));
   const admitEntry = (details) =>
     receiveEvent('generation', () => {
       const admitted = admitOnGeneration(details);
@@ -1162,11 +1198,7 @@ export function createStructure({
       refusalShape,
     );
   const closeInternal = api.close;
-  api.feed = window('structure.feed', feed, undefined, (result) => {
-    // A frame that just became durable is the moment the ladder can be climbed: the raw is accepting
-    // again, so what was spilled is offered to it once more - boundedly, and inside this operation.
-    if (result && (result.durable === true || result.alreadyDurable === true)) maybeDrainSpool();
-  });
+  api.feed = window('structure.feed', feedAndHeal);
   api.accept = window('structure.accept', acceptInternal);
   api.redeliverPending = window('structure.redeliverPending', redeliverPendingInternal, (refusal) => ({
     applied: 0,
