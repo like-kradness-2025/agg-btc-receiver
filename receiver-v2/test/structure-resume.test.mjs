@@ -867,7 +867,7 @@ test('what is spilled is the frame the key means, not the resend that arrived', 
     );
     assert.equal(after.stats.stopped, false);
 
-    after.spool.sync();
+    partsOf(after).spool.sync();
     const spilled = [...after.spool.drain()].filter((entry) => entry && typeof entry === 'object');
     const forThree = spilled.filter((entry) => entry.receive_seq === 3);
     assert.equal(forThree.length, 2, 'both attempts were spilled rather than dropped');

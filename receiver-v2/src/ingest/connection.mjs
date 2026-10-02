@@ -34,6 +34,36 @@ const PENDING = 'pending';
 const ACKNOWLEDGED = 'acknowledged';
 const FAILED = 'failed';
 
+/**
+ * A copy of one subscription's record, nested data included.
+ *
+ * The record is what the connection believes about a subscription, and a caller that reads the map
+ * must not be able to edit that belief: editing `subscriptions.get(key).state` used to edit the
+ * connection's own memory (the map was copied, its values were not), and the next subscription message
+ * recomputed the whole link's state from the edited value. Anything that is not plain data - a buffer,
+ * an error, a function - is handed on as it is.
+ */
+function copySubscription(entry) {
+  const copy = {};
+  for (const [key, value] of Object.entries(entry)) copy[key] = copySubscriptionValue(value);
+  return copy;
+}
+
+function copySubscriptionValue(value) {
+  if (Array.isArray(value)) return value.map(copySubscriptionValue);
+  if (value instanceof Map) {
+    return new Map([...value].map(([key, nested]) => [key, copySubscriptionValue(nested)]));
+  }
+  if (value instanceof Set) return new Set([...value].map((nested) => copySubscriptionValue(nested)));
+  if (value !== null && typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, copySubscriptionValue(nested)]));
+    }
+  }
+  return value;
+}
+
 export function createReceiveConnection({
   adapter,
   market,
@@ -76,6 +106,15 @@ export function createReceiveConnection({
   let closed = false;
   let state = 'idle';
   const subscriptions = new Map();
+
+  /**
+   * The subscriptions as a caller may see them: every record a copy, so a caller that edits what it was
+   * handed changes nothing the connection computes from. Used by the read view and by the notification
+   * hook alike, because the two must not disagree about what a caller can reach.
+   */
+  function snapshotSubscriptions() {
+    return new Map([...subscriptions].map(([key, entry]) => [key, copySubscription(entry)]));
+  }
 
   function setState(next, detail = '') {
     if (state === next) return;
@@ -211,7 +250,7 @@ export function createReceiveConnection({
         : [...subscriptions.values()].some((s) => s.state === FAILED)
           ? FAILED
           : PENDING;
-      onSubscriptions({ market, generation, state: subscriptionState, subscriptions: new Map(subscriptions) });
+      onSubscriptions({ market, generation, state: subscriptionState, subscriptions: snapshotSubscriptions() });
       setState(subscriptionState === ACKNOWLEDGED ? 'subscribed' : 'awaiting-subscription');
       return;
     }
@@ -414,7 +453,7 @@ export function createReceiveConnection({
       return subscriptionState;
     },
     get subscriptions() {
-      return new Map(subscriptions);
+      return snapshotSubscriptions();
     },
   };
 }

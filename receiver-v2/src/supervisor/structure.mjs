@@ -632,6 +632,32 @@ export function createStructure({
       descriptor.get ? { get: () => connection[name], enumerable: true } : descriptor,
     );
   }
+  // What a caller is handed for the spool: the reads only. Appending, advancing the cursor past a
+  // record, syncing and closing are how the structure drives it, and they stay in this module's own
+  // closure - an advance from outside deletes the segments behind the position it names, and with
+  // them frames nobody has delivered yet. The reads return copies already (a segment list, a cursor,
+  // freshly decoded envelopes), so editing what was handed over changes nothing either.
+  const spoolView =
+    spool === null
+      ? null
+      : {
+          get bytes() {
+            return spool.bytes;
+          },
+          get segments() {
+            return spool.segments;
+          },
+          get cursor() {
+            return spool.cursor;
+          },
+          get isOverBound() {
+            return spool.isOverBound;
+          },
+          get failed() {
+            return spool.failed;
+          },
+          drain: (...args) => spool.drain(...args),
+        };
 
   /**
    * The same acceptance as a caller's, reached from the connection's own announcement. It is one
@@ -804,7 +830,7 @@ export function createStructure({
     book: bookView,
     organizer: organizerView,
     ledger: ledgerView,
-    spool,
+    spool: spoolView,
     start: () => {
       // A structure that has stopped does not start again by being asked to: reception was closed because the
       // frames could not be handled, and reopening the socket would deliver frames this structure can only

@@ -38,7 +38,10 @@ const envelope = (seq, { connectionId = 'conn-1', generation = 1, payload, meta 
     ...(meta ? { meta } : {}),
   });
 
-function build(store, { written = [], onRawWrite = null, onAck = () => {}, onStop = () => {} } = {}) {
+function build(
+  store,
+  { written = [], rawWriter = null, spoolDir = null, onRawWrite = null, onAck = () => {}, onStop = () => {} } = {},
+) {
   const holder = {};
   const structure = createStructure({
     market: 'kraken_spot',
@@ -55,14 +58,19 @@ function build(store, { written = [], onRawWrite = null, onAck = () => {}, onSto
       },
     },
     durability: store,
+    spoolDir,
     webSocketImpl: function fakeSocket() {
       return { url: '', onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
     },
-    rawWriter: (frame) => {
-      written.push(`${frame.connection_id}:${frame.receive_seq}`);
-      if (onRawWrite) onRawWrite(frame, holder.structure);
-      return true;
-    },
+    // A test that needs the raw to refuse (so a frame is spilled) or to watch the writer itself
+    // replaces it; the default writes every frame down once and takes it.
+    rawWriter:
+      rawWriter ??
+      ((frame) => {
+        written.push(`${frame.connection_id}:${frame.receive_seq}`);
+        if (onRawWrite) onRawWrite(frame, holder.structure);
+        return true;
+      }),
     onAck,
     onGap: () => {},
     onStop,
@@ -687,43 +695,48 @@ test('the recovery a new structure runs holds the store while it runs', async ()
 });
 
 test('an open that fails frees the file only if its handle really closed', async () => {
-  await withStore(async (dir) => {
-    const { DatabaseSync } = await import('node:sqlite');
-    const path = join(dir, 'state.sqlite');
-    let refusals = 1;
-    class FlakyClose extends DatabaseSync {
-      close() {
-        if (refusals-- > 0) throw new Error('close refused');
-        return super.close();
-      }
+  // Not `withStore`: the second half of this test leaves its file held on purpose, and removing the
+  // directory would free the file's inode - a later store in this process can be handed that inode and
+  // then be refused by a handle that is already gone, because the store's identity is the file itself,
+  // not its name. The directory is kept until the process ends, when every handle is being torn down.
+  const dir = await mkdtemp(join(tmpdir(), 'reentry-held-'));
+  const { rmSync } = await import('node:fs');
+  process.once('exit', () => rmSync(dir, { recursive: true, force: true }));
+  const { DatabaseSync } = await import('node:sqlite');
+  const path = join(dir, 'state.sqlite');
+  let refusals = 1;
+  class FlakyClose extends DatabaseSync {
+    close() {
+      if (refusals-- > 0) throw new Error('close refused');
+      return super.close();
     }
-    const failingClock = () => {
-      throw new Error('the clock failed');
-    };
-    // The close refuses once: the retry closes it, so the file is free again.
-    assert.throws(
-      () => openDurability({ path, runId: 'run-1', Database: FlakyClose, nowMs: failingClock }),
-      /the clock failed/,
-    );
-    const afterwards = openDurability({ path, runId: 'run-2' });
-    afterwards.close();
+  }
+  const failingClock = () => {
+    throw new Error('the clock failed');
+  };
+  // The close refuses once: the retry closes it, so the file is free again.
+  assert.throws(
+    () => openDurability({ path, runId: 'run-1', Database: FlakyClose, nowMs: failingClock }),
+    /the clock failed/,
+  );
+  const afterwards = openDurability({ path, runId: 'run-2' });
+  afterwards.close();
 
-    // The close never succeeds: the file stays held rather than admitting a handle over a live connection.
-    class NeverCloses extends DatabaseSync {
-      close() {
-        throw new Error('never closes');
-      }
+  // The close never succeeds: the file stays held rather than admitting a handle over a live connection.
+  class NeverCloses extends DatabaseSync {
+    close() {
+      throw new Error('never closes');
     }
-    assert.throws(
-      () => openDurability({ path, runId: 'run-3', Database: NeverCloses, nowMs: failingClock }),
-      /the clock failed/,
-    );
-    assert.throws(
-      () => openDurability({ path, runId: 'run-4' }),
-      (error) => error.code === 'REENTRANT_OPERATION',
-      'the file is still held',
-    );
-  });
+  }
+  assert.throws(
+    () => openDurability({ path, runId: 'run-3', Database: NeverCloses, nowMs: failingClock }),
+    /the clock failed/,
+  );
+  assert.throws(
+    () => openDurability({ path, runId: 'run-4' }),
+    (error) => error.code === 'REENTRANT_OPERATION',
+    'the file is still held',
+  );
 });
 
 test('a module takes the right and the transactions from the wiring, never from what it is handed', async () => {
@@ -1224,7 +1237,7 @@ test('the views a caller is handed cannot change what the structure is doing', a
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
     store.beginRun();
     const written = [];
-    const structure = build(store, { written });
+    const structure = build(store, { written, spoolDir: join(dir, 'spool') });
     structure.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
     structure.feed(envelope(1));
 
@@ -1266,6 +1279,179 @@ test('the views a caller is handed cannot change what the structure is doing', a
     const second = structure.feed(envelope(2));
     assert.equal(second.applied, true, 'the next frame is processed normally');
     assert.deepEqual(written, ['conn-1:1', 'conn-1:2'], 'and reaches the raw once each');
+
+    // The spool is handed over as reads only: appending, advancing the cursor, syncing and closing are
+    // the structure's own operations. A cursor a caller could advance deletes the segments behind the
+    // position it names, and with them frames nobody has delivered yet.
+    for (const name of ['append', 'advance', 'close', 'sync']) {
+      assert.equal(structure.spool[name], undefined, `spool.${name} is a change operation and is not handed out`);
+    }
+    assert.equal(typeof structure.spool.drain, 'function', 'while what is waiting stays readable');
+
+    // Replacing a name on a view is a change to the caller's own copy, not to the structure: the frame
+    // that follows goes through the parts themselves, not through the view.
+    structure.book.openGaps = () => [{ side: 'bid', price: 0, size: 0 }];
+    structure.organizer.currentAck = () => null;
+    structure.ledger.pending = () => [];
+    const third = structure.feed(envelope(3));
+    assert.equal(third.applied, true, 'a replaced view name is not the structure s route');
+    assert.equal(structure.stats.gaps, 0, 'and the structure does not read its gaps through it');
+    assert.equal(structure.book.board.size('bid', 103), 3, 'the frame reached the board');
+    assert.deepEqual(written, ['conn-1:1', 'conn-1:2', 'conn-1:3'], 'and the raw was asked once for it');
+    store.close();
+  });
+});
+
+test('the spool a caller is handed holds no way to take a frame out of it', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    // A name that describes its own identity, because what the spool holds is read back as a frame.
+    const connectionId = 'run-1:kraken:kraken_spot:1';
+    const structure = build(store, {
+      spoolDir: join(dir, 'spool'),
+      rawWriter: () => false, // the raw refuses, so the frame is spilled rather than written
+    });
+    structure.accept(connectionId, { runId: 'run-1', generation: 1, firstSeq: 1 });
+    const spilled = structure.feed(envelope(1, { connectionId }));
+    assert.equal(spilled.spooled, true, 'the raw refused and the spool took the frame');
+    assert.equal(structure.stats.spooledFrames, 1);
+
+    // The view carries the reads...
+    for (const name of ['bytes', 'segments', 'cursor', 'isOverBound', 'failed']) {
+      assert.notEqual(structure.spool[name], undefined, `spool.${name} stays readable`);
+    }
+    assert.equal(structure.spool.bytes > 0, true, 'and the frame is in it');
+
+    // ...and none of the change operations the spool itself has. `advance` is the one that drops
+    // undelivered frames: it deletes the segments behind the position it names.
+    for (const name of ['append', 'advance', 'close', 'sync']) {
+      assert.equal(structure.spool[name], undefined, `spool.${name} is a change operation and is not handed out`);
+    }
+
+    // What a read returns is a copy: editing it changes nothing.
+    const segments = structure.spool.segments;
+    segments.push({ name: 'segment-9999999999.spool', index: 9_999_999_999, bytes: 0 });
+    assert.equal(structure.spool.segments.length, 1, 'a segment pushed onto a copy is not a segment');
+    const cursor = structure.spool.cursor;
+    cursor.segment = 9_999_999_999;
+    assert.equal(structure.spool.cursor.segment, null, 'and a cursor edited on a copy is not the cursor');
+
+    // The reviewer s sequence: advance the public spool past everything waiting. The view holds no such
+    // operation, so the frame nobody has delivered is still there to read.
+    const waiting = () => [...structure.spool.drain()].filter((entry) => entry && typeof entry === 'object');
+    assert.equal(waiting().length, 1, 'the spilled frame is readable through the view');
+    structure.spool.advance?.({ segment: 9_999_999_999, offset: 0 });
+    assert.equal(waiting().length, 1, 'and nothing reachable from the view advances past it');
+
+    // The wiring keeps the real spool: the change operations live on the internal side only.
+    assert.equal(typeof partsOf(structure).spool.advance, 'function', 'the structure still owns the real spool');
+    store.close();
+  });
+});
+
+test('a name a caller replaces on the structure is not the route its own re-delivery takes', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const structure = build(store, { written });
+    structure.accept('conn-1', { runId: 'run-1', generation: 1 });
+    // A frame the raw takes and the board cannot anchor yet: exactly the state an accept offers again.
+    const held = structure.feed(envelope(1, { meta: null }));
+    assert.equal(held.durable, true, 'the raw took the frame');
+    assert.equal(held.applied, false, 'and the board has nothing to anchor it to yet');
+    assert.equal(structure.stats.owed, 1, 'so it waits as an owed frame');
+
+    // Every public change operation is replaced with a function that would leave the frame undelivered.
+    const calls = [];
+    const original = {};
+    for (const name of ['feed', 'accept', 'redeliverPending', 'resume', 'start', 'stop', 'close']) {
+      original[name] = structure[name];
+      structure[name] = () => {
+        calls.push(name);
+        return { replaced: name };
+      };
+    }
+
+    // The accept that completes the origin offers the owed frame again - internally, through the
+    // closed-over route, not through the name a caller replaced.
+    const accepted = original.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    assert.equal(accepted.accepted, true, 'the completion went through the real route');
+    assert.deepEqual(calls, [], 'no replaced name was the structure s route');
+    assert.equal(structure.book.appliedBoundary.upToSeq, 1, 'the re-delivered frame reached the board');
+    assert.equal(structure.stats.owed, 0, 'and stopped being owed');
+    const next = original.feed(envelope(2));
+    assert.equal(next.applied, true, 'the next frame is processed normally');
+    assert.deepEqual(calls, [], 'still through the structure s own route');
+    assert.deepEqual(written, ['conn-1:1', 'conn-1:2'], 'the raw was asked once per frame');
+
+    // And the replacement is the caller's own function, which only the caller calls.
+    assert.deepEqual(structure.feed(envelope(3)), { replaced: 'feed' }, 'a direct call reaches the replacement');
+    assert.deepEqual(calls, ['feed'], 'which the structure s own operations never did');
+    store.close();
+  });
+});
+
+test('the subscription map a caller reads is a copy, so editing it changes nothing', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const sockets = [];
+    const handed = [];
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      durability: store,
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: (raw) => JSON.parse(raw),
+      },
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: () => true,
+      onSubscriptions: (info) => handed.push(info),
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    sockets[0].onopen?.();
+    const deliver = (body) => sockets[0].onmessage?.({ data: JSON.stringify(body) });
+
+    // One acknowledged subscription carries nested data, so the copy is tested at depth too.
+    deliver({ kind: 'subscription', key: 'a', ok: true, detail: { code: 'ok' } });
+    assert.equal(structure.connection.subscriptionState, 'acknowledged', 'a is acknowledged');
+
+    const read = structure.connection.subscriptions;
+    read.get('a').state = 'failed';
+    read.get('a').detail.code = 'edited';
+    assert.equal(structure.connection.subscriptions.get('a').state, 'acknowledged', 'the connection still has a acknowledged');
+    assert.equal(structure.connection.subscriptions.get('a').detail.code, 'ok', 'and its nested data is its own');
+
+    // The reviewer s sequence: edit what was handed over, then let b succeed. The state the connection
+    // computes must come from its own records, not from the copy a caller holds.
+    deliver({ kind: 'subscription', key: 'b', ok: true });
+    assert.equal(structure.connection.subscriptionState, 'acknowledged', 'b s success does not read a as failed');
+    assert.equal(structure.connection.subscriptions.get('a').state, 'acknowledged', 'and a is still acknowledged');
+
+    // The map a caller's hook is handed follows the same rule, at depth too.
+    const fromHook = handed.at(-1).subscriptions;
+    fromHook.get('b').state = 'failed';
+    fromHook.get('a').detail.code = 'edited';
+    deliver({ kind: 'subscription', key: 'c', ok: true });
+    assert.equal(structure.connection.subscriptions.get('b').state, 'acknowledged', 'a hook that edits its copy changes nothing');
+    assert.equal(structure.connection.subscriptions.get('a').detail.code, 'ok', 'nor anything nested in it');
+    assert.equal(structure.connection.subscriptionState, 'acknowledged', 'nor the state the connection computes');
+    structure.stop();
     store.close();
   });
 });
@@ -1323,14 +1509,20 @@ test('nothing a caller supplies is handed the store, a part, or a private route'
       written: [],
       onAck: (...args) => record('onAck', ...args),
     });
-    // The hooks a caller supplies: what they receive is data, never the store, a part, or a route.
+    // The hooks a caller supplies: what they receive is data, never the store, a part, or a route. The
+    // connection's own observations are among them, because the socket is driven here too. The raw
+    // writer takes the frame (`true`), so reception carries on and the socket really opens.
     const hooks = [
-      ['rawWriter', (...args) => record('rawWriter', ...args)],
+      ['rawWriter', (...args) => { record('rawWriter', ...args); return true; }],
       ['onAck', (...args) => record('onAck', ...args)],
       ['onGap', (...args) => record('onGap', ...args)],
       ['onStop', (...args) => record('onStop', ...args)],
       ['onDiagnostic', (...args) => record('onDiagnostic', ...args)],
+      ['onState', (...args) => record('onState', ...args)],
+      ['onSubscriptions', (...args) => record('onSubscriptions', ...args)],
     ];
+    const sockets = [];
+    const connectionId = 'run-1:kraken:kraken_spot:1';
     const second = createStructure({
       market: 'kraken_spot',
       stream: 'trades',
@@ -1340,33 +1532,97 @@ test('nothing a caller supplies is handed the store, a part, or a private route'
       adapter: {
         url: 'ws://venue.test/ws',
         stream: 'trades',
-        parse: () => ({ kind: 'data' }),
+        // A subscription on the socket reaches the observation hooks; a plain frame is data.
+        parse: (raw) => {
+          const parsed = JSON.parse(raw);
+          return parsed.kind ? parsed : { kind: 'data' };
+        },
         changesFor: () => [],
       },
       webSocketImpl: function fakeSocket(url) {
-        return { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        sockets.push(socket);
+        return socket;
       },
       rawWriter: hooks[0][1],
       onAck: hooks[1][1],
       onGap: hooks[2][1],
       onStop: hooks[3][1],
       onDiagnostic: hooks[4][1],
+      onState: hooks[5][1],
+      onSubscriptions: hooks[6][1],
     });
-    second.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
-    second.feed(envelope(1));
-    second.close();
+    // The connection is named before reception starts, so the announcement start() makes is the
+    // connection the board already holds - and the socket it opens is driven here.
+    second.accept(connectionId, { runId: 'run-1', generation: 1, firstSeq: 1 });
+    second.feed(envelope(1, { connectionId }));
+    second.start();
+    sockets[0].onopen?.();
+    sockets[0].onmessage?.({ data: JSON.stringify({ kind: 'subscription', key: 'a', ok: true, detail: { code: 'ok' } }) });
 
     assert.ok(seen.length > 0, 'the hooks were called');
-    const forbidden = [store, second, second.book, second.organizer, second.ledger, second.connection];
-    for (const { label, args } of seen) {
-      for (const argument of args) {
-        assert.equal(
-          forbidden.includes(argument),
-          false,
-          `${label} was handed the store, a part, or a connection`,
-        );
+
+    // Nothing reachable from an argument - at any depth, not only the top level - is the store, a part,
+    // a view, a private route, or a function: a nested object carries whatever it closes over.
+    const internals = [internalsOf(second), internalsOf(store)];
+    const forbidden = new Set([
+      store,
+      second,
+      second.book,
+      second.organizer,
+      second.ledger,
+      second.connection,
+      second.spool,
+      ...internals.flatMap((part) => Object.values(part)),
+    ]);
+    const reachable = new Set();
+    const functions = [];
+    const visit = (value, path) => {
+      if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return;
+      if (reachable.has(value)) return;
+      reachable.add(value);
+      assert.equal(forbidden.has(value), false, `${path} reaches the store, a part, or a private route`);
+      if (typeof value === 'function') {
+        functions.push({ path, fn: value });
+        return; // a function's own properties are the caller's business, not this check's
       }
+      if (value instanceof Map) {
+        for (const [key, nested] of value) {
+          visit(key, `${path}.key`);
+          visit(nested, `${path}[${String(key)}]`);
+        }
+        return;
+      }
+      if (value instanceof Set) {
+        for (const nested of value) visit(nested, `${path}[]`);
+        return;
+      }
+      if (Buffer.isBuffer(value)) return; // the frame's own bytes
+      for (const key of Object.keys(value)) visit(value[key], `${path}.${key}`);
+    };
+    for (const { label, args } of seen) {
+      for (const [index, argument] of args.entries()) visit(argument, `${label}[${index}]`);
     }
+
+    // A function inside an argument is a capability the caller can call: calling it must run no internal
+    // operation. Both halves matter - the state a call changed, and the contract that, together with the
+    // walk above, none is handed over at all.
+    const before = JSON.stringify({ stats: second.stats, boundary: second.book.appliedBoundary });
+    for (const { path, fn } of functions) {
+      try {
+        fn();
+      } catch {
+        // A function that wants its own arguments before it does anything has performed nothing here.
+      }
+      assert.equal(
+        JSON.stringify({ stats: second.stats, boundary: second.book.appliedBoundary }),
+        before,
+        `calling ${path} ran an internal operation`,
+      );
+    }
+    assert.deepEqual(functions.map(({ path }) => path), [], 'no function is reachable from what a caller is handed');
+    // The checks run while the structure is still alive (its stats are read above), and ended after them.
+    second.close();
     store.close();
   });
 });
