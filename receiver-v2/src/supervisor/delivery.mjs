@@ -101,9 +101,12 @@ function openDeliveryLedgerWithin(options, wiring) {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   // A state change, never a re-insert: an entry's place in the queue is where its frame arrived, and a
-  // frame confirmed late must not be delivered last because of it.
+  // frame confirmed late must not be delivered last because of it. A decided loss is not a state to move
+  // from: confirmation is a fact about the raw, and no path - a resend, a second record, a hand-opened
+  // ledger - may resurrect a frame whose fate is already written down.
   const confirmStatement = wiring.db.prepare(
-    'UPDATE delivery_ledger SET state = ? WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ?',
+    `UPDATE delivery_ledger SET state = ?
+      WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ? AND state <> 'skipped'`,
   );
   // A decision, never a removal: a frame that will never be applied stays in the ledger as the record of
   // that loss, and the first decision keeps the row - a state that is already `skipped` changes nothing.
@@ -189,7 +192,10 @@ function openDeliveryLedgerWithin(options, wiring) {
     return { recorded: result.changes === 1 };
   }
 
-  /** The raw holds this frame now. Called inside the transaction that claims it durable. */
+  /**
+   * The raw holds this frame now. Called inside the transaction that claims it durable. A loss already
+   * decided does not move: the confirmation is about the raw, and the decision about the frame stands.
+   */
   function confirm(envelope) {
     const result = confirmStatement.run(OWED, market, stream, envelope.connection_id, envelope.receive_seq);
     return { confirmed: result.changes };

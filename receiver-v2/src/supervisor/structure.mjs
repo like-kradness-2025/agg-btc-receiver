@@ -658,6 +658,9 @@ export function createStructure({
     get appliedBoundary() {
       return { ...book.appliedBoundary };
     },
+    get ownerEstablished() {
+      return book.ownerEstablished;
+    },
     resumeFrom: () => copyEntry(book.resumeFrom()),
     retiredRuns: () => copyList(book.retiredRuns()),
     openGaps: () => copyList(book.openGaps()),
@@ -816,9 +819,10 @@ export function createStructure({
       // Only what the raw is confirmed to hold: an intent is a frame the raw may not have, and delivering
       // it would put the board ahead of the canonical record.
       for (const entry of ledger.pending({ state: OWED })) {
-        if (book.appliedBoundary.connectionId === null) {
-          // Nobody has been accepted for this board yet. The frame may yet be admitted - it is not a loss
-          // and must not be recorded as one, because a report says what happened, and nothing has.
+        if (book.appliedBoundary.connectionId === null || !book.ownerEstablished) {
+          // Nobody has been accepted for this board yet, and a row that predates the ownership columns is
+          // nobody's either, whatever connection name it carries. The frame may yet be admitted - it is not
+          // a loss and must not be recorded as one, because a report says what happened, and nothing has.
           unadmittedCount += 1;
           continue;
         }

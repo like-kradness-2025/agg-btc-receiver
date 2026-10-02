@@ -536,6 +536,16 @@ function openBookWithin(options, wiring) {
       return { ...applied };
     },
 
+    /**
+     * Whether this board has an owner at all. A row that predates the ownership columns has none until an
+     * explicit accept says who it is, whatever connection name that row carries - and until then nothing
+     * may be written off as belonging to a connection that is gone, because the accept that claims the
+     * board may be the very one that admits the frames in question.
+     */
+    get ownerEstablished() {
+      return ownerEstablished;
+    },
+
     resumeFrom() {
       if (applied.connectionId === null) return null;
       return { connectionId: applied.connectionId, upToSeq: applied.upToSeq };
