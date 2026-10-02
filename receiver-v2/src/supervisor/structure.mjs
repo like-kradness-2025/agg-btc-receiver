@@ -77,7 +77,7 @@ export function createStructure({
   const store = durability ?? openDurability({ path, runId, ...(Database ? { Database } : {}) });
   durability = store;
 
-  let claimed = false;
+  let claimToken = null;
   /**
    * Run one construction step that can fail.
    *
@@ -90,9 +90,9 @@ export function createStructure({
     try {
       return step();
     } catch (error) {
-      if (claimed) {
+      if (claimToken !== null) {
         try {
-          internalsOf(durability).releaseStructureOwner({ market, stream });
+          internalsOf(durability).releaseStructureOwner({ market, stream }, claimToken);
         } catch {
           // The store cannot be reached to release; there is nothing this attempt can undo.
         }
@@ -114,8 +114,7 @@ export function createStructure({
   // pages of one store, and each claims for itself.)
   const wiring = constructing(() => {
     const internals = internalsOf(durability);
-    internals.claimStructureOwner({ market, stream });
-    claimed = true;
+    claimToken = internals.claimStructureOwner({ market, stream });
     return internals;
   });
 
@@ -124,6 +123,9 @@ export function createStructure({
   // spool, and only if the spool cannot hold it either does reception stop. (Across processes the
   // same decision is made when the channel reports a full queue.)
   let stopped = false;
+  // The terminal state: close() has completed. Nothing may act on a closed structure - its store may
+  // already serve another structure for this board, and a frame taken here would land in that other life.
+  let closed = false;
   let spooledFrames = 0;
   let refusedFrames = 0;
 
@@ -382,6 +384,11 @@ export function createStructure({
   }
 
   function feed(envelope) {
+    if (closed) {
+      // A closed structure is not a writer: its close ended it, and the board may already belong to
+      // another structure - a frame taken here would be applied into a life that is over.
+      return { accepted: false, reason: 'this structure is closed' };
+    }
     if (stopped) {
       // Reception is stopped, so anything still arriving is recorded as a hole rather than lost
       // silently or applied out of order.
@@ -504,19 +511,20 @@ export function createStructure({
     });
   }
 
-  // Every arrival from outside is handed to this executor. When the store is free the work runs now, inside
-  // one take; when an operation is running it is kept, in order, and run when that operation's own work is
-  // done - nothing is dropped, and nothing runs in the middle of a frame. A wait-list that fills up stops
-  // reception; the stop is recorded where it happens and carried out once the operation that overflowed it
-  // is over, because silence would look like a quiet stream and a notification must not come from inside a
-  // frame - the caller's own hook.
+  // Every arrival from outside is handed to this executor. When the store is free the arrival is kept like
+  // any other and the wait-list runs: what waited goes first, in order, and this arrival follows it. When
+  // an operation is running the arrival is kept and runs when that operation's own work is done - nothing
+  // is dropped, and nothing runs in the middle of a frame. A wait-list that fills up stops reception; the
+  // stop is recorded where it happens and carried out inside the executor once the work it interrupted has
+  // ended, because silence would look like a quiet stream, a notification must not come from inside a frame
+  // - the caller's own hook - and the stop's own hooks must meet the same gate as everyone else.
   const waiting = [];
   let draining = false;
   // The first arrival that did not fit, recorded but not answered for yet: the answer is a stop, and a stop
-  // called from here would be called from inside the arrival that overflowed the list.
+  // called from the arrival that overflowed the list would run inside the frame it arrived in.
   let overflowed = null;
 
-  /** The stop a full wait-list owes, carried out where the operation that overflowed it has ended. */
+  /** The stop a full wait-list owes, carried out inside the executor once the work it interrupted has ended. */
   function settleOverflow() {
     if (overflowed === null || stopped) return;
     const label = overflowed;
@@ -525,44 +533,49 @@ export function createStructure({
   }
 
   const receiveEvent = (label, work) => {
-    if (wiring.inChange() !== true) {
-      // Free: what waited - arrivals an operation that threw left behind - goes before this arrival, so
-      // nothing that was already accepted is overtaken by what came after it. Then this arrival is an
-      // operation of its own, and whatever arrived while it ran follows it. An exception from the work is
-      // the caller's to see, not this executor's to swallow.
-      let result;
+    if (wiring.inChange() === true) {
+      // An operation is running: the arrival is kept, in order, and runs when that operation's own work is
+      // done. Recorded only when it does not fit: the stop belongs to the operation this arrival arrived
+      // during, and it is carried out when that operation has finished, not from inside it.
+      if (waiting.length >= maxWaitingEvents) {
+        if (overflowed === null) overflowed = label;
+        return false;
+      }
+      waiting.push({ label, work, result: undefined });
+      return undefined;
+    }
+    // The executor is free. This arrival is kept BEFORE anything runs: what waited - the arrivals an
+    // operation that threw left behind - goes first, in order, and this arrival follows it, so nothing that
+    // was already accepted is overtaken by what came after it, and an exception from a task that goes first
+    // leaves this arrival held rather than lost. The exception still reaches the caller: the executor does
+    // not swallow it. The stop a full wait-list owes is carried out here too, inside the same take, so the
+    // hooks it calls meet the same gate as any other caller.
+    const entry = { label, work, result: undefined };
+    if (waiting.length < maxWaitingEvents) {
+      waiting.push(entry);
+    } else {
+      // A full list and a free executor: the queued work runs, and this arrival is the one that did not fit.
+      if (overflowed === null) overflowed = label;
+      entry.dropped = true;
+    }
+    return wiring.whileChange(() => {
       try {
-        result = wiring.whileChange(() => {
-          drainWaiting();
-          const outcome = work();
-          drainWaiting();
-          return outcome;
-        });
+        drainWaiting();
+        return entry.dropped === true ? false : entry.result;
       } finally {
-        // Out of the executor, the right released: a full wait-list stops reception here, where no arrival
-        // and no caller's hook is running.
         settleOverflow();
       }
-      return result;
-    }
-    if (waiting.length >= maxWaitingEvents) {
-      // Recorded only: the stop belongs to the operation this arrival arrived during, and it is carried
-      // out when that operation has finished, not from inside it.
-      if (overflowed === null) overflowed = label;
-      return false;
-    }
-    waiting.push({ label, work });
-    return undefined;
+    });
   };
-  // Runs after the operation's own work is done, and inside it: the tasks are continuations, so they take no
-  // right of their own and a task that causes another arrival queues it for the same loop.
+  // Runs inside the take that owns the work: the tasks are continuations, so they take no right of their
+  // own, and a task that causes another arrival queues it for the same loop.
   const drainWaiting = () => {
     if (draining) return;
     draining = true;
     try {
       while (waiting.length > 0) {
         const next = waiting.shift();
-        next.work();
+        next.result = next.work();
       }
     } finally {
       draining = false;
@@ -712,6 +725,9 @@ export function createStructure({
    * connection is: reception does not start.
    */
   function admitOnGeneration({ connectionId, generation, firstSeq, runId: incomingRunId }) {
+      // A closed structure admits nothing: a generation that was still waiting when close() ran must not
+      // start a reception that is over.
+      if (closed) return false;
       // Acceptance goes through the same route as a caller's accept(), so there is one behaviour rather
       // than a manual path and an automatic path that quietly differ. The generation is announced
       // before the connection's frames arrive, which is when the book needs to hear about it.
@@ -769,6 +785,7 @@ export function createStructure({
     market,
     /** Accept a connection explicitly. Frames from any other connection are refused by the book. */
     accept: (connectionId, options = {}) => {
+      if (closed) return { accepted: false, reason: 'this structure is closed' };
       // A caller may not hand this board to another run by asking: that authorisation is issued where
       // reception actually starts, from the board's own recorded owner and the run that is running here.
       const { takeover: _ignoredTakeover, ...callerOptions } = options;
@@ -780,6 +797,7 @@ export function createStructure({
      * failed attempt costs nothing and the difference between the raw and the board remains visible.
      */
     redeliverPending: () => {
+      if (closed) return { applied: 0, refused: true, reason: 'this structure is closed' };
       // Three answers, kept apart on purpose: what reached the board, what the board is holding until
       // a hole is filled, and what will never apply because the connection it belongs to is gone. The
       // previous version called the second one "redelivered" and threw the third one away, which is
@@ -835,6 +853,7 @@ export function createStructure({
      * longer its own) stays owed, which is exactly what the store is for.
      */
     resume: () => {
+      if (closed) return { delivered: 0, refused: true, reason: 'this structure is closed' };
       // What the raw is confirmed to hold goes first, and it is not a matter of taste: those frames are what
       // tells the board where this connection's numbering can start (a frame it has been handed fixes the
       // ceiling, §2.2). An intent re-decided before them could carry a start declaration above a frame the
@@ -878,6 +897,7 @@ export function createStructure({
     ledger: ledgerView,
     spool: spoolView,
     start: () => {
+      if (closed) return { started: false, reason: 'this structure is closed' };
       // A structure that has stopped does not start again by being asked to: reception was closed because the
       // frames could not be handled, and reopening the socket would deliver frames this structure can only
       // refuse - the state is what says so, not the socket. Restarting is a new process with a new run.
@@ -893,11 +913,15 @@ export function createStructure({
       return connection.start();
     },
     stop: () => {
+      if (closed) return;
       connection.stop();
       spool?.close();
     },
     /** The termination of the structure: reception, the spool, and the store it opened itself. */
     close: () => {
+      // Once: a closed structure has ended, and a close called again must not reach anything a later
+      // structure holds - the board given back by the first close may already belong to another one.
+      if (closed) return;
       // The structure ends the store it opened itself; a store a caller handed in is the caller's to end -
       // the structure stops using it and gives its board back. Reception first, and the file is free only
       // after the close that succeeded.
@@ -908,9 +932,10 @@ export function createStructure({
         // without a second take.
         wiring.close();
       }
-      // The board is given back last: a close that failed can be tried again, and until it succeeds the
-      // board is still this structure's.
-      wiring.releaseStructureOwner({ market, stream });
+      closed = true;
+      // The board is given back last, and only the claim that made it: a close that failed can be tried
+      // again, and until it succeeds the board is still this structure's.
+      wiring.releaseStructureOwner({ market, stream }, claimToken);
     },
     /** A frame handed in directly, for a replay adapter or a dry run. */
     feed,

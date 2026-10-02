@@ -1961,3 +1961,171 @@ test('a wait-list that overflows closes the socket and stops outside the frame, 
     store.close();
   });
 });
+
+test('the stop a full wait-list owes runs inside the gate, so its own hook is refused', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const sockets = [];
+    let attempted;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      maxWaitingEvents: 1,
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() { this.closes = (this.closes ?? 0) + 1; } };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(frame.receive_seq);
+        if (written.length === 1) {
+          // One slot is the whole wait-list: B fills it, C overflows it, and the stop it owes is carried
+          // out when the frame has ended.
+          sockets[0].onmessage?.({ data: JSON.stringify({ seq: 2, size: 2 }) });
+          sockets[0].onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) });
+        }
+        return true;
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {
+        // The stop's own hook is a caller's hook like any other: a change operation attempted from it runs
+        // while the stop is being carried out, inside the executor, and is refused there.
+        attempted = structure.accept('run-1:kraken:kraken_spot:2', { runId: 'run-1', generation: 2 });
+      },
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    sockets[0].onopen?.();
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 1, size: 1 }) });
+
+    assert.equal(structure.stats.stopped, true, 'the wait-list overflow stopped reception');
+    assert.ok(attempted, 'the stop hook ran');
+    assert.equal(attempted.accepted, false, 'and the connection it tried to admit was refused');
+    assert.equal(attempted.code, 'REENTRANT_OPERATION', 'as a re-entrant change operation');
+    assert.equal(
+      structure.book.appliedBoundary.generation,
+      1,
+      'so the generation it tried to admit never reached the board',
+    );
+    structure.close();
+    store.close();
+  });
+});
+
+test('a frame that arrived while a failed task waits is still kept, and runs in its turn', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const sockets = [];
+    let fired = false;
+    const structure = createStructure({
+      market: 'kraken_spot',
+      stream: 'trades',
+      runId: 'run-1',
+      venue: 'kraken',
+      adapter: {
+        url: 'ws://venue.test/ws',
+        stream: 'trades',
+        parse: () => ({ kind: 'data' }),
+        changesFor: (frame) => [{ side: 'bid', price: 100, size: JSON.parse(frame.raw.toString('utf8')).size }],
+      },
+      durability: store,
+      webSocketImpl: function fakeSocket(url) {
+        const socket = { url, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        sockets.push(socket);
+        return socket;
+      },
+      rawWriter: (frame) => {
+        written.push(JSON.parse(frame.raw.toString('utf8')).size);
+        return true;
+      },
+      onState: ({ state }) => {
+        if (state === 'subscribing' && !fired) {
+          fired = true;
+          // A failure event arrives from inside the open processing, and then this hook throws: the event
+          // is kept for its turn, ahead of whatever arrives next.
+          sockets[0].onerror?.(new Error('socket failure'));
+          throw new Error('open failure');
+        }
+      },
+      onFailure: () => {
+        throw new Error('the kept failure');
+      },
+      onAck: () => {},
+      onGap: () => {},
+      onStop: () => {},
+      onDiagnostic: () => {},
+    });
+
+    structure.start();
+    assert.throws(() => sockets[0].onopen?.(), /open failure/, 'the exception reached the caller');
+    assert.deepEqual(written, [], 'nothing ran while the failure was in the air');
+    assert.throws(
+      () => sockets[0].onmessage?.({ data: JSON.stringify({ seq: 3, size: 3 }) }),
+      /the kept failure/,
+      'the kept failure event runs first, and its exception reaches this caller',
+    );
+    assert.deepEqual(written, [], 'and the frame that arrived in the same turn is kept, not lost');
+    sockets[0].onmessage?.({ data: JSON.stringify({ seq: 4, size: 4 }) });
+    assert.deepEqual(written, [3, 4], 'the kept frame ran in its turn, before the later one');
+    store.close();
+  });
+});
+
+test('a closed structure writes nothing, and its close is once', async () => {
+  await withStore(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    store.beginRun();
+    const written = [];
+    const first = build(store, { written });
+    first.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    first.close();
+
+    // The board is free again, and the structure that closed is not a writer any more: the same frame,
+    // fed into it, is refused and never reaches the raw.
+    const second = build(store, { written });
+    second.accept('conn-1', { runId: 'run-1', generation: 1, firstSeq: 1 });
+    assert.equal(second.feed(envelope(1)).applied, true, 'the new structure took the board');
+    assert.deepEqual(first.feed(envelope(1)), { accepted: false, reason: 'this structure is closed' });
+    assert.deepEqual(first.accept('conn-9', { runId: 'run-1', generation: 9 }), {
+      accepted: false,
+      reason: 'this structure is closed',
+    });
+    assert.deepEqual(first.start(), { started: false, reason: 'this structure is closed' });
+    assert.deepEqual(first.resume(), { delivered: 0, refused: true, reason: 'this structure is closed' });
+    assert.deepEqual(first.redeliverPending(), { applied: 0, refused: true, reason: 'this structure is closed' });
+    assert.deepEqual(written, ['conn-1:1'], 'nothing the closed structure was asked to do reached the raw');
+    assert.equal(second.stats.applied, 1, 'and the board it no longer holds is untouched by it');
+
+    // A close that runs again is a no-op: the board given back by the first close now belongs to the
+    // second structure, and neither a repeated close nor a release that does not hold the claim may free it.
+    first.close();
+    assert.throws(
+      () => build(store, {}),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'the second structure kept the board through the first one s repeated close',
+    );
+    internalsOf(store).releaseStructureOwner({ market: 'kraken_spot', stream: 'trades' }, {});
+    assert.throws(
+      () => build(store, {}),
+      (error) => error.code === 'REENTRANT_OPERATION',
+      'and through a release that is not the claim s own',
+    );
+    second.close();
+    store.close();
+  });
+});

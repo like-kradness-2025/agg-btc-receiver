@@ -136,11 +136,11 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   let registered = false;
   let closed = false;
   const right = { busy: false };
-  // The boards a structure serves from this store. A second structure over the same board in the same
-  // store would share its position and outlive the first close, so it is refused; boards that differ
-  // are separate pages of one store (the tables are keyed by the board) and claim separately. The claim
-  // lives in this closure, so every wrapper of the store carries the same one.
-  const structureOwners = new Set();
+  // The boards a structure serves from this store, and the claim each one carries. A second structure over
+  // the same board in the same store would share its position and outlive the first close, so it is
+  // refused; boards that differ are separate pages of one store (the tables are keyed by the board) and
+  // claim separately. The claims live in this closure, so every wrapper of the store carries the same ones.
+  const structureOwners = new Map();
   try {
     db = new Database(dbPath);
 
@@ -469,10 +469,15 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
         error.code = REENTRANT_OPERATION;
         throw error;
       }
-      structureOwners.add(board);
+      // What was claimed is identified by this token: only the claim that made it can give it back, so a
+      // close that runs again can never free a board the structure no longer holds.
+      const token = {};
+      structureOwners.set(board, token);
+      return token;
     },
-    releaseStructureOwner({ market, stream }) {
-      structureOwners.delete(JSON.stringify([market, stream]));
+    releaseStructureOwner({ market, stream }, token) {
+      const board = JSON.stringify([market, stream]);
+      if (structureOwners.get(board) === token) structureOwners.delete(board);
     },
   });
   return exported;
