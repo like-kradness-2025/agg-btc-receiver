@@ -27,6 +27,12 @@ import { FRAME_MAX_BYTES, createFrameDecoder, decodeEnvelope, encodeEnvelope, fr
 export const DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_FSYNC_MS = 1000;
 export const DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+/**
+ * The second half of the bound: the spec says the spool may hold the earlier of 5% of the
+ * filesystem's free space or the fixed ceiling, so the free-space share is what keeps a nearly
+ * full disk from being filled by the spool before anyone notices.
+ */
+export const FREE_SPACE_FRACTION = 0.05;
 
 /** Envelopes are written length-prefixed so a torn tail is detected rather than parsed. */
 const RECORD_OVERHEAD = 4;
@@ -65,10 +71,26 @@ export function createSpool(options = {}) {
     fsModule = fs,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
+    freeSpace = null,
   } = options;
   if (!dir) throw new TypeError('spool needs a directory');
 
   fsModule.mkdirSync(dir, { recursive: true });
+
+  // How much the filesystem still has free, injected so the bound can be forced without filling a
+  // disk. The default is a real reading of the spool's own filesystem; a filesystem that will not
+  // answer is not reported as full (which would refuse every record) - the fixed ceiling still
+  // applies, and the caller is never stopped over a number this process could not read.
+  const readFreeSpace =
+    freeSpace ??
+    (() => {
+      try {
+        const stat = fsModule.statfsSync(dir);
+        return stat.bavail * stat.bsize;
+      } catch {
+        return Number.POSITIVE_INFINITY;
+      }
+    });
 
   let segments = readDirNames(dir)
     .map((name) => ({ name, index: segmentIndexOf(name) }))
@@ -129,6 +151,50 @@ export function createSpool(options = {}) {
   }
 
   /**
+   * The effective bound, recomputed before each record: the earlier of the fixed ceiling and 5% of
+   * what the filesystem still has free. It is read per append rather than once, because the free
+   * space is what the spool is consuming and a reading taken at construction says nothing about now.
+   */
+  function allowedBytes() {
+    const free = readFreeSpace();
+    const bySpace = Number.isFinite(free) ? Math.floor(free * FREE_SPACE_FRACTION) : Infinity;
+    return Math.min(maxBytes, bySpace);
+  }
+
+  /**
+   * The segment a new record may land in.
+   *
+   * The cursor is the consumer's confirmed position, and its file is released once the consumer has
+   * moved past a whole segment. Writing into a segment the cursor has already left would put bytes
+   * behind the consumer that it will never read - so the active segment is moved forward to meet the
+   * cursor, and a record arriving after a complete drain starts a fresh segment at that position.
+   */
+  function ensureWritable() {
+    if (current === null) {
+      const index = cursor.segment !== null && cursor.offset === 0 ? cursor.segment : 1;
+      current = { name: segmentName(index), index, bytes: 0 };
+      segments.push(current);
+      return;
+    }
+    if (cursor.segment !== null && current.index < cursor.segment) {
+      // This segment lies entirely behind the confirmed position; advance() has removed its file, and a
+      // handle still open to it would write into an inode nothing can name. Close it before moving on, so
+      // the next record opens the new segment rather than appending to a file that is already gone.
+      if (handle) {
+        try {
+          fsModule.closeSync(handle);
+        } catch {
+          /* already closed */
+        }
+        handle = null;
+      }
+      const index = cursor.segment;
+      current = { name: segmentName(index), index, bytes: 0 };
+      segments.push(current);
+    }
+  }
+
+  /**
    * Append one envelope.
    *
    * Returns false when the record would take the spool past its bound. False is a stop signal for
@@ -140,11 +206,8 @@ export function createSpool(options = {}) {
     if (record.length > FRAME_MAX_BYTES) {
       throw new RangeError('a single record exceeds the frame limit');
     }
-    if (current === null) {
-      current = { name: segmentName(1), index: 1, bytes: 0 };
-      segments.push(current);
-    }
-    if (bytes + record.length > maxBytes) return false;
+    ensureWritable();
+    if (bytes + record.length > allowedBytes()) return false;
     rotateIfNeeded(record.length);
     const file = openCurrent();
     // A write can be short - a full disk, an interrupted syscall - and treating that as a complete
@@ -218,6 +281,67 @@ export function createSpool(options = {}) {
   }
 
   /**
+   * Read every record from the cursor onwards, oldest segment first, each with the position to resume
+   * from after it.
+   *
+   * drain() hands out the decoded envelopes and nothing else, which is what a consumer that only reads
+   * wants. A consumer that has to *confirm* what it read needs more: the cursor may only be moved to a
+   * contiguous place, and a decoded envelope does not say where it ended. A record's end is its length
+   * prefix plus its payload - the same framing append wrote - so the position is derived from the
+   * encoded length rather than guessed at, and a caller may advance with `{ segment, offset }` for the
+   * last record it truly consumed.
+   *
+   * The position after the last record of a segment whose bytes it exactly fills is the start of the
+   * next segment, not the end of this one: that is the position that releases a whole segment when the
+   * caller advances, and it is the only place the cursor can sit that means "this segment is done".
+   * A segment with anything left over - a torn tail - keeps the position inside itself, so those bytes
+   * are never skipped by an advance that trusted this walk.
+   */
+  function* drainRecords({ limit = Infinity } = {}) {
+    let read = 0;
+    let startOffset = cursor.offset;
+    for (const segment of segments) {
+      if (cursor.segment !== null && segment.index < cursor.segment) continue;
+      const file = path.join(dir, segment.name);
+      const fd = fsModule.openSync(file, 'r');
+      let buf;
+      try {
+        buf = fsModule.readFileSync(fd);
+      } finally {
+        fsModule.closeSync(fd);
+      }
+      if (startOffset > 0) buf = buf.subarray(startOffset);
+      const decoder = createFrameDecoder({ maxBytes: FRAME_MAX_BYTES + 1 });
+      let records;
+      try {
+        records = decoder.push(buf);
+      } catch {
+        // A length the format cannot have written means the segment desynchronised, and nothing
+        // after it can be trusted: the walk ends here rather than inventing positions.
+        return;
+      }
+      // The end of the segment is reached exactly when every byte from the read point is a complete
+      // record; anything else - a torn tail - must keep the resume position inside this segment.
+      const completeBytes = records.reduce((sum, record) => sum + RECORD_OVERHEAD + record.length, 0);
+      const reachesEnd = completeBytes === buf.length;
+      let at = startOffset;
+      for (let index = 0; index < records.length; index += 1) {
+        if (read >= limit) return;
+        const record = records[index];
+        at += RECORD_OVERHEAD + record.length;
+        const last = index === records.length - 1;
+        const position =
+          last && reachesEnd
+            ? { segment: segment.index + 1, offset: 0 }
+            : { segment: segment.index, offset: at };
+        yield { envelope: decodeEnvelope(record), ...position };
+        read += 1;
+      }
+      startOffset = 0;
+    }
+  }
+
+  /**
    * Confirm everything up to this position as consumed and durable elsewhere.
    *
    * The caller may only pass a contiguous position; segments entirely behind it are deleted, which
@@ -264,6 +388,7 @@ export function createSpool(options = {}) {
   return {
     append,
     drain,
+    drainRecords,
     advance,
     close,
     sync: flush,

@@ -144,6 +144,22 @@ function openDeliveryLedgerWithin(options, wiring) {
   const countStatement = wiring.db.prepare(
     'SELECT COUNT(*) AS owed FROM delivery_ledger WHERE market = ? AND stream = ?',
   );
+  // The retention bound's two halves: how much raw the ledger is still holding, and how old the oldest
+  // entry is. Both are asked of the store rather than kept in this process, because a restart is exactly
+  // when the bound has to be re-applied to what is still written down.
+  const heldSizeStatement = wiring.db.prepare(
+    `SELECT COALESCE(SUM(length(raw)), 0) AS held_bytes, MIN(recorded_at_ms) AS oldest_ms
+       FROM delivery_ledger
+      WHERE market = ? AND stream = ?`,
+  );
+  // The oldest entries first, each with the bytes it is holding, so a sweep can decide - oldest first -
+  // which ones the bound has passed. The store's own row order breaks ties, never a clock that can step.
+  const oldestStatement = wiring.db.prepare(
+    `SELECT connection_id, receive_seq, length(raw) AS bytes, recorded_at_ms, state
+       FROM delivery_ledger
+      WHERE market = ? AND stream = ?
+      ORDER BY recorded_at_ms, rowid`,
+  );
 
   function rowToEntry(row) {
     return {
@@ -254,6 +270,22 @@ function openDeliveryLedgerWithin(options, wiring) {
     skip,
     find,
     pending,
+    /** What the ledger is still holding: the total raw bytes, and the age of the oldest entry. */
+    heldSize() {
+      const row = heldSizeStatement.get(market, stream);
+      return { bytes: row.held_bytes, oldestMs: row.oldest_ms ?? null };
+    },
+    /** The oldest entries first, each with the bytes it holds and the state it is in. */
+    oldestEntries({ limit = Infinity } = {}) {
+      const rows = oldestStatement.all(market, stream);
+      return (limit === Infinity ? rows : rows.slice(0, limit)).map((row) => ({
+        connectionId: row.connection_id,
+        receiveSeq: row.receive_seq,
+        bytes: row.bytes,
+        recordedAtMs: row.recorded_at_ms,
+        state: row.state,
+      }));
+    },
     size() {
       return countStatement.get(market, stream).owed;
     },

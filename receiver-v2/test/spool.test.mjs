@@ -162,3 +162,79 @@ test('a torn tail is reported, not parsed as a record', async () => {
     reopened.close();
   });
 });
+
+test('drainRecords gives the position after each record, and advancing there resumes cleanly', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir, segmentBytes: 300 });
+    for (let i = 1; i <= 6; i += 1) spool.append(envelope(i));
+    spool.sync();
+    const records = [...spool.drainRecords()];
+    assert.deepEqual(records.map((record) => record.envelope.receive_seq), [1, 2, 3, 4, 5, 6]);
+    for (const record of records) {
+      assert.ok(Number.isInteger(record.segment), 'a walked record knows which segment it is in');
+      assert.ok(Number.isInteger(record.offset) && record.offset >= 0, 'and where it ends');
+    }
+    // Confirm through the third record: the cursor names where the fourth begins, and the walk
+    // continues from there - nothing before the confirmed position comes back.
+    const third = records[2];
+    spool.advance({ segment: third.segment, offset: third.offset });
+    assert.deepEqual(
+      [...spool.drainRecords()].map((record) => record.envelope.receive_seq),
+      [4, 5, 6],
+      'the position after a record is exactly where its successor resumes',
+    );
+    spool.close();
+  });
+});
+
+test('a fully consumed segment is released, and a record after the drain starts ahead of the cursor', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir });
+    for (const seq of [1, 2, 3]) spool.append(envelope(seq));
+    spool.sync();
+    const records = [...spool.drainRecords()];
+    const last = records.at(-1);
+    // The last record of a segment whose bytes it exactly fills resumes at the start of the next
+    // segment: that is the position that releases the whole segment when the caller advances.
+    spool.advance({ segment: last.segment, offset: last.offset });
+    assert.deepEqual(spool.segments, [], 'the whole consumed segment is released');
+    assert.equal(spool.bytes, 0, 'and nothing is counted as held');
+    assert.deepEqual([...spool.drainRecords()], [], 'what was confirmed does not come back');
+
+    // A record arriving after a complete drain must land where the cursor can still read it: at or
+    // after the confirmed position, never inside the released segment behind it.
+    assert.equal(spool.append(envelope(4)), true);
+    spool.sync();
+    assert.deepEqual(
+      [...spool.drainRecords()].map((record) => record.envelope.receive_seq),
+      [4],
+      'the new record is readable from the cursor, not written behind it',
+    );
+    spool.close();
+  });
+});
+
+test('the free-space half of the bound refuses a record and deletes nothing', async () => {
+  await withSpool(async (dir) => {
+    // The bound is the earlier of 5% of free space or the fixed ceiling: 5% of 10_000 is 500 bytes,
+    // well below the 2GB ceiling, so the free-space half is the one that applies. The reading is
+    // injected so the condition is forced without filling a disk.
+    const spool = createSpool({ dir, freeSpace: () => 10_000 });
+    let accepted = 0;
+    for (let i = 1; i <= 50; i += 1) if (spool.append(envelope(i))) accepted += 1;
+    assert.ok(accepted > 0, 'the bound lets records through while they fit');
+    assert.ok(accepted < 50, 'and stops before 5% of the free space is crossed');
+    assert.ok(spool.bytes <= 500, 'what is held stays within the free-space share');
+    const held = spool.segments.map((segment) => segment.name);
+    const before = spool.bytes;
+    assert.equal(spool.append(envelope(999)), false, 'false is the stop signal for the caller');
+    assert.equal(spool.bytes, before, 'the refused record was not written');
+    assert.deepEqual(spool.segments.map((segment) => segment.name), held, 'and nothing held was deleted');
+    assert.deepEqual(
+      [...spool.drainRecords()].map((record) => record.envelope.receive_seq),
+      Array.from({ length: accepted }, (_, i) => i + 1),
+      'a refusal never discards what is already spooled',
+    );
+    spool.close();
+  });
+});

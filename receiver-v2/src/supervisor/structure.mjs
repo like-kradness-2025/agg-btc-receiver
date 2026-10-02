@@ -29,12 +29,22 @@
 
 import { openBook } from '../book/state.mjs';
 import { openOrganizer } from '../organize/watermark.mjs';
-import { openDeliveryLedger, INTENT, OWED } from './delivery.mjs';
+import { openDeliveryLedger, INTENT, OWED, SKIPPED } from './delivery.mjs';
 import { makeEnvelope } from '../envelope.mjs';
 import { createSpool } from '../spool.mjs';
 import { createReceiveConnection } from '../ingest/connection.mjs';
 import { bindInternals, constructorOf, internalsOf } from '../internal/wiring.mjs';
 import { openDurability } from '../durability.mjs';
+
+/**
+ * The delivery ledger's retention bound (§9.1): the earlier of five minutes old or one gigabyte held.
+ * Past it, the frames it still names are declared missing rather than kept for a delivery that will
+ * not come - the decision is written down exactly like any other permanent loss, so a restart repeats
+ * neither it nor the report. Here rather than in the ledger because the bound is a policy the wiring
+ * owns, and because a test has to be able to shrink it to something it can actually reach.
+ */
+export const DEFAULT_LEDGER_RETENTION_MS = 5 * 60 * 1000;
+export const DEFAULT_LEDGER_RETENTION_BYTES = 1024 * 1024 * 1024;
 
 export function createStructure({
   market,
@@ -55,6 +65,8 @@ export function createStructure({
   onDiagnostic = () => {},
   nowMs = () => Date.now(),
   maxWaitingEvents = 1_000,
+  ledgerRetentionMs = DEFAULT_LEDGER_RETENTION_MS,
+  ledgerRetentionBytes = DEFAULT_LEDGER_RETENTION_BYTES,
   ...receiveOptions
 }) {
   // The checks that can refuse the configuration run before anything is opened: a construction that never
@@ -128,6 +140,14 @@ export function createStructure({
   let closed = false;
   let spooledFrames = 0;
   let refusedFrames = 0;
+  // True only while the spool is being walked. A record met here is *already* in the spool, so a raw
+  // that refuses it again must not append it a second time: the walk would never make progress and the
+  // spool would hold the same bytes over and over. It is a walk flag rather than an argument so that
+  // the public frame handler keeps its shape and no caller can reach this state.
+  let walkingSpool = false;
+  // Re-entrancy guard for the drain: it re-injects frames through the same handler a live frame gets,
+  // and that handler must never be able to start a second walk of the spool it is already walking.
+  let drainingSpool = false;
 
   // The construction is one operation of its own: the parts are opened through their internal path, which
   // does not take the right again, and the whole of it runs inside one take - so no hook an initialisation
@@ -253,6 +273,114 @@ export function createStructure({
     // committed fact, and one whose write never landed is not counted at all.
     if (recorded) framesWrittenDown += 1;
     return recorded;
+  }
+
+  /**
+   * Declare the entries past the retention bound missing, oldest first.
+   *
+   * §9.1 bounds how long organize keeps a frame the board has not taken: the earlier of five minutes or
+   * one gigabyte. What is past that bound is not going to be delivered - the frame it names is a
+   * permanent loss - so it is written down through exactly the same decision a frame below the first
+   * sequence goes through: the row stays as the record, the first decision keeps it, and the report is
+   * made once. An entry inside the bound is never touched.
+   *
+   * The byte half is measured over what the ledger is still *holding for delivery* - entries not already
+   * decided. A decided loss keeps its row and its bytes, so counting those would leave the byte bound
+   * impossible to satisfy and every sweep would re-skip rows that are already decided. The total the
+   * ledger reports (heldSize) still counts them; this is which of them the bound can still act on.
+   */
+  function sweepRetentionInternal() {
+    if (ledger.size() === 0) return { swept: 0 };
+    const entries = ledger.oldestEntries();
+    let remaining = 0;
+    for (const entry of entries) if (entry.state !== SKIPPED) remaining += entry.bytes;
+    const now = nowMs();
+    let swept = 0;
+    for (const entry of entries) {
+      if (entry.state === SKIPPED) continue; // already decided: its loss is written down
+      const tooOld = now - entry.recordedAtMs > ledgerRetentionMs;
+      const tooMuch = remaining > ledgerRetentionBytes;
+      if (!tooOld && !tooMuch) break; // this one, and everything newer, is inside the bound
+      const reason = tooOld
+        ? `the delivery ledger's retention bound passed this frame: it is older than ${ledgerRetentionMs} ms`
+        : `the delivery ledger's retention bound passed this frame: the ledger holds more than ${ledgerRetentionBytes} bytes`;
+      const { decided } = ledgerInternal.skip(entry.connectionId, entry.receiveSeq, reason);
+      if (decided) {
+        swept += 1;
+        onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: entry.receiveSeq });
+      }
+      remaining -= entry.bytes;
+    }
+    return { swept };
+  }
+
+  /**
+   * Walk what the spool holds, oldest first, and re-inject each record through the same handling a live
+   * frame gets - the raw write is attempted again, the ledger records it, the board applies it, and the
+   * acknowledgement follows. There is no second delivery path here, which is the point: a frame that
+   * comes back from the spool is treated exactly like one that has just arrived.
+   *
+   * The cursor moves once, to the end of the last *contiguously* consumed record: the first record the
+   * raw still refuses stops the walk where it is, and nothing past it is confirmed - the caller may only
+   * acknowledge a contiguous range, and advancing over a record that was not consumed would delete it.
+   * The walk ends with the retention sweep, because a drain is one of the moments the bound is re-applied.
+   */
+  function drainSpoolInternal({ limit = 512 } = {}) {
+    if (closed) {
+      return { walked: 0, consumed: 0, advanced: false, swept: 0, refused: true, reason: 'this structure is closed' };
+    }
+    // Nothing is walked out of a stopped structure: its frame handler refuses everything, so the walk
+    // would report each record as a hole instead of delivering it. The bound is still applied.
+    if (stopped) {
+      return { walked: 0, consumed: 0, advanced: false, ...sweepRetentionInternal(), stopped: true, reason: 'this structure has stopped' };
+    }
+    let walked = 0;
+    let consumed = 0;
+    let lastConsumed = null;
+    let stoppedReason = null;
+    if (spool !== null && spool.bytes > 0 && !drainingSpool) {
+      drainingSpool = true;
+      walkingSpool = true;
+      try {
+        for (const record of spool.drainRecords({ limit })) {
+          walked += 1;
+          const result = feed(record.envelope);
+          if (result.durable === true || result.alreadyDurable === true || result.applied === true) {
+            consumed += 1;
+            lastConsumed = { segment: record.segment, offset: record.offset };
+            continue;
+          }
+          stoppedReason = result.stillSpilled
+            ? 'the raw still refused the record'
+            : result.reason ?? 'the record was not consumed';
+          break;
+        }
+      } catch (error) {
+        // A record the spool cannot hand back - a frame whose bytes do not describe the identity they
+        // claim, a length that desynchronised - is not a record this walk may guess at. It stops where
+        // it is, leaves the spool untouched, and says so, rather than letting a broken record take down
+        // the frame handling that triggered the drain.
+        stoppedReason = `the spool could not hand back a record: ${error.message}`;
+        onDiagnostic({ market, reason: stoppedReason });
+      } finally {
+        walkingSpool = false;
+        drainingSpool = false;
+      }
+      if (lastConsumed !== null) spool.advance(lastConsumed);
+    }
+    const swept = sweepRetentionInternal();
+    return { walked, consumed, advanced: lastConsumed !== null, ...swept, stopped: stoppedReason };
+  }
+
+  /**
+   * Drain at the moment the ladder can actually climb: when a frame's own write has just succeeded and
+   * the spool is holding something. It is bounded and it runs inside the operation that wrote the frame,
+   * never from a caller's hook - a repair that depends on somebody remembering to call it is a repair
+   * that does not happen.
+   */
+  function maybeDrainSpool() {
+    if (spool === null || spool.bytes === 0 || drainingSpool) return;
+    drainSpoolInternal();
   }
 
   /**
@@ -472,6 +600,12 @@ export function createStructure({
       // The raw writer refused: the frame is spilled rather than dropped.
       // What is spilled is the frame this key means - the one that was written down - not the resend that
       // arrived under it.
+      if (walkingSpool) {
+        // This frame came out of the spool and the raw refused it again. Appending it here would copy a
+        // record that is already in the spool; the bytes would grow by themselves and never be read. It
+        // stays exactly where it is, and the walk that met it stops there (nothing past it may move).
+        return { ...note, spooled: false, stillSpilled: true };
+      }
       if (spool && spool.append(target) && !spool.failed) {
         spooledFrames += 1;
         return { ...note, spooled: true };
@@ -687,6 +821,8 @@ export function createStructure({
     },
     find: (...args) => copyEntry(ledger.find(...args)),
     pending: (...args) => copyList(ledger.pending(...args)),
+    heldSize: () => ledger.heldSize(),
+    oldestEntries: (...args) => ledger.oldestEntries(...args),
     size: () => ledger.size(),
   };
   const connectionSurface = {};
@@ -1008,12 +1144,16 @@ export function createStructure({
   // all inside the same take, so an arrival is never processed in the middle of the frame that was running.
   // The wait is emptied even when the operation throws, and a full wait-list is answered for here as well:
   // an overflow that happened during a window is the same stop, carried out the same way.
-  const window = (name, run, refusalShape) =>
+  const window = (name, run, refusalShape, after) =>
     wiring.guard(
       name,
       (...args) => {
         try {
-          return run(...args);
+          const result = run(...args);
+          // The after-step runs while this operation still holds the store's right, so it is a
+          // continuation of the operation rather than a second one - and never a caller's hook.
+          if (typeof after === 'function') after(result);
+          return result;
         } finally {
           drainWaiting();
           settleOverflow();
@@ -1022,7 +1162,11 @@ export function createStructure({
       refusalShape,
     );
   const closeInternal = api.close;
-  api.feed = window('structure.feed', feed);
+  api.feed = window('structure.feed', feed, undefined, (result) => {
+    // A frame that just became durable is the moment the ladder can be climbed: the raw is accepting
+    // again, so what was spilled is offered to it once more - boundedly, and inside this operation.
+    if (result && (result.durable === true || result.alreadyDurable === true)) maybeDrainSpool();
+  });
   api.accept = window('structure.accept', acceptInternal);
   api.redeliverPending = window('structure.redeliverPending', redeliverPendingInternal, (refusal) => ({
     applied: 0,
@@ -1030,8 +1174,28 @@ export function createStructure({
     code: refusal.code,
     reason: refusal.reason,
   }));
-  api.resume = window('structure.resume', resumeInternal, (refusal) => ({
-    delivered: 0,
+  api.resume = window(
+    'structure.resume',
+    resumeInternal,
+    (refusal) => ({
+      delivered: 0,
+      refused: true,
+      code: refusal.code,
+      reason: refusal.reason,
+    }),
+    () => {
+      // Recovery is the other moment the retention bound is re-applied: what could not be delivered and
+      // is now too old is declared missing. There is deliberately no spool walk here - re-injecting
+      // spilled frames at startup is a later set's job, and the automatic drain already happens the
+      // moment reception writes its first frame successfully.
+      sweepRetentionInternal();
+    },
+  );
+  api.drainSpool = window('structure.drainSpool', drainSpoolInternal, (refusal) => ({
+    walked: 0,
+    consumed: 0,
+    advanced: false,
+    swept: 0,
     refused: true,
     code: refusal.code,
     reason: refusal.reason,
