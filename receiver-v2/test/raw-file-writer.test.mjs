@@ -143,3 +143,116 @@ test('a file left with a torn last line recovers on open instead of refusing to 
     write.close();
   });
 });
+
+test('a rollback that fails poisons the writer, so a later write never claims success over the fragment', async () => {
+  await withDir(async (dir) => {
+    const filePath = join(dir, 'raw.log');
+    const fsModule = { ...fs };
+    let calls = 0;
+    fsModule.writeSync = (fd, buf, off, len) => {
+      calls += 1;
+      // The failing attempt lands half the line, then makes no progress, so the append cannot finish.
+      if (calls === 1) return fs.writeSync(fd, buf, off, Math.max(1, Math.floor(len / 2)));
+      if (calls === 2) return 0;
+      return fs.writeSync(fd, buf, off, len);
+    };
+    // The trim that would cut the fragment back fails. The review found this swallowed: the fragment
+    // stayed and the next attempt appended a whole line after it and answered true over a corrupt file.
+    fsModule.ftruncateSync = () => {
+      throw Object.assign(new Error('injected trim IO failure'), { code: 'EIO' });
+    };
+
+    const write = createFileRawWriter({ path: filePath, fsModule });
+    const frame = envelope(1);
+    assert.equal(write(frame), false, 'the append did not finish and its fragment could not be cut back');
+    const after = readFileSync(filePath, 'utf8');
+    assert.ok(after.length > 0 && !after.endsWith('\n'), 'the half-written line is left behind');
+
+    // The IO failures are lifted, but the writer may not claim the frame: the failed rollback poisoned it.
+    fsModule.ftruncateSync = fs.ftruncateSync;
+    assert.equal(write(frame), false, 'a poisoned writer never answers true');
+    assert.equal(readFileSync(filePath, 'utf8'), after, 'the poisoned writer wrote nothing more than the fragment');
+    write.close();
+  });
+});
+
+test('a file another hand has moved is never rolled back: it is poisoned and the other line survives', async () => {
+  await withDir(async (dir) => {
+    const filePath = join(dir, 'raw.log');
+    const fsModule = { ...fs };
+    const otherLine = `${JSON.stringify({ key: 'k-other', envelope: { raw: '' } })}\n`;
+    let observed = false;
+    // The length this writer reads is taken *before* another writer appends - the exact ordering the
+    // review reproduced. The other writer's successful line lands, then this writer's append fails.
+    fsModule.fstatSync = (fd) => {
+      const stat = fs.fstatSync(fd);
+      if (!observed) {
+        observed = true;
+        fs.appendFileSync(filePath, otherLine);
+      }
+      return stat;
+    };
+    fsModule.writeSync = () => {
+      throw Object.assign(new Error('write IO failure'), { code: 'EIO' });
+    };
+
+    const write = createFileRawWriter({ path: filePath, fsModule });
+    assert.equal(write(envelope(1)), false, 'this writer did not become durable');
+    // The other writer's line is still there - before the fix, this writer cut it back and lost it.
+    assert.equal(readFileSync(filePath, 'utf8'), otherLine, "the other writer's line survives untouched");
+    // And the failure poisoned this writer: it claims nothing from here on.
+    assert.equal(write(envelope(2)), false, 'the poisoned writer answers false to everything');
+    assert.equal(readFileSync(filePath, 'utf8'), otherLine, 'still nothing written over the other line');
+    write.close();
+  });
+});
+
+test('a poisoned writer is recovered by the next start: the torn tail is cut and the frame redelivered', async () => {
+  await withDir(async (dir) => {
+    const filePath = join(dir, 'raw.log');
+    const failing = { ...fs };
+    let calls = 0;
+    failing.writeSync = (fd, buf, off, len) => {
+      calls += 1;
+      if (calls === 1) return fs.writeSync(fd, buf, off, Math.max(1, Math.floor(len / 2)));
+      if (calls === 2) return 0;
+      return fs.writeSync(fd, buf, off, len);
+    };
+    failing.ftruncateSync = () => {
+      throw new Error('injected trim IO failure');
+    };
+
+    const poisoned = createFileRawWriter({ path: filePath, fsModule: failing });
+    const frame = envelope(7);
+    assert.equal(poisoned(frame), false, 'the append could not be finished and its trim failed');
+    // A later write on the poisoned writer adds nothing. Were it to append a whole line after the
+    // fragment, the restart would read one unparseable line and refuse the file for ever.
+    assert.equal(poisoned(frame), false, 'the poisoned writer adds nothing after the fragment');
+    poisoned.close();
+
+    // The next start (a fresh writer on the same path) cuts the torn tail and writes the redelivered frame.
+    const write = createFileRawWriter({ path: filePath, fsModule: fs });
+    assert.equal(write(frame), true, 'the redelivered frame is durable after recovery');
+    const lines = readFileSync(filePath, 'utf8').trim().split('\n').filter(Boolean);
+    assert.equal(lines.length, 1, 'exactly one whole record');
+    const record = JSON.parse(lines[0]);
+    assert.equal(record.key, dedupeKey(frame), 'the recovered line is the frame that was redelivered');
+    write.close();
+  });
+});
+
+test('a second writer on a live path is refused at construction', async () => {
+  await withDir(async (dir) => {
+    const filePath = join(dir, 'raw.log');
+    const first = createFileRawWriter({ path: filePath });
+    assert.throws(
+      () => createFileRawWriter({ path: filePath }),
+      /already owns/,
+      'one process may only own a raw destination once',
+    );
+    // Once the first writer is closed the path is free again - a restart in this process may reopen it.
+    first.close();
+    const second = createFileRawWriter({ path: filePath });
+    second.close();
+  });
+});
