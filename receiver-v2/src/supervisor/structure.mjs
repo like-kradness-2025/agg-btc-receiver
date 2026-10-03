@@ -358,11 +358,14 @@ export function createStructure({
       });
       if (decided) {
         swept += 1;
-        onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: entry.receiveSeq });
+        // The state changes before any caller's hook: the proof goes with the commit that decided the loss,
+        // because a hook that throws must not be able to leave the board serving on a range the store has
+        // already written off - the row is decided, so nothing would come back to heal it later.
         if (invalidated) {
           bookInternal.dropProof(entry.connectionId);
           requestRefetch(entry.connectionId);
         }
+        onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: entry.receiveSeq });
       }
       remaining -= entry.bytes;
     }

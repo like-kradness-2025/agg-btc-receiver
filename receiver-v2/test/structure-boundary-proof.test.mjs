@@ -44,7 +44,7 @@ const exactSuccessor = ({ previous, current, replace }) =>
 
 let clock = 1_000_000;
 
-async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false } = {}) {
+async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false, gapThrows = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'proof-structure-'));
   const base = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
   const inject = injectable ? withInjectableWrites(base) : null;
@@ -73,7 +73,10 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
     },
     rawWriter: () => true,
     nowMs: () => clock,
-    onGap: (gap) => gaps.push(gap),
+    onGap: (gap) => {
+      if (gapThrows) throw new Error('the gap hook refused');
+      gaps.push(gap);
+    },
     onRefetch: (request) => refetch.push(request),
     onDiagnostic: () => {},
   });
@@ -240,5 +243,32 @@ test('a commit that never lands leaves the board serving, because the store stil
       assert.equal(refetch.length, 0, 'and nothing asks for a re-anchor');
     },
     { injectable: true },
+  );
+});
+
+test('a report that throws does not leave the board serving on a range the store wrote off', async () => {
+  // The state follows the commit and a caller's hook follows the state. A hook that throws must not be able to
+  // leave the proof standing over a range the ledger has already decided is gone: the row is decided, so a
+  // later sweep skips it and nothing would ever come back to drop that proof.
+  await withStructure(
+    async ({ structure, refetch, parts, store }) => {
+      assert.equal(structure.feed(envelope(1, 1)).applied, true);
+      assert.equal(parts.book.proveBoundary().proven, true, 'the board is serving before the loss');
+      assert.equal(parts.ledger.record(envelope(7, 7, { meta: null }), 'durable and held').recorded, true);
+      clock += 10 * 60 * 1000;
+
+      assert.throws(() => structure.drainSpool(), /the gap hook refused/, 'the report could not be made');
+      assert.equal(structure.ledger.find(CONNECTION, 7).state, 'skipped', 'the loss is still decided');
+      assert.equal(
+        internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_missing_record').get().n,
+        1,
+        'and its record is on the store',
+      );
+      const proof = parts.book.proveBoundary();
+      assert.equal(proof.proven, false, 'so the board is not serving on it');
+      assert.match(proof.reason, /proof is broken/);
+      assert.equal(refetch.length, 1, 'and a re-anchor was asked for');
+    },
+    { gapThrows: true },
   );
 });
