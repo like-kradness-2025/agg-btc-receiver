@@ -527,6 +527,12 @@
 - **契約違反の制御メッセージは「チャネル終端」**（既存の「decode エラーは終端」規約の再利用）。破棄して継続する選択肢もあり得る（文書未指定）。
 - `version=1` 固定・ネゴシエーションなし。`payload` は**存在のみ検証**（内容は段階2以降）。`sendAck` のシグネチャ変更に伴い既存 `ipc.test.mjs` の1アサーションを新契約に合わせ更新（新契約が要求）。
 
+**段階2 実装（commit `652b961`）**: ingest の入口 `src/ingest/main.mjs`＋**ingest 専用の `received_tail` store**（`src/ingest/store.mjs`）＋偽 organize peer（`test-support/fake-organize.mjs`）。**受信テールを到着時に ingest の store へ**、**spool を ingest が専有**（追記・fsync・古い順の再送・**耐久ACK後に cursor 更新とセグメント削除**）、**待っている世代の accept でのみソケットを開く**（別 run は明示 takeover・旧 instance 拒否）、購読の拒否/期限超過は IPC で organize へ、**子の再起動IDと受信 run/世代を分離**。テスト **394/394**（+11・変異6件赤）。**既存ファイルは byte-identical** ✓。保留: テールの store 移行は段階5（ingest に独立 store を用意済み）、takeover の判断の所在地は段階5（ingest は明示フラグを運ぶだけ）。
+
+**段階3 実装（commit `<stage3>`）**: organize の入口 `src/organize/main.mjs`＋専用 store（`src/organize/store.mjs`）＋偽 ingest/book。**所有表厳守**（`sqlite_master` 検査で **`received_tail` も spool も organize が持たない**ことを固定 ✓）。裁定③（watermark＋ledger confirm＋pending_boundary を**同一tx**）／④⑤（失効要求の**状態機械 requested→confirmed の一方向**・重複 no-op・**確定済み欠測の取消を拒否**・**supervisor による終了確認の代替条件**・**再起動時の再導出と再接続時の再送**）／⑦（fsync→DB確定→ACK）／⑧（`run_marker` は organize が書く）／⑨⑩（**「全ACK」判定は organize**: tails 非空＋穴なし耐久上限が末尾到達＋spool 空＋raw 穴なし。**未達なら `run_marker` は running のまま＝正常完了を書かない**）。テスト **402/402**（+8・変異8件赤）。**既存コード無変更** ✓。
+  - **当方の決定（設計に規定なし・記録）**: `invalidation_request` 表（`request_id`＝安定ID `${market}:${stream}:${connectionId}:${from}-${to}`・単調 revision・state/reason/requested_at/confirmed_at/confirmed_by）／`tail_sealed` の payload 形 `{tails:[{connectionId,lastReceivedSeq}], spool_empty}`／トポロジは organize が1ソケットを listen し `hello.payload.role` で ingest/book を判別／organize の accept は常に `accepted:true`（owner/takeover の裁定は book 側＝段階4）／`run_marker` の旧 run 無効化は store の open で。
+  - **段階4/5へ残した（重要）**: (a) organize→book への**owed フレーム配送本体**は未配線（`applied_ack` の受信側＝pending_boundary 消去＋ledger release のみ）(b) **失効の「告知」の宛先が未規定**（`onMissing` コールバックのみ。IPC 語彙に専用 type なし）(c) **起動時の未完了 `pending_boundary` の適用/取消（Astra 裁定②の規律）は未完**（書き込み・同一tx・applied での消去までは実装）(d) supervisor の停止順・readiness 集約・子再起動・実3プロセス通し（段階5）(e) 障害訓練（段階6）(f) **台帳の保持期限・上限の sweep（セット5）を organize プロセスに載せていない** (g) canonical raw 本体（§8）。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。
