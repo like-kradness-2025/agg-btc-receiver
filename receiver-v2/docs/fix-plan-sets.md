@@ -493,7 +493,7 @@
 |---|---|
 | ingest | `received_tail`、spool（セグメント・cursor・削除） |
 | organize | `run_marker`、`pending_boundary`、`suspected_gap`、`organized_watermark`、`organize_gap`、`delivery_ledger`、raw |
-| book | `applied_boundary`、`book_level`、`board_anchor`、`book_missing_record`、`book_gap`、`retired_run`、`connection_identity`、`legacy_owner` |
+| book | `applied_boundary`、`book_level`、`board_anchor`、`book_missing_record`、`book_gap`、`retired_run`、`connection_identity`、`legacy_owner`、**`book_invalidation`**（裁定④⑤の「処理済み revision と失効を同一tx」を満たすため段階4で追加。§5.8 の裁定②の表には無かった） |
 | supervisor | 上記表の**書き込みなし**（子の生存・起動停止・readiness を統括） |
 
 **原子性（裁定③）**: organize 内の同一tx＝watermark＋ledger confirm＋pending 境界／book 内の同一tx＝板状態＋適用境界＋anchor（**§9.4(1) は book 側で満たす**）。役割横断は tx で囲わず、**要求の永続化＋往復＋再起動時の照合/再導出**で埋める。
@@ -532,6 +532,10 @@
 **段階3 実装（commit `<stage3>`）**: organize の入口 `src/organize/main.mjs`＋専用 store（`src/organize/store.mjs`）＋偽 ingest/book。**所有表厳守**（`sqlite_master` 検査で **`received_tail` も spool も organize が持たない**ことを固定 ✓）。裁定③（watermark＋ledger confirm＋pending_boundary を**同一tx**）／④⑤（失効要求の**状態機械 requested→confirmed の一方向**・重複 no-op・**確定済み欠測の取消を拒否**・**supervisor による終了確認の代替条件**・**再起動時の再導出と再接続時の再送**）／⑦（fsync→DB確定→ACK）／⑧（`run_marker` は organize が書く）／⑨⑩（**「全ACK」判定は organize**: tails 非空＋穴なし耐久上限が末尾到達＋spool 空＋raw 穴なし。**未達なら `run_marker` は running のまま＝正常完了を書かない**）。テスト **402/402**（+8・変異8件赤）。**既存コード無変更** ✓。
   - **当方の決定（設計に規定なし・記録）**: `invalidation_request` 表（`request_id`＝安定ID `${market}:${stream}:${connectionId}:${from}-${to}`・単調 revision・state/reason/requested_at/confirmed_at/confirmed_by）／`tail_sealed` の payload 形 `{tails:[{connectionId,lastReceivedSeq}], spool_empty}`／トポロジは organize が1ソケットを listen し `hello.payload.role` で ingest/book を判別／organize の accept は常に `accepted:true`（owner/takeover の裁定は book 側＝段階4）／`run_marker` の旧 run 無効化は store の open で。
   - **段階4/5へ残した（重要）**: (a) organize→book への**owed フレーム配送本体**は未配線（`applied_ack` の受信側＝pending_boundary 消去＋ledger release のみ）(b) **失効の「告知」の宛先が未規定**（`onMissing` コールバックのみ。IPC 語彙に専用 type なし）(c) **起動時の未完了 `pending_boundary` の適用/取消（Astra 裁定②の規律）は未完**（書き込み・同一tx・applied での消去までは実装）(d) supervisor の停止順・readiness 集約・子再起動・実3プロセス通し（段階5）(e) 障害訓練（段階6）(f) **台帳の保持期限・上限の sweep（セット5）を organize プロセスに載せていない** (g) canonical raw 本体（§8）。
+
+**段階4 実装（commit `<stage4>`）**: book の入口 `src/book/main.mjs`＋専用 store（`src/book/store.mjs`）＋偽 organize（`test-support/fake-organize-for-book.mjs`）。**所有表厳守**（`sqlite_master` 検査で book の9表が揃い、**organize の表・`received_tail`・spool・`invalidation_request` が存在しない**ことを固定 ✓）。裁定③（板＋境界＋anchor を**同一tx**／anchor の tx 外書き込みは赤で固定 ✓）／④⑤（book 側の失効: **提供停止＋`book_invalidation` と `book_missing_record` を同一txで永続化→`invalidated` 応答**。**重複 request_id は no-op**、**確定済み欠測の取消は常に拒否**、再起動後も「提供しない」状態が残る ✓）／⑫（**accept の認可裁定は book** — owner/generation/明示 takeover/retired-run/旧 instance 拒否を跨ぎ越しで保証し、各理由を wire 上の値で固定 ✓）／`applied_ack` 送信 ✓／C6・C7 の意味が跨ぎ越しでも保たれる ✓。テスト **413/413**（+11・変異5件赤）。**既存コード無変更** ✓。
+  - **当方の決定（設計に規定なし・記録）**: ①**accept の経路** — organize の単一ソケット・トポロジでは ingest の `accept` は **relay** される必要がある（段階4は「受けた `accept` を book が裁定して `accepted` を返す」ところまで。**段階3の organize はまだ relay していない → 段階5で relay するか経路を張り替える**）②**`book_invalidation` 表の追加**（裁定②の所有表には無かったが④⑤が同一tx書込みを要求するため book 所有で追加）③**`changesFor` の継ぎ目** — organize→book のフレーム配送本体が未配線のため、レベル変化の導出主体が未定 → 本段階は**注入フック**で受ける（raw 読み出しを勝手に作らない）。
+  - **段階5へ残した**: 実トポロジの supervisor 結線（起動/停止順・子再起動・readiness 集約・**実3プロセス通し**）／organize→book の owed フレーム配送本体＋レベル変化の導出／失効の「告知」の宛先／起動時の未完 `pending_boundary` の適用・取消／台帳の保持期限 sweep／canonical raw。
 
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
