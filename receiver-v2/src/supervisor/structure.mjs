@@ -64,6 +64,12 @@ export function createStructure({
   onStop = () => {},
   onDiagnostic = () => {},
   onRefetch = () => {},
+  // Called once, after the store's execution right has been handed back at the end of an operation -
+  // a socket arrival, a caller's feed, a recovery. It is an observation, not a capability: it is told
+  // that the operation is over and cannot change its result. The supervisor uses it to carry out a
+  // notification (a stop or a re-anchor) that was raised from inside the operation, because the
+  // structure refuses to act on one while its own right is held. A hook that throws changes nothing.
+  onOperationEnd = () => {},
   nowMs = () => Date.now(),
   maxWaitingEvents = 1_000,
   ledgerRetentionMs = DEFAULT_LEDGER_RETENTION_MS,
@@ -157,6 +163,22 @@ export function createStructure({
   // Re-entrancy guard for the drain: it re-injects frames through the same handler a live frame gets,
   // and that handler must never be able to start a second walk of the spool it is already walking.
   let drainingSpool = false;
+
+  /**
+   * Report that an operation has ended and the store's execution right is free again.
+   *
+   * This is the one point a notification raised from inside an operation can be acted on: while the
+   * right is held the structure refuses to stop or start, so a request made from a socket arrival or a
+   * caller's frame waits for the operation to finish. It is called after the right has been handed back
+   * - never inside the take - and a hook that throws cannot change the operation's result.
+   */
+  const operationEnded = () => {
+    try {
+      onOperationEnd();
+    } catch {
+      // An observation that throws is not a fact about the operation it followed.
+    }
+  };
 
   // The construction is one operation of its own: the parts are opened through their internal path, which
   // does not take the right again, and the whole of it runs inside one take - so no hook an initialisation
@@ -393,17 +415,20 @@ export function createStructure({
    */
   function drainSpoolInternal({ limit = 512 } = {}) {
     if (closed) {
-      return { walked: 0, consumed: 0, advanced: false, swept: 0, refused: true, reason: 'this structure is closed' };
+      return { walked: 0, consumed: 0, advanced: false, swept: 0, refused: true, stopped: true, stoppedCode: 'closed', reason: 'this structure is closed' };
     }
     // Nothing is walked out of a stopped structure: its frame handler refuses everything, so the walk
     // would report each record as a hole instead of delivering it. The bound is still applied.
     if (stopped) {
-      return { walked: 0, consumed: 0, advanced: false, ...sweepRetentionInternal(), stopped: true, reason: 'this structure has stopped' };
+      return { walked: 0, consumed: 0, advanced: false, ...sweepRetentionInternal(), stopped: true, stoppedCode: 'stopped', reason: 'this structure has stopped' };
     }
     let walked = 0;
     let consumed = 0;
     let lastConsumed = null;
     let stoppedReason = null;
+    // The machine-readable half of the stop: the caller classifies by this rather than by matching the
+    // report's words. Only `raw-refused` is transient - the raw may be able to take the record later.
+    let stoppedCode = null;
     if (spool !== null && spool.bytes > 0 && !drainingSpool) {
       drainingSpool = true;
       walkingSpool = true;
@@ -419,6 +444,7 @@ export function createStructure({
           stoppedReason = result.stillSpilled
             ? 'the raw still refused the record'
             : result.reason ?? 'the record was not consumed';
+          stoppedCode = result.stillSpilled ? 'raw-refused' : 'not-consumed';
           break;
         }
       } catch (error) {
@@ -427,6 +453,7 @@ export function createStructure({
         // it is, leaves the spool untouched, and says so, rather than letting a broken record take down
         // the frame handling that triggered the drain.
         stoppedReason = `the spool could not hand back a record: ${error.message}`;
+        stoppedCode = 'spool-unreadable';
         onDiagnostic({ market, reason: stoppedReason });
       } finally {
         walkingSpool = false;
@@ -435,7 +462,7 @@ export function createStructure({
       if (lastConsumed !== null) spool.advance(lastConsumed);
     }
     const swept = sweepRetentionInternal();
-    return { walked, consumed, advanced: lastConsumed !== null, ...swept, stopped: stoppedReason };
+    return { walked, consumed, advanced: lastConsumed !== null, ...swept, stopped: stoppedReason, stoppedCode };
   }
 
   /**
@@ -833,14 +860,21 @@ export function createStructure({
       if (overflowed === null) overflowed = label;
       entry.dropped = true;
     }
-    return wiring.whileChange(() => {
-      try {
-        drainWaiting();
-        return entry.dropped === true ? false : entry.result;
-      } finally {
-        settleOverflow();
-      }
-    });
+    try {
+      return wiring.whileChange(() => {
+        try {
+          drainWaiting();
+          return entry.dropped === true ? false : entry.result;
+        } finally {
+          settleOverflow();
+        }
+      });
+    } finally {
+      // The right is back: this is where a request raised by the frame just handled is carried out. The
+      // socket arrival is the main road in, so a notification raised here that nobody acted on would be
+      // the ordinary case, not the corner one.
+      operationEnded();
+    }
   };
   // Runs inside the take that owns the work: the tasks are continuations, so they take no right of their
   // own, and a task that causes another arrival queues it for the same loop.
@@ -1315,9 +1349,11 @@ export function createStructure({
   // A window takes the right, runs the operation, and then lets the arrivals that waited for it through -
   // all inside the same take, so an arrival is never processed in the middle of the frame that was running.
   // The wait is emptied even when the operation throws, and a full wait-list is answered for here as well:
-  // an overflow that happened during a window is the same stop, carried out the same way.
-  const window = (name, run, refusalShape, after) =>
-    wiring.guard(
+  // an overflow that happened during a window is the same stop, carried out the same way. Once the right is
+  // back the operation has ended, and that is reported - a refused window never held the right, so it has
+  // no end to report.
+  const window = (name, run, refusalShape, after) => {
+    const guarded = wiring.guard(
       name,
       (...args) => {
         try {
@@ -1333,6 +1369,15 @@ export function createStructure({
       },
       refusalShape,
     );
+    return (...args) => {
+      const tookTheRight = wiring.inChange() !== true;
+      try {
+        return guarded(...args);
+      } finally {
+        if (tookTheRight) operationEnded();
+      }
+    };
+  };
   const closeInternal = api.close;
   api.feed = window('structure.feed', feedAndHeal);
   api.accept = window('structure.accept', acceptInternal);
@@ -1365,6 +1410,8 @@ export function createStructure({
     advanced: false,
     swept: 0,
     refused: true,
+    stopped: true,
+    stoppedCode: 'refused',
     code: refusal.code,
     reason: refusal.reason,
   }));

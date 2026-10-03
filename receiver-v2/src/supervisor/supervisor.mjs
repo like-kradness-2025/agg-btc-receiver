@@ -96,8 +96,24 @@ export function createSupervisor(options = {}) {
   // Whether the run ended for a reason that is not a clean stop. A clean stop still writes the completion;
   // an abnormal end must not, or the next start cannot tell the crash from the shutdown.
   let abnormal = false;
-  let ready = false;
+  // Whether reception has been admitted and its socket opened. This is *not* readiness: a socket that
+  // is open has proved nothing about the board. Readiness (the `ready` getter below) is derived from
+  // this plus the board actually serving on the connection that is current - see `serving()`. Keeping
+  // the two apart is what stops the supervisor reporting a board nobody may read as ready.
+  let started = false;
   let recoveries = 0;
+  // Whether a settle is already in progress. Carrying a recovery out runs structure operations, each of
+  // which reports its own end and would otherwise call settle again from inside this one; the outer loop
+  // is already owed the same answer, so a nested call returns and lets it finish.
+  let settling = false;
+  // How many of the supervisor's own operations are on the stack. A notification that arrives while one
+  // is running is recorded, not carried out: §5.7 wants the request answered after the *operation it
+  // arrived in* has ended, and an operation the supervisor is running is not over until it returns. The
+  // startup sequence is the case that matters - a re-anchor raised while (d) redelivers must not run its
+  // nested stop/start in the middle of the sequence, or the sequence's own (e) connection is issued over
+  // it and the run opens more than the one connection it should. A socket arrival never comes through a
+  // supervisor call, so its depth is zero and its request is carried out the moment the arrival ends.
+  let operationDepth = 0;
 
   const step = (name, detail) => {
     try {
@@ -145,6 +161,10 @@ export function createSupervisor(options = {}) {
     deferRecovery: true,
     onStop: (info) => recordStop(info),
     onRefetch: (info) => recordRefetch(info),
+    // The structure calls this once the execution right is back, after any operation it ran - a socket
+    // arrival in particular, which never comes through a supervisor API call. That is the moment a stop
+    // or a re-anchor recorded from inside the operation can be carried out.
+    onOperationEnd: () => settle(),
     onGap,
     onAck,
     onDiagnostic: (diagnostic) => {
@@ -168,22 +188,50 @@ export function createSupervisor(options = {}) {
    * asked for is dropped because it asked too early.
    */
   function settle() {
-    for (;;) {
-      if (ended) return;
-      if (stopRequest !== null) {
-        if (!carryStop()) return; // an operation still holds the right: its own exit will carry it out
+    // A request raised while one of the supervisor's own operations is running waits for that operation:
+    // its exit calls this again, at depth zero. This is what keeps a request from being carried out in the
+    // middle of the startup sequence - and the depth check sits before the re-entrancy guard, so a nested
+    // settle inside a supervisor operation does not mark the outer loop as running.
+    if (operationDepth > 0) return;
+    // Re-entrant calls are answered by the loop already running: the operations a recovery runs report
+    // their own end, and that end must not start a second pass over the same requests. A request raised
+    // by such a nested operation stays recorded and the outer loop picks it up on its next turn.
+    if (settling) return;
+    settling = true;
+    try {
+      for (;;) {
+        if (ended) return;
+        if (stopRequest !== null) {
+          if (!carryStop()) return; // an operation still holds the right: its own exit will carry it out
+          return;
+        }
+        if (refetchRequest !== null) {
+          if (!carryRefetch()) return;
+          continue;
+        }
         return;
       }
-      if (refetchRequest !== null) {
-        if (!carryRefetch()) return;
-        continue;
-      }
-      return;
+    } finally {
+      settling = false;
     }
   }
 
   /** The re-entrancy refusal a structure window answers with when another operation holds the right. */
   const refused = (result) => result !== null && typeof result === 'object' && result.code === 'REENTRANT_OPERATION';
+
+  /**
+   * Readiness: reception is admitted and the board is actually serving on the connection that is
+   * current. A structure that has merely opened a socket has proved nothing - the board is serving
+   * only once the current connection's frames have been applied and its boundary is proven (§5.7,
+   * C6/C7). `book.appliedBoundary.connectionId` is read live, so a re-anchor's new connection must
+   * have its own frames applied before this returns true again; and a stop, an end, or a stopped
+   * structure is never ready whatever the board's phase says.
+   */
+  function serving() {
+    if (!started || stopped || ended || closed) return false;
+    if (structure.stats.stopped) return false;
+    return structure.book.appliedBoundary.connectionId !== null && structure.book.isRunning === true;
+  }
 
   function carryStop() {
     const stoppedIt = stopStructure();
@@ -192,7 +240,7 @@ export function createSupervisor(options = {}) {
     refetchRequest = null;
     ended = true;
     stopped = true;
-    ready = false;
+    started = false;
     abnormal = true;
     exit(1);
     return true;
@@ -215,6 +263,7 @@ export function createSupervisor(options = {}) {
    */
   function carryRefetch() {
     const info = refetchRequest;
+    if (refetchRequest === null) return true;
     if (recoveries >= maxRecoveryAttempts) {
       recordStop({ market, reason: `the board could not be re-anchored after ${recoveries} attempts` });
       return true; // the request is now a stop, carried out by the loop
@@ -222,28 +271,60 @@ export function createSupervisor(options = {}) {
     // The old connection is abandoned first: its silence and stability timers, and any event it queued,
     // are checked against a socket that is already gone, so nothing of it can re-anchor the board.
     const stoppedIt = structure.stop();
-    if (refused(stoppedIt)) return false;
-    refetchRequest = null;
+    if (refused(stoppedIt)) return false; // the request stays: it is only answered once it is carried out
     recoveries += 1;
-    ready = false;
+    started = false;
     step('recover', { attempt: recoveries, connectionId: info?.connectionId ?? null });
     try {
       const announced = structure.start();
-      if (refused(announced)) return true; // the right came back; the start is owed another attempt next time
-      // The connection reports success by returning nothing: it is admitted unless a stop was raised in its
-      // announcement.
-      if (stopRequest === null && !structure.stats.stopped) ready = true;
+      // A refusal here means another operation holds the store's right again. The request is *not*
+      // cleared: it has not been carried out, and whoever holds the right will call settle() on the
+      // way out and owe it the same answer.
+      if (refused(announced)) return false;
     } catch (error) {
       recordStop({ market, reason: `the re-anchor failed: ${error.message}` });
+      return true;
     }
+    // The replacement started, so the request we answered is cleared - but only that one. A newer
+    // request recorded from inside the recovery (a connection the book again refused) is a different
+    // need and stays pending for the loop's next pass.
+    if (refetchRequest === info) refetchRequest = null;
+    if (stopRequest === null && !structure.stats.stopped) started = true;
     return true;
   }
 
   function runOperation(operation) {
+    operationDepth += 1;
     try {
       return operation();
     } finally {
+      // The operation has ended: only now may a request it raised be carried out, and the depth is back to
+      // what it was before, so a request raised inside settles here rather than from inside the operation.
+      operationDepth -= 1;
       settle();
+    }
+  }
+
+  /**
+   * Run one step of the startup sequence, turning a failure at that step into a stop and a non-zero
+   * end. A step that throws is exactly as fatal as one that reports failure: either the run did not
+   * reach reception, and a process that carried on from here would be one that never opened a socket
+   * while looking alive. The stop is recorded first, so a notification hook cannot swallow it, and
+   * because the end is abnormal the completion is never written.
+   */
+  function stepOrStop(name, run) {
+    try {
+      const value = run();
+      // A step that returns a re-entrancy refusal did not run either: another operation held the
+      // store's right, and treating that as success would carry on past work that never happened.
+      if (refused(value)) {
+        recordStop({ market, reason: `the ${name} step was refused as re-entrant: ${value.reason}` });
+        return { ok: false, reason: `the ${name} step was refused` };
+      }
+      return { ok: true, value };
+    } catch (error) {
+      recordStop({ market, reason: `the ${name} step failed: ${error.message}` });
+      return { ok: false, reason: `the ${name} step failed: ${error.message}` };
     }
   }
 
@@ -255,29 +336,45 @@ export function createSupervisor(options = {}) {
     return runOperation(() => {
       if (ended) return { started: false, reason: 'this supervisor has ended' };
       step('beginRun', {});
-      const begun = structure.beginRun();
-      if (begun?.begun === false) {
-        recordStop({ market, reason: begun.reason ?? 'the run could not be marked live' });
+      const begun = stepOrStop('beginRun', () => structure.beginRun());
+      if (!begun.ok) return { started: false, reason: begun.reason };
+      if (begun.value?.begun === false) {
+        recordStop({ market, reason: begun.value.reason ?? 'the run could not be marked live' });
         return { started: false, reason: 'the run could not be marked live' };
       }
       step('restore', {});
-      structure.restore();
+      const restored = stepOrStop('restore', () => structure.restore());
+      if (!restored.ok) return { started: false, reason: restored.reason };
+      if (stopRequest !== null || ended) return { started: false, reason: 'the store could not be restored' };
       step('drain', {});
       drainWithRetry();
-      if (ended || structure.stats.stopped) {
-        return { started: false, reason: 'recovery stopped the structure' };
+      // A drain that stopped recorded a stop: the sequence ends here rather than announcing a
+      // connection over a store whose old spool could not be drained.
+      if (stopRequest !== null || ended || structure.stats.stopped) {
+        return { started: false, reason: 'the old spool could not be drained' };
       }
-      // (d) and (e): start() redelivers what the raw holds and the board does not have, then announces the
-      // connection; the socket opens only if the book admits it in the real onGeneration.
+      // (d): redeliver what the raw holds and the board does not have, which fixes where the old
+      // connection's numbering can start - before the connection is announced, because a completion
+      // heard before these frames could carry a start above a frame the store already holds (§2.2).
+      step('redeliver', {});
+      const redelivered = stepOrStop('redeliver', () => structure.redeliverPending());
+      if (!redelivered.ok) return { started: false, reason: redelivered.reason };
+      if (stopRequest !== null || ended || structure.stats.stopped) {
+        return { started: false, reason: 'redelivery stopped the structure' };
+      }
+      // (e): announce the connection; the socket opens only if the book admits it in the real
+      // onGeneration.
       step('start', {});
-      const announced = structure.start();
-      if (announced && announced.started === false) return announced;
+      const announced = stepOrStop('start', () => structure.start());
+      if (!announced.ok) return { started: false, reason: announced.reason };
+      if (announced.value && announced.value.started === false) return announced.value;
       // The connection reports its own start by returning nothing; whether it was admitted is visible in the
-      // stop a refused connection raises, and in the structure having stopped.
-      if (stopRequest !== null || structure.stats.stopped) {
+      // stop a refused connection raises, and in the structure having stopped. A run the hook already ended
+      // (the refusal was carried out the moment the announcement's operation finished) is not a start either.
+      if (stopRequest !== null || ended || structure.stats.stopped) {
         return { started: false, reason: 'the connection was not admitted' };
       }
-      ready = true;
+      started = true;
       return { started: true, connectionId: structure.connection.connectionId };
     });
   }
@@ -287,10 +384,12 @@ export function createSupervisor(options = {}) {
     for (;;) {
       const drained = structure.drainSpool();
       if (!drained?.stopped) return drained;
-      // Only a raw that refused a record is the transient case: the spool may be handed back once the raw
-      // can take it. A spool that cannot be read, a failed save or a refused admission is not something a
-      // retry improves, and those stop the run.
-      const transient = /raw still refused/.test(String(drained.stopped));
+      // The machine-readable code decides what a retry can improve. Only a raw that refused a record is
+      // the transient case: the spool may be handed back once the raw can take it. A spool that cannot
+      // be read, a frame the store could not save, or a connection the board has not accepted is not
+      // something a retry improves, and those stop the run. The report keeps the string form for people;
+      // the classification is the code.
+      const transient = drained.stoppedCode === 'raw-refused';
       if (transient && attempts < maxRecoveryAttempts) {
         attempts += 1;
         continue;
@@ -312,7 +411,7 @@ export function createSupervisor(options = {}) {
       runOperation(() => {
         if (closed) return { stopped: false, reason: 'this supervisor is closed' };
         stopped = true;
-        ready = false;
+        started = false;
         if (!ended) {
           ended = true;
           stopStructure();
@@ -339,7 +438,7 @@ export function createSupervisor(options = {}) {
       settle();
     },
     get ready() {
-      return ready;
+      return serving();
     },
     get stopped() {
       return stopped;
