@@ -286,29 +286,18 @@ export function createStructure({
   }
 
   /**
-   * The write half of invalidateProofForMissing: drop the proof of the connection the board follows, and
-   * say whether that is what happened. It is separate so the two records this decision makes - the
-   * ledger's row for the loss and the dropped proof - can be written inside one transaction, with the
-   * refetch request (a hook) outside it.
+   * The write half of declaring a range of the followed connection missing: the board's record of it, and
+   * nothing else. It is separate from dropping the proof because the two have to happen on either side of a
+   * commit - the record inside the transaction that also writes the ledger's row, the proof afterwards. A
+   * rollback takes the write back, and it cannot take an in-memory fact back with it.
+   *
+   * Only the connection the board follows concerns the board (C11); a loss of another connection is history.
    */
-  function dropFollowedProof(connectionId, reason) {
+  function declareFollowedMissing(connectionId, reason) {
     const followed = book.appliedBoundary.connectionId;
     if (followed === null || connectionId !== followed) return false;
-    const result = bookInternal.invalidateProof(
-      connectionId,
-      `a range of this connection was declared missing: ${reason}`,
-    );
-    return result?.invalidated === true;
-  }
-
-  /**
-   * A missing range is a fact about the connection that lost it. When it is the connection the board is
-   * following, the proof the board holds no longer covers what is on it, so the proof is dropped - a
-   * proof that outlived its range would put the board straight back into service on the next success.
-   * A loss of any other connection is history, and it must not block the board running now (C7, C11).
-   */
-  function invalidateProofForMissing(connectionId, reason) {
-    if (dropFollowedProof(connectionId, reason)) requestRefetch(connectionId);
+    bookInternal.declareMissing(connectionId, `a range of this connection was declared missing: ${reason}`);
+    return true;
   }
 
   /**
@@ -355,21 +344,25 @@ export function createStructure({
       const reason = tooOld
         ? `the delivery ledger's retention bound passed this frame: it is older than ${ledgerRetentionMs} ms`
         : `the delivery ledger's retention bound passed this frame: the ledger holds more than ${ledgerRetentionBytes} bytes`;
-      // The loss and the proof it invalidates are one fact about the store, so they are written in one
-      // transaction: a ledger row that says the range is gone while the board still holds a proof over it
-      // is a state only a crash could leave, and the restart would then apply frames the proof never
-      // covered. The report and the request are hooks, so they are made after the commit.
+      // The loss and the record of the proof it invalidates are one fact about the store, so they are
+      // written in one transaction: a ledger row that says the range is gone while the board still holds a
+      // proof over it is a state only a crash could leave, and the restart would then apply frames the
+      // proof never covered. The proof itself is dropped in memory only after this transaction commits -
+      // and the report and the request are hooks, so they are made after it too.
       const { decided, invalidated } = wiring.inTransaction(() => {
         const skipped = ledgerInternal.skip(entry.connectionId, entry.receiveSeq, reason);
         return {
           decided: skipped.decided,
-          invalidated: skipped.decided ? dropFollowedProof(entry.connectionId, reason) : false,
+          invalidated: skipped.decided ? declareFollowedMissing(entry.connectionId, reason) : false,
         };
       });
       if (decided) {
         swept += 1;
         onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: entry.receiveSeq });
-        if (invalidated) requestRefetch(entry.connectionId);
+        if (invalidated) {
+          bookInternal.dropProof(entry.connectionId);
+          requestRefetch(entry.connectionId);
+        }
       }
       remaining -= entry.bytes;
     }

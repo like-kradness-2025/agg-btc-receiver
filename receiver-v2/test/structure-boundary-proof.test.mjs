@@ -216,3 +216,29 @@ test('a frame the rule accepts puts the board in service through the structure, 
     assert.equal(refetch.length, 0, 'nothing needed a re-anchor');
   });
 });
+
+test('a commit that never lands leaves the board serving, because the store still holds its proof', async () => {
+  // The proof follows the commit, never the write: the sweep's writes are taken back together, and an
+  // in-memory fact cannot be taken back with them. A board left refusing to serve over a loss the store
+  // does not hold is a board stopped by a fact that never happened.
+  await withStructure(
+    async ({ structure, refetch, parts, inject, store }) => {
+      assert.equal(structure.feed(envelope(1, 1)).applied, true);
+      assert.equal(parts.book.proveBoundary().proven, true, 'the board is serving before the loss');
+      assert.equal(parts.ledger.record(envelope(7, 7, { meta: null }), 'durable and held').recorded, true);
+      clock += 10 * 60 * 1000;
+
+      inject.armCommitFailure();
+      assert.throws(() => structure.drainSpool(), /injected write failure/, 'the commit was refused');
+      assert.equal(structure.ledger.find(CONNECTION, 7).state, 'owed', 'the loss was not decided');
+      assert.equal(
+        internalsOf(store).db.prepare('SELECT COUNT(*) AS n FROM book_missing_record').get().n,
+        0,
+        'and no record of it was left behind',
+      );
+      assert.equal(parts.book.proveBoundary().proven, true, 'so the board is still serving');
+      assert.equal(refetch.length, 0, 'and nothing asks for a re-anchor');
+    },
+    { injectable: true },
+  );
+});

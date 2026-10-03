@@ -392,3 +392,18 @@ test('a frame the proof refuses does not write the origin it declared', async ()
     sequenceAdapter(({ previous }) => previous !== null),
   );
 });
+
+test('dropping a proof names the connection the board follows, and no other', async () => {
+  // The book enforces this itself rather than trusting its caller: a loss of another connection is history,
+  // and a board that stopped serving over one would be stopped by something that never concerned it (C11).
+  await withBook(async ({ book }) => {
+    book.accept('conn-1', { firstSeq: 1 });
+    assert.equal(book.apply({ envelope: envelope(1, 1), changes: [change(1)] }).applied, true);
+    assert.equal(book.proveBoundary().proven, true);
+
+    assert.equal(book.dropProof('conn-2').dropped, false, 'another connection is not the board\u2019s');
+    assert.equal(book.proveBoundary().proven, true, 'so the board is still serving');
+    assert.equal(book.dropProof('conn-1').dropped, true);
+    assert.equal(book.proveBoundary().proven, false, 'its own loss stops it');
+  }, sequenceAdapter());
+});

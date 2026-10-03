@@ -10,7 +10,7 @@
 import { bindInternals, internalsOf } from '../src/internal/wiring.mjs';
 
 export function withInjectableWrites(store) {
-  const armed = { pattern: null };
+  const armed = { pattern: null, commit: null };
   const watchers = { onWrite: null };
   const internal = internalsOf(store);
   const db = {
@@ -33,13 +33,38 @@ export function withInjectableWrites(store) {
       };
     },
   };
+  // The commit itself, refused on request. An INSERT failure cannot show what a rollback does to the
+  // process's own memory: there the write never landed, so nothing was ever followed. Refusing the commit
+  // is the case where the writes did land inside the transaction and are taken back afterwards.
+  const inTransaction = (fn) => {
+    const refuse = armed.commit;
+    armed.commit = null;
+    internal.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      if (refuse) throw new Error('injected write failure');
+      internal.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        internal.db.exec('ROLLBACK');
+      } catch {
+        // the original failure is the one to report
+      }
+      throw error;
+    }
+  };
   const wrapped = { ...store };
-  bindInternals(wrapped, { ...internal, db });
+  bindInternals(wrapped, { ...internal, db, inTransaction });
   return {
     durability: wrapped,
     /** Fail the next write whose SQL matches, once. */
     armWriteFailure: (pattern) => {
       armed.pattern = pattern;
+    },
+    /** Refuse the next commit, once: the transaction's writes are rolled back after they ran. */
+    armCommitFailure: () => {
+      armed.commit = true;
     },
     /** Watch every write. The callback runs inside the transaction that owns it. */
     onWrite: (fn) => {

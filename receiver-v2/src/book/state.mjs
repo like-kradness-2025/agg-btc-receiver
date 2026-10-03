@@ -483,6 +483,17 @@ function openBookWithin(options, wiring) {
   }
 
   /**
+   * The in-memory half of a broken proof: the board stops serving, and only a replacement answers it.
+   */
+  function breakProof(connectionId) {
+    proof.state = BROKEN;
+    proof.connectionId = connectionId ?? proof.connectionId;
+    proof.anchorSeq = null;
+    proof.upToSeq = null;
+    phase = SYNCING;
+  }
+
+  /**
    * The rule did not hold: the proof is dropped and the board stops serving until a replacement.
    *
    * The break is written down rather than kept in memory: a restart that came back merely unanchored
@@ -494,14 +505,15 @@ function openBookWithin(options, wiring) {
     const connectionId = envelope?.connection_id ?? proof.connectionId;
     // The write comes first, and the in-memory book follows it: a record that cannot be written must leave
     // the book exactly as it was, memory included - the discipline every durable change here follows.
+    //
+    // This is the whole act for a caller that is not inside a transaction of its own. A caller that is -
+    // the retention sweep, which must write the ledger's row for the loss and this record together - writes
+    // through `declareMissingNow` and drops the proof with `dropProofNow` once its commit has landed: a
+    // rollback takes a write back, and it cannot take an in-memory fact back with it.
     if (connectionId !== null) {
       missingRecordStatement.run(market, stream, connectionId, reason, nowMs());
     }
-    proof.state = BROKEN;
-    proof.connectionId = connectionId;
-    proof.anchorSeq = null;
-    proof.upToSeq = null;
-    phase = SYNCING;
+    breakProof(connectionId);
   }
 
   /**
@@ -690,6 +702,30 @@ function openBookWithin(options, wiring) {
       anchorSeq: proof.anchorSeq,
       upToSeq: proof.upToSeq,
     };
+  }
+
+  /**
+   * Write down that a range of this connection is gone, and nothing else.
+   *
+   * Separated from dropping the proof so that a caller holding a transaction open around this write - the
+   * retention sweep, which writes the ledger's row for the loss in the same transaction - can drop the
+   * proof itself once its commit has landed. A rollback takes a write back; it cannot take an in-memory
+   * fact back with it, so the memory follows the commit, never the write.
+   */
+  function declareMissingNow(connectionId, reason) {
+    if (connectionId === null) return { recorded: false };
+    missingRecordStatement.run(market, stream, connectionId, reason, nowMs());
+    return { recorded: true };
+  }
+
+  /**
+   * Drop the proof in memory, for a caller whose write has been committed. Only the connection the board
+   * follows stops the board serving (C11); a loss of another connection is history.
+   */
+  function dropProofNow(connectionId) {
+    if (connectionId !== applied.connectionId) return { dropped: false };
+    breakProof(connectionId);
+    return { dropped: true };
   }
 
   const api = {
@@ -1068,6 +1104,20 @@ function openBookWithin(options, wiring) {
     },
 
     /**
+     * Write down that a range of this connection is gone. The proof is not dropped here: a caller that
+     * holds a transaction open around this write drops it itself once the commit has landed, so that a
+     * rollback cannot leave a board refusing to serve on the strength of a fact the store does not hold.
+     */
+    declareMissing(connectionId, reason = 'a range of this connection was declared missing') {
+      return declareMissingNow(connectionId, reason);
+    },
+
+    /** The in-memory half of the pair above: the board stops serving, after the write has committed. */
+    dropProof(connectionId) {
+      return dropProofNow(connectionId);
+    },
+
+    /**
      * A range of this connection has been declared missing. The proof covered a range with a hole in it,
      * so it is dropped rather than left standing: a proof that outlived its range would put the book
      * straight back into service on the next success. The record is written down, so a restart comes back
@@ -1075,13 +1125,14 @@ function openBookWithin(options, wiring) {
      *
      * A loss of another connection is history too, and it must not block the board running now: this is a
      * no-op unless the connection named is the one this board follows (C11).
+     *
+     * For a caller outside a transaction this is the whole act - the write, then the memory. A caller
+     * inside one uses `declareMissing` and `dropProof` around its own commit.
      */
     invalidateProof(connectionId, reason = 'a range of this connection was declared missing') {
       if (connectionId !== applied.connectionId) return { invalidated: false };
-      // The record and the dropped proof are the same fact, so the reason is written with them: writing a
-      // default first and overwriting it would leave the store saying one thing and then the other, and
-      // the reason is what the restart reads.
-      markProofBroken({ connection_id: connectionId }, reason);
+      declareMissingNow(connectionId, reason);
+      dropProofNow(connectionId);
       return { invalidated: true };
     },
   };
@@ -1106,12 +1157,16 @@ function openBookWithin(options, wiring) {
     beginSync: api.beginSync,
     proveBoundary: api.proveBoundary,
     invalidateProof: api.invalidateProof,
+    declareMissing: api.declareMissing,
+    dropProof: api.dropProof,
   };
   api.accept = wiring.guard('book.accept', internal.accept);
   api.apply = wiring.guard('book.apply', internal.apply, (refusal) => ({ applied: false, code: refusal.code, reason: refusal.reason }));
   api.beginSync = wiring.guard('book.beginSync', internal.beginSync);
   api.proveBoundary = wiring.guard('book.proveBoundary', internal.proveBoundary);
   api.invalidateProof = wiring.guard('book.invalidateProof', internal.invalidateProof, (refusal) => ({ invalidated: false, code: refusal.code, reason: refusal.reason }));
+  api.declareMissing = wiring.guard('book.declareMissing', internal.declareMissing, (refusal) => ({ recorded: false, code: refusal.code, reason: refusal.reason }));
+  api.dropProof = wiring.guard('book.dropProof', internal.dropProof, (refusal) => ({ dropped: false, code: refusal.code, reason: refusal.reason }));
 
   bindInternals(api, internal);
   return api;
