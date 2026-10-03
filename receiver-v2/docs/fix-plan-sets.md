@@ -537,6 +537,17 @@
   - **当方の決定（設計に規定なし・記録）**: ①**accept の経路** — organize の単一ソケット・トポロジでは ingest の `accept` は **relay** される必要がある（段階4は「受けた `accept` を book が裁定して `accepted` を返す」ところまで。**段階3の organize はまだ relay していない → 段階5で relay するか経路を張り替える**）②**`book_invalidation` 表の追加**（裁定②の所有表には無かったが④⑤が同一tx書込みを要求するため book 所有で追加）③**`changesFor` の継ぎ目** — organize→book のフレーム配送本体が未配線のため、レベル変化の導出主体が未定 → 本段階は**注入フック**で受ける（raw 読み出しを勝手に作らない）。
   - **段階5へ残した**: 実トポロジの supervisor 結線（起動/停止順・子再起動・readiness 集約・**実3プロセス通し**）／organize→book の owed フレーム配送本体＋レベル変化の導出／失効の「告知」の宛先／起動時の未完 `pending_boundary` の適用・取消／台帳の保持期限 sweep／canonical raw。
 
+**段階5前の設計確認（Astra・2026-10-04・判定: 修正要求）**:
+1. **トポロジは supervisor 所有のソケット／ルーティングへ変更**（organize ハブは採らない — 整理障害を ingest↔book の通信障害に広げるため）。supervisor は**宛先・送信元 instance・接続状態を検証**するが、**accept 認可・耐久判定・板処理は行わない**（「中身を解釈しない」は**業務 payload に限定**）。中継は**有界・非耐久**、**送信成功を ACK に代用しない**、**再送責任は各所有者に残す**。
+2. **accept の経路**: **ingest が要求を発行 → supervisor → book が認可**（裁定⑫と矛盾しない）。**book の確定後、organize が採用状態を反映し、その完了を確認して** ingest の受信開始を許可。**book の成功応答だけでソケットを開かない** ✗。**organize の無条件 `accepted:true` は撤去**。途中切断・応答欠落は**同一要求の冪等再送**で回復。要求/応答は `request_id`・受信 run/世代・対象接続・**現役 instance** に結び付け、**supervisor は認可応答を捏造しない**。
+3. **レベル変化の導出は ingest**（封筒に載せる。**supervisor にアダプタを置かない**）。導出結果を**spool と `delivery_ledger` に保持**し、復旧・再配送でも**同じ結果**を使う。**形式の版と検証規則**を定め、**欠落を空の変更として黙認しない**。organize のアダプタ複製は不要。
+4. **`book_invalidation` の book 所有を追認**（所有表・移行・復旧契約に正式追加）。
+
+**段階5の結線対象（明記）**: organize→book の **owed フレーム配送本体**／**未完 `pending_boundary` の復旧**／**台帳の保持期限 sweep**／**失効の告知先**。
+**停止順の区別（裁定）**: 「**処理を止める順**」と「**プロセスを終了する順**」を分け、**book の停止結果を確認するまで organize の完了記録能力を残す**。**全ACKだけで正常終了扱いにしない**。
+**運用切替は段階6の指定障害訓練まで承認しない**。canonical raw は既承認の別課題のまま。
+**段階5の分割（実施）**: **5a**＝supervisor のソケット/ルーティング所有＋accept 経路の是正＋変化導出の ingest 移設（+ 無条件 accepted の撤去）／**5b**＝起動(a)〜(e) の写像・停止順（処理/終了の分離）・子再起動・readiness 集約・`busy_timeout=0`＋プロセス間排他＋旧所有者の終了確認・**実3プロセス通し**。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。
