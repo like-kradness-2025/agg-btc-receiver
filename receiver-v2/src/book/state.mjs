@@ -1104,20 +1104,6 @@ function openBookWithin(options, wiring) {
     },
 
     /**
-     * Write down that a range of this connection is gone. The proof is not dropped here: a caller that
-     * holds a transaction open around this write drops it itself once the commit has landed, so that a
-     * rollback cannot leave a board refusing to serve on the strength of a fact the store does not hold.
-     */
-    declareMissing(connectionId, reason = 'a range of this connection was declared missing') {
-      return declareMissingNow(connectionId, reason);
-    },
-
-    /** The in-memory half of the pair above: the board stops serving, after the write has committed. */
-    dropProof(connectionId) {
-      return dropProofNow(connectionId);
-    },
-
-    /**
      * A range of this connection has been declared missing. The proof covered a range with a hole in it,
      * so it is dropped rather than left standing: a proof that outlived its range would put the book
      * straight back into service on the next success. The record is written down, so a restart comes back
@@ -1126,8 +1112,10 @@ function openBookWithin(options, wiring) {
      * A loss of another connection is history too, and it must not block the board running now: this is a
      * no-op unless the connection named is the one this board follows (C11).
      *
-     * For a caller outside a transaction this is the whole act - the write, then the memory. A caller
-     * inside one uses `declareMissing` and `dropProof` around its own commit.
+     * This is the whole act - write, then memory - and it is for a caller outside a transaction. The two
+     * halves it is made of (`declareMissingNow`, `dropProofNow`) are reachable only through the wiring's
+     * internals, never as methods on the object a caller is handed: a caller that could take half the act
+     * could drop a proof without writing why, or write a loss it never dropped the proof for.
      */
     invalidateProof(connectionId, reason = 'a range of this connection was declared missing') {
       if (connectionId !== applied.connectionId) return { invalidated: false };
@@ -1157,16 +1145,17 @@ function openBookWithin(options, wiring) {
     beginSync: api.beginSync,
     proveBoundary: api.proveBoundary,
     invalidateProof: api.invalidateProof,
-    declareMissing: api.declareMissing,
-    dropProof: api.dropProof,
+    // The two halves of the act above, for the wiring that has to put a commit between them. They are not
+    // methods on the object handed out: a caller that could take half of it could drop a proof without
+    // writing down why, or write a loss it never dropped the proof for.
+    declareMissing: declareMissingNow,
+    dropProof: dropProofNow,
   };
   api.accept = wiring.guard('book.accept', internal.accept);
   api.apply = wiring.guard('book.apply', internal.apply, (refusal) => ({ applied: false, code: refusal.code, reason: refusal.reason }));
   api.beginSync = wiring.guard('book.beginSync', internal.beginSync);
   api.proveBoundary = wiring.guard('book.proveBoundary', internal.proveBoundary);
   api.invalidateProof = wiring.guard('book.invalidateProof', internal.invalidateProof, (refusal) => ({ invalidated: false, code: refusal.code, reason: refusal.reason }));
-  api.declareMissing = wiring.guard('book.declareMissing', internal.declareMissing, (refusal) => ({ recorded: false, code: refusal.code, reason: refusal.reason }));
-  api.dropProof = wiring.guard('book.dropProof', internal.dropProof, (refusal) => ({ dropped: false, code: refusal.code, reason: refusal.reason }));
 
   bindInternals(api, internal);
   return api;

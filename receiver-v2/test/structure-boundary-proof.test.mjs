@@ -44,7 +44,7 @@ const exactSuccessor = ({ previous, current, replace }) =>
 
 let clock = 1_000_000;
 
-async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false, gapThrows = false, rawRefuses = false } = {}) {
+async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false, gapThrows = false, rawRefuses = false, refetchThrowsOnce = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'proof-structure-'));
   const base = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
   const inject = injectable ? withInjectableWrites(base) : null;
@@ -52,6 +52,7 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
   const refetch = [];
   const gaps = [];
   let rawCalls = 0;
+  let refetchThrew = false;
   const structure = createStructure({
     market: MARKET,
     stream: STREAM,
@@ -81,7 +82,13 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
       if (gapThrows) throw new Error('the gap hook refused');
       gaps.push(gap);
     },
-    onRefetch: (request) => refetch.push(request),
+    onRefetch: (request) => {
+      if (refetchThrowsOnce && !refetchThrew) {
+        refetchThrew = true;
+        throw new Error('the refetch hook refused');
+      }
+      refetch.push(request);
+    },
     onDiagnostic: () => {},
   });
   structure.accept(CONNECTION, { runId: 'run-1', generation: 1, firstSeq: 1 });
@@ -293,5 +300,30 @@ test('a stop that could not be reported is still a stop', async () => {
       assert.equal(rawWrites(), reached, 'the raw is not reached again');
     },
     { rawRefuses: true, gapThrows: true },
+  );
+});
+
+test('a re-anchor request that could not be delivered is asked again', async () => {
+  // The request *is* the notification, so it is recorded as made only once a caller has heard it: a request
+  // recorded as made but never delivered leaves the board waiting for an answer to a question nobody asked.
+  await withStructure(
+    async ({ structure, refetch, parts }) => {
+      assert.equal(structure.feed(envelope(1, 1)).applied, true);
+      assert.equal(parts.book.proveBoundary().proven, true, 'the board is serving');
+      assert.equal(parts.ledger.record(envelope(7, 7, { meta: null }), 'durable and held').recorded, true);
+      clock += 10 * 60 * 1000;
+
+      // The sweep decides the loss and asks for a re-anchor; the caller's hook refuses to hear it.
+      assert.throws(() => structure.drainSpool(), /the refetch hook refused/);
+      assert.equal(refetch.length, 0, 'the request was never delivered');
+
+      // The next frame breaks the proof the same way, and the request is made this time - because the first
+      // one never was.
+      const broken = structure.feed(envelope(2, 50));
+      assert.equal(broken.applied, false);
+      assert.match(String(broken.reason), /proof is broken/);
+      assert.equal(refetch.length, 1, 'and this time the request lands');
+    },
+    { refetchThrowsOnce: true },
   );
 });

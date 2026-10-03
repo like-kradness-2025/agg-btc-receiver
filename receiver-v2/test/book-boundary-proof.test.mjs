@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { makeEnvelope } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { openBook } from '../src/book/state.mjs';
+import { internalsOf } from '../src/internal/wiring.mjs';
 
 const MARKET = 'kraken_spot';
 const STREAM = 'trades';
@@ -401,9 +402,10 @@ test('dropping a proof names the connection the board follows, and no other', as
     assert.equal(book.apply({ envelope: envelope(1, 1), changes: [change(1)] }).applied, true);
     assert.equal(book.proveBoundary().proven, true);
 
-    assert.equal(book.dropProof('conn-2').dropped, false, 'another connection is not the board\u2019s');
+    const internal = internalsOf(book);
+    assert.equal(internal.dropProof('conn-2').dropped, false, 'another connection is not the board\u2019s');
     assert.equal(book.proveBoundary().proven, true, 'so the board is still serving');
-    assert.equal(book.dropProof('conn-1').dropped, true);
+    assert.equal(internal.dropProof('conn-1').dropped, true);
     assert.equal(book.proveBoundary().proven, false, 'its own loss stops it');
   }, sequenceAdapter());
 });

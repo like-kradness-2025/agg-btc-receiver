@@ -307,13 +307,16 @@ export function createStructure({
    */
   function requestRefetch(connectionId) {
     if (refetchRequested) return;
-    refetchRequested = true;
+    // The request *is* the notification, so the flag is set only once the caller has been told: a hook that
+    // throws leaves the request un-made and the next delivery asks again. A recovery request that was never
+    // delivered must not be recorded as delivered, or nobody ever hears it and the board waits for ever.
     onRefetch({
       market,
       stream,
       connectionId,
       reason: 'the board needs a re-anchor: no replacement has arrived',
     });
+    refetchRequested = true;
   }
 
   /**
@@ -485,9 +488,12 @@ export function createStructure({
     try {
       connection?.stop?.();
     } catch (error) {
-      // Nothing here can do anything useful about a socket that will not close; the stop is recorded and the
-      // caller has been told, which is what matters.
-      onDiagnostic({ market, reason: `reception could not be closed: ${error.message}` });
+      try {
+        onDiagnostic({ market, reason: `reception could not be closed: ${error.message}` });
+      } catch {
+        // A diagnostic is best-effort by contract. It is wrapped rather than left to run: a diagnostic hook
+        // that throws must not be able to swallow the news that reception has stopped, which comes next.
+      }
     }
     onStop({ market, reason });
   }
