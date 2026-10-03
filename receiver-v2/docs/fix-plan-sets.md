@@ -518,6 +518,15 @@
 
 **障害訓練の合格条件**: 各訓練で ①欠落0 ②重複0 ③**fail-closed が実際に発火した記録** ④`data_complete` が実態一致 ⑤再起動後の板が snapshot＋再送で正しい。未通過なら切替しない（併走/切替の作業に進まない）。
 
+**段階1 実装（2026-10-04・commit `<STAGE1>`）**: `src/ipc-message.mjs`（新規＝契約モジュール）に共通形・語彙14種・**type 別の必須フィールド表**・型検証つき `make/encode/decode` を定義し、`src/ipc.mjs` のフレーミング／512/100ms バッチ／有界バッファ／連続 durable 上限（`sendAck`）／壊れフレーム1回報告＋閉鎖に**制御を TAG_CONTROL 経由で結合**。encode・decode の**両方で必須欠落・未知 type・型不一致を拒否**（黙って通さない）。**運用経路は無変更**（`ipc.mjs` は src/bin から import 0件のまま）。テスト **383/383**（+18）。裁定どおり**段階1のみ**で、停止の実装は段階5。
+
+**段階1で実装者が自分で決めた点（記録・必要なら裁定）**:
+- **type 別必須フィールド表**（裁定⑪は「共通形と語彙」のみを明示）: 全 type に `version/type/role_instance`。`hello` に `run_id`／`accept`・`accepted`・`resend`・`invalidate`・`invalidated` に `request_id`＋対象識別／`durable_ack`・`applied_ack` に `run_id/market/stream/connection_id/generation`＋`payload`／`stop`・`stopped` に `request_id`／`tail_sealed`・`drained` に `run_id`＋`payload`／`error`・`readiness` に `payload`。**握手の向き**と `accept`/`accepted` に `request_id` を要するかは文書から一意でないため**当方の決定**。
+- **market/stream の必須が一律でない**（接続スコープの ack には要る／`accept`・`invalidate` には入れない）: 接続識別に stream が要るかの判断（C1/C2 の接続名は stream を含まない）。
+- **共通形外の追加キーは拒否**（厳格解釈）: 将来フィールドを足すときは緩める必要がある。
+- **契約違反の制御メッセージは「チャネル終端」**（既存の「decode エラーは終端」規約の再利用）。破棄して継続する選択肢もあり得る（文書未指定）。
+- `version=1` 固定・ネゴシエーションなし。`payload` は**存在のみ検証**（内容は段階2以降）。`sendAck` のシグネチャ変更に伴い既存 `ipc.test.mjs` の1アサーションを新契約に合わせ更新（新契約が要求）。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。

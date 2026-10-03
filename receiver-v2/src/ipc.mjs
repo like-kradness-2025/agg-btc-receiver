@@ -19,6 +19,7 @@
 import net from 'node:net';
 
 import { FRAME_MAX_BYTES, createFrameDecoder, decodeEnvelope, encodeEnvelope, frame } from './envelope.mjs';
+import { IPC_VERSION, decodeMessage, encodeMessage } from './ipc-message.mjs';
 
 /** First byte of every payload. Data and control must never be confused. */
 export const TAG_ENVELOPE = 0x01;
@@ -102,10 +103,6 @@ function framePayload(tag, body) {
   payload[0] = tag;
   body.copy(payload, 1);
   return payload;
-}
-
-function encodeControl(message) {
-  return Buffer.from(JSON.stringify(message), 'utf8');
 }
 
 /**
@@ -209,14 +206,46 @@ export function createChannel(socket, options = {}) {
     return push(framePayload(TAG_ENVELOPE, encodeEnvelope(envelope)));
   }
 
-  /** Queue one control message (ack, resend request, capacity report). */
+  /**
+   * Queue one control message. The message is the common IPC shape (src/ipc-message.mjs): an
+   * invalid one - unknown type, missing required field, wrong type - is refused here, before it is
+   * framed, so nothing off-contract reaches the wire. False still means only one thing: the queue
+   * is over its bound.
+   */
   function sendControl(message) {
-    return push(framePayload(TAG_CONTROL, encodeControl(message)));
+    return push(framePayload(TAG_CONTROL, encodeMessage(message)));
   }
 
-  /** Acknowledge a contiguous durable range. The value comes from contiguousCeiling, not from a guess. */
-  function sendAck({ connectionId, upToSeq, capacity }) {
-    return sendControl({ t: 'ack', connection_id: connectionId, up_to_seq: upToSeq, capacity });
+  /**
+   * Acknowledge a contiguous durable range. The value comes from contiguousCeiling, not from a
+   * guess. The acknowledgement is a `durable_ack` message carrying its own role instance and the
+   * stream identity it concerns; the ceiling and capacity travel in the (uninterpreted) payload.
+   */
+  function sendAck({
+    roleInstance,
+    requestId = null,
+    runId,
+    market,
+    stream,
+    connectionId,
+    generation,
+    upToSeq,
+    capacity,
+    version = IPC_VERSION,
+  }) {
+    const message = {
+      version,
+      type: 'durable_ack',
+      role_instance: roleInstance,
+      run_id: runId,
+      market,
+      stream,
+      connection_id: connectionId,
+      generation,
+      payload: { up_to_seq: upToSeq, capacity },
+    };
+    if (requestId !== null) message.request_id = requestId;
+    return sendControl(message);
   }
 
   socket.on('data', (chunk) => {
@@ -236,7 +265,7 @@ export function createChannel(socket, options = {}) {
       const body = payload.subarray(1);
       try {
         if (tag === TAG_ENVELOPE) onEnvelope(decodeEnvelope(body), payload);
-        else if (tag === TAG_CONTROL) onControl(JSON.parse(body.toString('utf8')), payload);
+        else if (tag === TAG_CONTROL) onControl(decodeMessage(body), payload);
         else fail(new TypeError(`unknown tag ${tag}`));
       } catch (error) {
         // Any error on this channel is terminal. A frame that cannot be decoded leaves the stream's

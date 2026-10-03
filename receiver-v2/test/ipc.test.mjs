@@ -88,7 +88,16 @@ test('envelopes and control messages arrive on their own paths', async () => {
   const client = await connect(path);
   client.sendEnvelope(envelope(1));
   client.sendEnvelope(envelope(2));
-  client.sendAck({ connectionId: 'conn-1', upToSeq: 2, capacity: 'ok' });
+  client.sendAck({
+    roleInstance: 'organize-1',
+    runId: 'run-1',
+    market: 'kraken_spot',
+    stream: 'trades',
+    connectionId: 'conn-1',
+    generation: 0,
+    upToSeq: 2,
+    capacity: 'ok',
+  });
   client.flush();
 
   await until(() => got.envelopes.length === 2 && got.controls.length === 1);
@@ -96,7 +105,17 @@ test('envelopes and control messages arrive on their own paths', async () => {
   assert.equal(got.envelopes[1].receive_seq, 2);
   assert.equal(got.envelopes[1].raw.toString('utf8'), '{"seq":2}');
   assert.equal(got.envelopes[1].connection_id, 'conn-1');
-  assert.deepEqual(got.controls[0], { t: 'ack', connection_id: 'conn-1', up_to_seq: 2, capacity: 'ok' });
+  assert.deepEqual(got.controls[0], {
+    version: 1,
+    type: 'durable_ack',
+    role_instance: 'organize-1',
+    run_id: 'run-1',
+    market: 'kraken_spot',
+    stream: 'trades',
+    connection_id: 'conn-1',
+    generation: 0,
+    payload: { up_to_seq: 2, capacity: 'ok' },
+  });
 
   client.close();
   await server.close();
