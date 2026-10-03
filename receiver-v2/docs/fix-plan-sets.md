@@ -482,6 +482,42 @@
 - **受入結果（最終レビューが実測・実プロセス）**: ①**撤去の完全性** ✓（`src/raw` 消滅・入口チェーンに raw 更新経路なし・`raw` 入り設定は終了1でファイルを作らない）②**no-raw の durable は処理状態の耐久性として成立** ✓（`onAck` 内で子プロセスを即終了させて実測: 未適用の生バイト＋meta＋接続識別情報は**台帳の owed 行に保持**され、再起動で板へ適用・台帳解放。**適用後は保存契約から外れる**）③**ack は板への適用完了も raw 履歴保存も保証しない**（入口の `onAck` は既定の空関数・venue への受理ACK送信なし）＝**過剰な約束なし** ✓ ④spool／C8／確定順序の整合 ✓ ⑤rawWriter を与えた場合の表示・挙動は不変 ✓（12ファイル中11は無変更、関数指定時の確定条件は `true` のみ）。
 - **結了時状態**: `npm test` **338/338**、branch `feat/receiver-split`。**「raw の耐久性を達成した」とは記録しない** ✓。canonical raw は §8 の別課題へ ✓。
 
+## 5.8 3プロセス化（設計。Astra 判定: 修正要求 → 反映済み 2026-10-04）
+
+仕様 §1・§2・§8.3、C9 item4、**C11 完了条件**。設計ドラフト `/home/weed420/.hermes/cache/scratch/design-3proc.md` に対し、アストラの裁定（16項）を反映した確定設計。**実装は段階分割**（下記）。
+
+**骨格**: **案C（役割別に DB を物理分割し、各 DB は当該役割だけが開く。他役割の参照は IPC）** を採用。加えて **役割をまたぐ段は「先に書く→後で告知」だけでは不可** ✗（**告知を取り逃したプロセスが古い前提で提供を続ける穴**）→ **失効要求の永続化と応答の往復**を必須にする。
+
+**所有表（最終・裁定②）**:
+| 所有者 | 表・永続資源 |
+|---|---|
+| ingest | `received_tail`、spool（セグメント・cursor・削除） |
+| organize | `run_marker`、`pending_boundary`、`suspected_gap`、`organized_watermark`、`organize_gap`、`delivery_ledger`、raw |
+| book | `applied_boundary`、`book_level`、`board_anchor`、`book_missing_record`、`book_gap`、`retired_run`、`connection_identity`、`legacy_owner` |
+| supervisor | 上記表の**書き込みなし**（子の生存・起動停止・readiness を統括） |
+
+**原子性（裁定③）**: organize 内の同一tx＝watermark＋ledger confirm＋pending 境界／book 内の同一tx＝板状態＋適用境界＋anchor（**§9.4(1) は book 側で満たす**）。役割横断は tx で囲わず、**要求の永続化＋往復＋再起動時の照合/再導出**で埋める。
+
+**欠測処理（裁定④⑤）**: organize が**失効要求を永続化** → book が**提供停止＋失効を永続化して応答** → organize が**欠測確定** → 告知。**応答不能時は supervisor による当該 book の終了確認を代替条件**とし、**再起動時の照合完了まで提供禁止**。要求は安定ID・対象 connection・範囲・**単調 revision** を持ち、book は処理済み revision と失効を**同一txで**保存。重複は no-op、**確定済み欠測を取り消す補償は禁止**。
+
+**IPC（裁定⑥⑪⑫）**: 共通形 `{version,type,request_id,role_instance,run_id,market,stream,connection_id,generation,payload}`（該当項目必須）。語彙: `hello/accept/accepted/durable_ack/applied_ack/resend/invalidate/invalidated/stop/tail_sealed/drained/stopped/error/readiness`。**必須 IPC は永続要求の再送・再接続時照合・再起動時再導出で回復**（C12 の一度きりの外部通知とは区別し、契約に追記）。**欠測記録は配送 payload 解放後も残す**。accept は **ingest が発行・明示 takeover・旧 instance 拒否**。停止は request_id 付き段階応答で管理し、**正常停止の判定には対応する完了応答と子の終了結果を要求**（**EOF 単独では死亡とも正常終了とも判定しない**）。
+
+**spool／run_marker（裁定⑦⑧）**: spool は **ingest が専有**（追記・fsync・古い順の再送・**ACK 後の cursor 更新と削除**）。organize は受信データを耐久化して ACK（**fsync→DB確定→ACK の順序を維持**、§8.1 の主体記述を改訂）。`run_marker` は **organize が**開始・旧 run 無効化・正常完了を書き、supervisor は指示のみ。**子の再起動IDと受信 run／接続世代を分離**（book 再起動だけで受信世代を更新しない）。
+
+**「全 ACK」（裁定⑨⑩）**: **organize が判定**する。ingest が受信停止後に永続化した**全接続・旧世代を含む最終末尾一覧**について、**穴のない raw 耐久上限が末尾まで到達**したことが条件（送信成功や book 適用 ACK では代用不可）。最終末尾不明・raw 穴・未処理 spool があれば**正常完了を書かない**（book 未適用分は ledger に保持でき、**正常完了は板の完全性を意味しない**）。
+
+**障害対応（裁定⑬）**: **条件別** — book 障害は受信・整理を継続し book だけ再起動／organize 障害は spool 容量内で受信継続、保持不能なら**受信停止＋欠測記録**、記録不能なら**非ゼロ終了**。**readiness は切断・世代不一致・報告期限超過で失効**。
+
+**入口（裁定⑭）**: `bin/receiver.mjs` を**監督＋3役割プロセスの入口へ置換**。**単一プロセス結線はテスト専用**とし、**運用の切替スイッチは設けない**。
+
+**busy（裁定⑮）**: 案C では **`busy_timeout` を明示的に 0** とし、**busy を異常として扱う**（正常な多プロセス運用でスプリアス停止を出さないため、**DB単位のプロセス間排他＋旧所有者の終了確認**を必須化。`OPEN_STORES` だけに依存しない）。実測根拠: 既定では2つ目の書き込みが約48msで `database is locked`、WAL でも同じ、`busy_timeout` があれば待つ（`scratch/sqlite-multiproc-probe.mjs`）。
+
+**完了条件（裁定⑯）**: C11 完了＝**実3プロセスの通し試験＋指定3障害訓練（ingest 再起動／spool 溢れ／book 単独再起動）＋欠測処理の COMMIT 前後・通知欠落・重複・旧世代混入の試験**。**365 件成功だけでは完了しない**。
+
+**段階（各段で独立検証）**: 1) IPC 制御語彙＋transport 結合（挙動不変・偽 peer）→ 2) ingest 抽出 → 3) organize 抽出 → 4) book 抽出 → 5) supervisor 結線（起動(a)〜(e)・停止順・子再起動・readiness 集約・実3プロセス通し）→ 6) 障害訓練。監視系・下流互換・併走切替は別作業（O-8/O-10）。
+
+**障害訓練の合格条件**: 各訓練で ①欠落0 ②重複0 ③**fail-closed が実際に発火した記録** ④`data_complete` が実態一致 ⑤再起動後の板が snapshot＋再送で正しい。未通過なら切替しない（併走/切替の作業に進まない）。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。
