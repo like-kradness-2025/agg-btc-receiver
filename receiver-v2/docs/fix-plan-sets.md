@@ -557,6 +557,11 @@
   - **当方の決定/残置（記録）**: ①読（readiness の**報告を router が集約器へ流していない**＝役割からの定期報告は未結線。集約器自体は単体試験済み）②organize 障害時の「受信継続→organize 再起動」の配管と実 spool 容量サンプラは未実装 ③owed 配送は毎回全件送る（book が dedupe）＝配送カーソル最適化は保留 ④既定値（`reportDeadlineMs`/`startupDeadlineMs`=60s・`stopDeadlineMs`=10s・`maxRestarts`=3）は設計が定めていない当方の選択 ⑤`busy_timeout=0` は設定したが、SQLite の既定が既に 0 のため**busy 異常の専用テストは無い**。
   - **段階5c の範囲**: **本物のプロセス分離（fork/exec＋役割ごとの CLI＋実 websocket 解決）**／readiness 報告の結線／organize 障害継続の配管／未完 `pending_boundary` の復旧／台帳の保持期限 sweep／失効の告知先／**`bin/receiver.mjs` の置換**（⑭。**運用切替は段階6の障害訓練まで不可**）。
 
+**段階5c 実装（commit `<stage5c>`）**: **本物のプロセス分離** ✓。`bin/role.mjs <role> <spec-json>` を fork する spawner（`src/supervisor/process-spawner.mjs`）＋二重経路（fork の IPC＝監督 RPC／router ソケット＝業務 IPC）。**pid が全て異なることを試験で断言**。**役割からの定期 `readiness` を router の `onObserved` 経由で集約器へ結線**（段階5b の留保を解消。報告期限超過で失効 ✓）。**役割独立を実測** ✓（**book の子を SIGKILL しても ingest/organize は同一 pid で継続**、book だけ1回再起動、**受信世代と connectionId は不変**、監督は exit の code/signal で死を検知し条件別ポリシーが実プロセスで発火）。**実プロセス通し試験** ✓（3実プロセス→偽 venue→板 serving→全ACK＋book 停止結果で complete、終了順 book→organize→ingest、`run_marker=complete`）。テスト **447/447**（約5.1秒・3連続安定）。**既存の単一プロセス経路は無変更** ✓。
+  - **【本質的な未決・要修正】組み込み kraken アダプタの `changesFor` が素の配列を返し、`src/changes.mjs` の v1 契約（`{replace, changes}`／`{replace:true, levels}`）に不適合** ✗ → **実 kraken を fork 経路で受けると全フレームが「level changes refused」となり板が serving しない** ✗（既存 `venue-kraken` テストが素配列を期待するため今回未修正。通し試験は契約形状のアダプタモジュールで代替）。→ **裁定③（形式の版と検証規則）に従い、アダプタを契約へ合わせる修正が要る**（本質的な統合ギャップ）。
+  - **当方の決定/要確認（記録）**: ①役割 CLI は `bin/role.mjs <role> <spec-json>`（spec は argv の JSON。設定ファイルは使わない）②非直列化物の解決に `websocketModule`／`adapterModule` のモジュール seam を設けた（既定はグローバル WebSocket／組み込みアダプタ）。**「テスト専用の穴」と見なされうる点は要確認**（製品の通常経路では既定値のみ）③同期プロパティ読みは子の 15ms 間隔の状態 push キャッシュで供給 ④fork 経路は `rawWriter`（関数）を直列化できないため未対応（既定 null＝raw 撤去と整合）⑤`waitForAdmission` の条件を `connecting` から「idle/refused 以外」へ修正（実子は adoption 直後に subscribing へ進み `connecting` 窓を取り逃すため。旧実装の15秒待ち・世代2化フレークの原因）。
+  - **段階5d へ残した**: `bin/receiver.mjs` の置換（⑭）／organize 障害時の「受信継続→organize 再起動」の配管／未完 `pending_boundary` の復旧／台帳の保持期限 sweep／失効の告知先。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。

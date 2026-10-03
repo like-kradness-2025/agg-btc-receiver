@@ -63,6 +63,11 @@ export function createIngestProcess({
   // not itself know the board's owner (that is organize/book), so the policy is injected; the default
   // asserts nothing.
   takeoverFor = () => false,
+  // Stage 5c: the periodic readiness report (ruling ⑬, §5.8). A role reports its own readiness on
+  // this interval so the supervisor's aggregator can lose it when the report ages past its deadline -
+  // a live but stuck role is otherwise indistinguishable from a healthy one. Disabled (0) by default,
+  // so a process built without it behaves exactly as before.
+  readinessIntervalMs = 0,
   onStop = () => {},
   onDiagnostic = () => {},
   onGap = () => {},
@@ -201,6 +206,7 @@ export function createIngestProcess({
   function stopReception(reason) {
     if (stopped || closed) return;
     stopped = true;
+    stopReadinessReporting();
     try {
       connection.stop();
     } catch (error) {
@@ -563,6 +569,47 @@ export function createIngestProcess({
           drain: (...args) => spool.drain(...args),
         };
 
+  // Stage 5c: the periodic readiness report. It travels the ordinary control path to the supervisor's
+  // router, which observes it (it is not relayed to a peer). The interval is unref'd so a process that
+  // is otherwise quiet can still let the loop go, and it is cleared the moment reception stops or the
+  // process closes - a stopped role does not keep reporting itself ready.
+  let readinessTimer = null;
+
+  function readinessPayload() {
+    return {
+      role: 'ingest',
+      ready: !closed && !stopped,
+      connection_id: connection.connectionId,
+      generation: connection.generation,
+      market,
+      stream,
+    };
+  }
+
+  function startReadinessReporting() {
+    if (!Number.isFinite(readinessIntervalMs) || readinessIntervalMs <= 0) return;
+    readinessTimer = setInterval(() => {
+      sendControlBestEffort(
+        makeMessage({
+          version: IPC_VERSION,
+          type: 'readiness',
+          role_instance: instance,
+          payload: readinessPayload(),
+        }),
+      );
+    }, readinessIntervalMs);
+    if (typeof readinessTimer.unref === 'function') readinessTimer.unref();
+  }
+
+  function stopReadinessReporting() {
+    if (readinessTimer !== null) {
+      clearInterval(readinessTimer);
+      readinessTimer = null;
+    }
+  }
+
+  startReadinessReporting();
+
   return {
     /** The consume side of the organize link, wired by whoever opened the channel. */
     handleControl,
@@ -597,6 +644,7 @@ export function createIngestProcess({
     /** A clean stop: reception ends and the spool is closed. */
     stop() {
       if (closed) return;
+      stopReadinessReporting();
       connection.stop();
       spool?.close();
     },
@@ -604,6 +652,7 @@ export function createIngestProcess({
     /** The termination of the process: reception, the spool, and the store it opened itself. */
     close() {
       if (closed) return;
+      stopReadinessReporting();
       connection.stop();
       spool?.close();
       if (openedStoreHere) {

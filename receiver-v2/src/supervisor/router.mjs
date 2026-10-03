@@ -54,7 +54,7 @@ const KNOWN_ROLES = new Set(Object.keys(ROLE_ROUTES));
  * Build the router. Callbacks are observations only - none of them may change the verdict, and none
  * of them is handed a way to send as another role.
  */
-export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, onRouted = () => {} } = {}) {
+export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, onRouted = () => {}, onObserved = () => {} } = {}) {
   const bindings = new Map(); // channel -> { role, instance }
   const byRole = new Map(); // role -> channel
   const pendingAccepts = new Map(); // request_id -> { message, generation, connectionId }
@@ -242,6 +242,13 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     }
     // readiness and error are observed by the supervisor itself; they are not relayed to a peer.
     if (type === 'readiness' || type === 'error') {
+      // Stage 5c: hand the observation to the supervisor, which feeds a role's readiness report into
+      // its aggregator (the report deadline is what lets a live-but-silent role lose readiness).
+      try {
+        onObserved({ type, from: senderRole, message });
+      } catch {
+        /* an observation that throws is not a fact about the message */
+      }
       return { observed: type, from: senderRole };
     }
     if (type === 'accept') {

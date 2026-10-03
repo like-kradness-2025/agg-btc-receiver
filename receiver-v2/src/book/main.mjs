@@ -77,6 +77,9 @@ export function createBookProcess({
   onApplied = () => {},
   onInvalidated = () => {},
   onStop = () => {},
+  // Stage 5c: the periodic readiness report (ruling ⑬). It travels the ordinary control path to the
+  // supervisor's router, which observes it. Disabled (0) by default.
+  readinessIntervalMs = 0,
 } = {}) {
   if (!market || !stream) throw new TypeError('the book process needs a market and a stream');
   if (!runId) throw new TypeError('the book process needs a run id');
@@ -391,6 +394,7 @@ export function createBookProcess({
   function handleStop(message) {
     if (stopped || closed) return { stopped: false, reason: 'this book process has already stopped' };
     stopped = true;
+    stopReadinessReporting();
     try {
       onStop({ market, stream, reason: 'a stop was requested over IPC' });
     } catch {
@@ -450,6 +454,33 @@ export function createBookProcess({
     return true;
   }
 
+  // Stage 5c: the periodic readiness report, on the ordinary control path to the router. Unref'd, and
+  // cleared the moment the book stops or closes.
+  let readinessTimer = null;
+
+  function readinessPayload() {
+    return { role: 'book', ready: !stopped && !closed, market, stream };
+  }
+
+  function startReadinessReporting() {
+    if (!Number.isFinite(readinessIntervalMs) || readinessIntervalMs <= 0) return;
+    readinessTimer = setInterval(() => {
+      sendControl(
+        makeMessage({ version: IPC_VERSION, type: 'readiness', role_instance: instance, payload: readinessPayload() }),
+      );
+    }, readinessIntervalMs);
+    if (typeof readinessTimer.unref === 'function') readinessTimer.unref();
+  }
+
+  function stopReadinessReporting() {
+    if (readinessTimer !== null) {
+      clearInterval(readinessTimer);
+      readinessTimer = null;
+    }
+  }
+
+  startReadinessReporting();
+
   const api = {
     market,
     stream,
@@ -508,6 +539,7 @@ export function createBookProcess({
       if (closed) return;
       closed = true;
       stopped = true;
+      stopReadinessReporting();
       if (organizeRef !== null) {
         try {
           organizeRef.close();

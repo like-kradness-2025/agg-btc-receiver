@@ -294,6 +294,13 @@ async function inProcessSpawner(role, { options }) {
   throw new TypeError(`no entrance for role ${role}`);
 }
 
+/**
+ * The in-process spawner is kept for tests: it is the seam the through tests use to exercise the
+ * wiring above without paying for three OS processes. The real process separation is
+ * `createForkSpawner` in `./process-spawner.mjs`, which forks `bin/role.mjs` per role.
+ */
+export { inProcessSpawner };
+
 export function createRunSupervisor(options = {}) {
   const {
     market,
@@ -310,6 +317,9 @@ export function createRunSupervisor(options = {}) {
     rawWriter = null,
     nowMs = () => Date.now(),
     reportDeadlineMs = 60_000,
+    // Stage 5c: how often a role reports its own readiness to the aggregator (via the router). Must be
+    // well under `reportDeadlineMs` so a live role is not expired by its own reporting interval.
+    readinessIntervalMs = 1_000,
     startupDeadlineMs = 60_000,
     stopDeadlineMs = 10_000,
     maxRestarts = 3,
@@ -394,6 +404,7 @@ export function createRunSupervisor(options = {}) {
           ingestStorePath,
           spoolDir,
           channelOptions: ROUTE_OPTIONS,
+          readinessIntervalMs,
           onStop: (info) => diagnostic(`reception stopped: ${info?.reason ?? 'unknown'}`, { kind: 'stop' }),
           onDiagnostic: (d) => diagnostic(d?.reason ?? String(d), { kind: 'ingest' }),
         },
@@ -412,6 +423,7 @@ export function createRunSupervisor(options = {}) {
           rawWriter: rawWriter ?? null,
           markRunning: false, // (a) is the supervisor's to carry out
           channelOptions: ROUTE_OPTIONS,
+          readinessIntervalMs,
           onDiagnostic: (d) => diagnostic(d?.reason ?? String(d), { kind: 'organize' }),
         },
       };
@@ -429,6 +441,7 @@ export function createRunSupervisor(options = {}) {
         adapter: null,
         storePath: bookStorePath,
         channelOptions: ROUTE_OPTIONS,
+        readinessIntervalMs,
         onDiagnostic: (d) => diagnostic(d?.reason ?? String(d), { kind: 'book' }),
       },
     };
@@ -451,6 +464,16 @@ export function createRunSupervisor(options = {}) {
     const process = await spawner(role, spec);
     const handle = { role, instance: spec.instance, process, storePath: dbPath };
     children[role] = handle;
+    // Stage 5c: a real child process announces its own death (with code and signal) through the
+    // spawner. Only a death that is not an intentional close reaches here, and only while this handle
+    // is still the current one - so the condition-by-condition failure policy (ruling ⑬) runs against
+    // a real process death, not a simulated one.
+    if (typeof process?.onExit === 'function') {
+      process.onExit((info) => {
+        if (closed || ended || children[role] !== handle) return;
+        void handleChildFailure(role, info);
+      });
+    }
     readiness.setExpectedInstance(role, spec.instance);
     readiness.setConnected(role, true);
     step('spawn', { role, instance: spec.instance });
@@ -471,13 +494,13 @@ export function createRunSupervisor(options = {}) {
     const handle = children[role];
     if (!handle) return;
     readiness.setConnected(role, false);
+    children[role] = null;
     try {
-      handle.process.close();
+      await handle.process.close();
     } catch (error) {
       diagnostic(`the ${role} could not be closed cleanly: ${error.message}`, { kind: 'terminate' });
     }
     releaseRole(role, { confirmedTerminated: true });
-    children[role] = null;
   }
 
   async function waitForRoles(timeoutMs) {
@@ -493,12 +516,19 @@ export function createRunSupervisor(options = {}) {
     // as soon as it is announced (before anyone answered), so the id alone would let the startup race
     // past (e). What proves the socket may open is organize's adoption having come back - reception
     // has left `idle`. The supervisor's own pending accept must be settled too.
+    //
+    // "Left idle" is checked as a state, not as `=== 'connecting'`: a real child process opens its
+    // socket and moves on to `subscribing` as soon as the adoption lands, and the supervisor's cached
+    // snapshot may never observe the brief `connecting` window. A state that is not `idle` and not a
+    // refusal is exactly "admitted and running"; requiring the precise intermediate state would make
+    // the supervisor wait for a deadline to pass and only then catch a later generation.
     await until(
       () => {
         const ingest = children.ingest?.process;
         if (!ingest || ingest.connectionId == null) return false;
         if (router.pendingAcceptCount !== 0) return false;
-        return ingest.state === 'connecting';
+        const state = ingest.state;
+        return typeof state === 'string' && state !== '' && state !== 'idle' && state !== 'refused';
       },
       { timeoutMs, label: 'the connection to be authorized, adopted and admitted' },
     );
@@ -524,6 +554,11 @@ export function createRunSupervisor(options = {}) {
           listenPath: routerListenPath,
           channelOptions: ROUTE_OPTIONS,
           onDiagnostic: (d) => diagnostic(d?.reason ?? String(d), { kind: 'router' }),
+          // Stage 5c: the roles' readiness reports are observed by the router and fed to the
+          // aggregator here. This closes stage 5b's reservation (the reports were not wired to it).
+          onObserved: (observed) => {
+            if (observed.type === 'readiness') readiness.noteReport(observed.from, observed.message?.payload ?? {});
+          },
         });
         step('router', { path: router.path });
 
@@ -534,24 +569,24 @@ export function createRunSupervisor(options = {}) {
         step('bound', { instances: RUN_ROLES.map((r) => router.instances().get(r)) });
 
         // (a) mark this run live.
-        children.organize.process.beginRun();
+        await children.organize.process.beginRun();
         step('a:beginRun', {});
 
         // (b) hand organize the book's applied boundary - never omitted, even when it is empty.
         const boundary = children.book.process.appliedBoundary;
-        const recorded = children.organize.process.resumeFromBoundary(boundary);
+        const recorded = await children.organize.process.resumeFromBoundary(boundary);
         step('b:boundary', { recorded: recorded.recorded, boundary });
 
         // (c) the old spool, oldest-first.
-        const drained = children.ingest.process.drainSpool();
+        const drained = await children.ingest.process.drainSpool();
         step('c:drainSpool', drained);
 
         // (d) what is durable and owed goes to the board - before (e), the invariant this wiring fixes.
-        const delivered = children.organize.process.deliverOwed();
+        const delivered = await children.organize.process.deliverOwed();
         step('d:deliverOwed', delivered);
 
         // (e) issue the connection; the socket opens only once the book authorized and organize adopted.
-        children.ingest.process.start();
+        await children.ingest.process.start();
         step('e:accept', {});
         await waitForAdmission(startupDeadlineMs);
         started = true;
@@ -584,8 +619,8 @@ export function createRunSupervisor(options = {}) {
 
       // reception: seal the final tails first, then stop receiving.
       if (children.ingest) {
-        results.sealed = children.ingest.process.sealTails();
-        children.ingest.process.stop();
+        results.sealed = await children.ingest.process.sealTails();
+        await children.ingest.process.stop();
         step('stop:ingest', results.sealed);
       }
       // organization: judged on the sealed tails; asked to stop accepting, but not to finalize yet.
@@ -597,18 +632,18 @@ export function createRunSupervisor(options = {}) {
         diagnostic('the sealed tails were not judged reached before the deadline', { kind: 'stop' });
       }
       if (children.organize) {
-        results.organize = children.organize.process.requestStop('the run is stopping');
+        results.organize = await children.organize.process.requestStop('the run is stopping');
         step('stop:organize', results.organize);
       }
       // the board: stopped, and its result confirmed.
       if (children.book) {
-        results.book = children.book.process.stop();
+        results.book = await children.book.process.stop();
         step('stop:book', results.book);
       }
       const bookConfirmed = results.book?.stopped === true;
       // The completion needs BOTH: the sealed tails reached, and the board's stop confirmed.
       if (bookConfirmed && results.allAcked && children.organize) {
-        results.completion = children.organize.process.finalize();
+        results.completion = await children.organize.process.finalize();
       } else {
         results.completion = {
           completed: false,
@@ -624,19 +659,21 @@ export function createRunSupervisor(options = {}) {
   }
 
   /** Terminate the child processes in their own order, releasing each store once it is confirmed gone. */
-  function terminate() {
+  async function terminate() {
     const order = [...TERMINATION_ORDER];
     for (const role of order) {
       const handle = children[role];
       if (!handle) continue;
       readiness.setConnected(role, false);
+      // Null the child first: an intentional close must not read as an abnormal death, and the exit
+      // guard is the handle's identity.
+      children[role] = null;
       try {
-        handle.process.close();
+        await handle.process.close();
       } catch (error) {
         diagnostic(`the ${role} could not be closed cleanly: ${error.message}`, { kind: 'terminate' });
       }
       releaseRole(role, { confirmedTerminated: true });
-      children[role] = null;
     }
     try {
       router?.close();
@@ -656,7 +693,7 @@ export function createRunSupervisor(options = {}) {
   async function close() {
     if (closed) return { closed: true, completed: false, reason: 'this run was already closed' };
     if (!stopped) await stop();
-    const termination = terminate();
+    const termination = await terminate();
     return {
       closed: true,
       terminationOrder: termination.terminationOrder,
@@ -709,7 +746,7 @@ export function createRunSupervisor(options = {}) {
       return { continued: true, verdict };
     }
     if (verdict.action === 'stop-reception-record') {
-      children.ingest?.process.stop();
+      await children.ingest?.process.stop();
       diagnostic(`reception stopped and the missing recorded: ${verdict.reason}`, { kind: 'child-failure' });
       return { stoppedReception: true, recorded: true, verdict };
     }

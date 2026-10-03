@@ -119,6 +119,9 @@ export function createOrganizeProcess({
   // Whether this process writes its own `running` marker on construction. The store has already
   // invalidated the previous running run (ruling ⑧); this writes the live one.
   markRunning = true,
+  // Stage 5c: the periodic readiness report (ruling ⑬). It travels the ordinary control path to the
+  // supervisor's router, which observes it. Disabled (0) by default.
+  readinessIntervalMs = 0,
 } = {}) {
   if (!market || !stream) throw new TypeError('the organize process needs a market and a stream');
   if (!runId) throw new TypeError('the organize process needs a run id');
@@ -717,6 +720,7 @@ export function createOrganizeProcess({
   function stop(reason = 'a stop was requested') {
     if (closed) return { stopped: false, reason: 'this organize process is closed' };
     stopped = true;
+    stopReadinessReporting();
     const completion = finalize();
     try {
       onStop({ market, reason });
@@ -734,6 +738,7 @@ export function createOrganizeProcess({
   function requestStop(reason = 'a stop was requested') {
     if (closed) return { stopped: false, reason: 'this organize process is closed' };
     stopped = true;
+    stopReadinessReporting();
     try {
       onStop({ market, reason });
     } catch {
@@ -849,7 +854,43 @@ export function createOrganizeProcess({
     return channel;
   }
 
+  // Stage 5c: the periodic readiness report. Behind the supervisor the channel to the router is the
+  // one it arrived on (routerMode), so both reply routes point at it; the message's own type is the
+  // routing fact. The interval is unref'd and cleared the moment the process stops or closes.
+  let readinessTimer = null;
+
+  function readinessPayload() {
+    return { role: 'organize', ready: !stopped && !closed, market, stream };
+  }
+
+  function sendReadiness() {
+    const channel = ingestChannel ?? bookChannel;
+    if (channel === null) return false;
+    try {
+      return channel.sendControl(
+        makeMessage({ version: IPC_VERSION, type: 'readiness', role_instance: instance, payload: readinessPayload() }),
+      );
+    } catch (error) {
+      diagnostic(`a readiness report could not be sent: ${error.message}`);
+      return false;
+    }
+  }
+
+  function startReadinessReporting() {
+    if (!Number.isFinite(readinessIntervalMs) || readinessIntervalMs <= 0) return;
+    readinessTimer = setInterval(sendReadiness, readinessIntervalMs);
+    if (typeof readinessTimer.unref === 'function') readinessTimer.unref();
+  }
+
+  function stopReadinessReporting() {
+    if (readinessTimer !== null) {
+      clearInterval(readinessTimer);
+      readinessTimer = null;
+    }
+  }
+
   if (markRunning) organizeStore.beginRun();
+  startReadinessReporting();
 
   const api = {
     market,
@@ -906,6 +947,7 @@ export function createOrganizeProcess({
     close() {
       if (closed) return;
       closeServer();
+      stopReadinessReporting();
       stopped = true;
       closed = true;
       if (openedStoreHere) {
