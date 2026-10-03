@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { openDurability } from '../src/durability.mjs';
+import { createSupervisor } from '../src/supervisor/supervisor.mjs';
 
 async function withDir(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'tail-'));
@@ -78,5 +79,74 @@ test('an old single-key receive tail is migrated without guessing its stream, an
     assert.equal(again.readReceivedTail('conn-old', 'book').lastReceivedSeq, 3);
     assert.equal(again.readReceivedTail('conn-old', 'trades'), null);
     again.close();
+  });
+});
+
+test('a frame received on the socket records the receive tail for its connection, board and stream', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const sockets = [];
+    // A socket implementation that hands the test each socket the reception opens, so the frames below
+    // arrive through the real receive path rather than a caller feeding envelopes into the supervisor.
+    const webSocketImpl = function (url) {
+      const socket = {
+        url,
+        sent: [],
+        closed: false,
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+        send(message) {
+          socket.sent.push(message);
+        },
+        close() {
+          socket.closed = true;
+        },
+      };
+      sockets.push(socket);
+      return socket;
+    };
+    const adapter = {
+      url: 'ws://venue.test/ws',
+      stream: 'trades',
+      parse: () => ({ kind: 'data' }),
+      changesFor: (frame) => [{ side: 'bid', price: 100 + frame.receive_seq, size: 1 }],
+    };
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path,
+      venue: 'kraken',
+      runId: 'run-1',
+      webSocketImpl,
+      rawWriter: () => true,
+      spoolDir: join(dir, 'spool'),
+      exit: () => {},
+      onStop: () => {},
+      onRefetch: () => {},
+    });
+    assert.equal(supervisor.start().started, true, 'the connection was admitted and the socket opened');
+    assert.equal(sockets.length, 1, 'reception opened one socket');
+    const connectionId = supervisor.connection.connectionId;
+    // Three frames arrive on the socket. Reception stamps each one and records how far it has heard as it
+    // handles it - this is the receive path, not the supervisor's own `feed`.
+    sockets[0].onmessage({ data: '{"seq":1}' });
+    sockets[0].onmessage({ data: '{"seq":2}' });
+    sockets[0].onmessage({ data: '{"seq":3}' });
+    supervisor.stop();
+    supervisor.close();
+
+    // Read the store's own table, so the assertion is about what was persisted, not what an API reports.
+    const db = new DatabaseSync(path);
+    const rows = db.prepare('SELECT * FROM received_tail').all();
+    db.close();
+    assert.equal(rows.length, 1, 'reception wrote exactly one tail row for the board');
+    assert.equal(rows[0].connection_id, connectionId, 'it names the connection the frames arrived on');
+    assert.equal(rows[0].market, 'kraken_spot', 'and the market');
+    assert.equal(rows[0].stream, 'trades', 'the stream is part of the key, written not guessed');
+    assert.equal(rows[0].last_received_seq, 3, 'and it holds the highest sequence received');
+    assert.ok(rows[0].last_recv_mono_ns > 0, 'with the monotonic stamp of that frame');
   });
 });

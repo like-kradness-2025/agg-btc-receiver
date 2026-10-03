@@ -8,18 +8,20 @@
  * and the frames are then never delivered: the canonical record holds data the board silently never saw,
  * which is precisely the failure this ledger exists to prevent.
  *
- * So a frame is written down here twice, in a sense, because the raw write is not part of this store's
- * transactions:
+ * So a frame is written down here twice, in a sense, because the durability decision is not itself made by
+ * this store's ledger: when there is a raw writer it is the raw's write, and when there is none it is the
+ * store's own record alone (`rawSkipped`) - either way the entry may not assume a raw holds the frame:
  *
- *  - an *intent* goes in before the raw write, so the worst a crash can leave behind is an entry for a
- *    frame the raw may not hold - which is recoverable, because the raw write can be decided again from
- *    the frame the entry carries;
- *  - it is *confirmed* in the same transaction that claims the frame durable, so an entry the raw really
- *    does hold and the claim to have received it cannot exist without each other.
+ *  - an *intent* goes in before the durability decision, so the worst a crash can leave behind is an entry
+ *    for a frame that may not be durable yet - which is recoverable, because the decision can be made again
+ *    from the frame the entry carries;
+ *  - it is *confirmed* in the same transaction that claims the frame durable - the raw write's transaction
+ *    when there is a raw writer, the store's own when there is not - so an entry and the claim to have
+ *    received that frame cannot exist without each other.
  *
- * Only a confirmed entry is delivered to the board: an intent is a frame the raw may not have, and
+ * Only a confirmed entry is delivered to the board: an intent is a frame that may not be durable yet, and
  * delivering it would put the board ahead of the canonical record. An intent that is still an intent
- * after a restart is therefore offered back through the organizer, which decides the raw write again -
+ * after a restart is therefore offered back through the organizer, which decides the durability again -
  * the one direction in which a crash is safe.
  *
  * The frame's own bytes travel with the entry instead of a pointer into the raw, because the raw writer

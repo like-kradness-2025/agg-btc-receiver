@@ -7,8 +7,10 @@
  * decision, and only one place should be making it.
  *
  * Three things happen for every envelope, in this order and no other:
- *   1. the raw is written down (the hook the caller passes), because the raw is the canonical record
- *      and nothing may be acknowledged before it is safe;
+ *   1. the frame is made durable and written down. When the caller passes a raw writer that is the raw,
+ *      the canonical record, and nothing may be acknowledged before it is safe. When no raw writer is
+ *      given the raw stage is skipped entirely (`rawSkipped`): there is no raw, and the store's own
+ *      record is the only thing that makes the frame durable - success here never means "a raw holds it";
  *   2. the contiguous ceiling moves if this sequence is exactly the next one, and only then;
  *   3. an acknowledgement may be emitted, and it may only ever carry that ceiling.
  *
@@ -26,7 +28,8 @@
  * are held, and released only as far as they are contiguous once the start is known. A start that has
  * been established is never renegotiated.
  *
- * The watermark is persisted per connection, but it only moves after the raw is durable: a restart
+ * The watermark is persisted per connection, but it only moves once the frame is durable - in the raw
+ * when there is a raw writer, on the store's own record alone when there is not (`rawSkipped`): a restart
  * resumes from what was written down, never from what was merely received.
  */
 

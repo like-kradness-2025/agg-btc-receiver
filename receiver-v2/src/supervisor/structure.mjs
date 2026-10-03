@@ -941,7 +941,25 @@ export function createStructure({
     healAfterFrame(result);
     return result;
   };
-  const feedEntry = (envelope) => receiveEvent('message', () => feedAndHeal(envelope));
+  // The reception seam: every data frame the socket delivered arrives here, and this is the one place that
+  // records how far this process can show it heard. The row names the connection the frame carries and is
+  // keyed by stream as well as connection, because one connection name serves a market's book and its
+  // trades (C2). It is a lower bound only (see the store's note) and never a completeness claim: it is
+  // written on the reception side, as the frame is handled, not derived from anything durable. Writing it
+  // here, before the frame is organized, is what keeps "received" a fact about reception rather than a
+  // verdict of the board - a frame the board refuses was still received. A redelivered or spooled frame is
+  // not a new reception and does not pass through here; only a socket arrival does.
+  const feedEntry = (envelope) =>
+    receiveEvent('message', () => {
+      wiring.updateReceivedTail({
+        connectionId: envelope.connection_id,
+        market,
+        stream: envelope.stream,
+        lastReceivedSeq: envelope.receive_seq,
+        lastRecvMonoNs: envelope.recv_mono_ns,
+      });
+      return feedAndHeal(envelope);
+    });
   const admitEntry = (details) =>
     receiveEvent('generation', () => {
       const admitted = admitOnGeneration(details);

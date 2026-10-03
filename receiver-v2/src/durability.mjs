@@ -408,8 +408,9 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     },
 
     /**
-     * Record how far this process can prove it received. A lower bound, deliberately: it is written
-     * every interval rather than every frame, and nothing may treat it as a completeness claim.
+     * Record how far this process can prove it received. A lower bound, deliberately: it is written on
+     * the reception side as frames arrive rather than being derived from anything durable, so it can lag
+     * the socket by the frame being processed, and nothing may treat it as a completeness claim.
      *
      * The tail belongs to one board: a connection name is shared by the market's book and its trades
      * (C2), so the stream is part of what identifies the row. A caller that has no stream to give is
@@ -526,6 +527,10 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     // own (a begin or a clean end), and the public names would refuse that as a second operation.
     beginRun: internal.beginRun,
     completeRun: internal.completeRun,
+    // The receive tail's write, without the right, for the same reason: reception records how far it has
+    // heard from inside the operation that handles the frame, and the guarded public name would refuse
+    // that as a second operation. It is a write the structure owns, not a route a caller is handed.
+    updateReceivedTail: internal.updateReceivedTail,
     REENTRANT_OPERATION,
     /**
      * One structure serves a board from a store at a time. A second structure over the same board in the
