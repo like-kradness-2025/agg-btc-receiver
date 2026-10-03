@@ -20,6 +20,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 
 import { openDurability } from '../src/durability.mjs';
 
@@ -200,5 +201,40 @@ test('SIGINT is the same orderly shutdown as SIGTERM', async () => {
     assert.equal(signal, null, 'the process ended on its own');
     assert.equal(code, 0, 'SIGINT stops cleanly too');
     assert.notEqual(completionOf(config.database), null, 'and writes the completion');
+  });
+});
+
+test('a completion the store refuses turns the stop into exit 1 with no completion', async () => {
+  await withDir(async (dir) => {
+    const { path, config } = writeConfig(dir);
+    const handle = startChild(path);
+    const ready = await waitForReady(handle);
+    const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+
+    // A store that refuses the completion: the marker insert for `state = 'complete'` is rejected, the
+    // same way a full disk or a failing write would refuse it. The signal still drives the clean stop,
+    // so the process reaches close()'s completion write - and that write is exactly what must not be
+    // reported as success. Before the fix the exception was swallowed and the process left with 0 while
+    // the run record still said `running`.
+    const db = new DatabaseSync(config.database);
+    db.exec(
+      "CREATE TRIGGER fail_completion BEFORE INSERT ON run_marker WHEN NEW.state = 'complete' " +
+        "BEGIN SELECT RAISE(FAIL, 'completion IO failure'); END",
+    );
+    db.close();
+
+    handle.child.kill('SIGTERM');
+    const { code, signal } = await handle.exited;
+
+    assert.equal(signal, null, 'the process still ended on its own, not by the signal default action');
+    assert.equal(code, 1, `a run whose completion could not be written is not a clean end; stderr=${handle.stderr}`);
+    assert.equal(completionOf(config.database), null, 'and no completion is on disk');
+
+    // The run record is not complete either: the next start must still be able to tell this from a crash.
+    const reader = new DatabaseSync(config.database);
+    const marker = reader.prepare('SELECT state FROM run_marker WHERE run_id = ?').get(runId);
+    reader.close();
+    assert.notEqual(marker, undefined, 'the run was marked live and left behind');
+    assert.notEqual(marker.state, 'complete', 'the run is not marked complete');
   });
 });

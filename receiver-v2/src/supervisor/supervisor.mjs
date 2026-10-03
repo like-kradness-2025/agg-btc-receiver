@@ -521,13 +521,35 @@ export function createSupervisor(options = {}) {
         return { stopped: true };
       }),
     close: () => {
-      if (closed) return;
+      if (closed) return { closed: true, completed: false, reason: 'this supervisor is closed' };
       closed = true;
       stopStructure();
       // The marker is written only on a clean end: an abnormal end leaves no completion, so the next start
-      // can tell that this one did not stop on purpose.
-      if (!abnormal) structure.completeRun();
-      structure.close();
+      // can tell that this one did not stop on purpose. The completion's outcome is *returned* rather than
+      // swallowed, and a completion that throws is re-thrown after the structure is still closed: a process
+      // turning this into its exit code has to be able to tell a written completion from one the store
+      // refused, and only the former is a clean end.
+      let completion = null;
+      let failure = null;
+      try {
+        if (!abnormal) completion = structure.completeRun();
+      } catch (error) {
+        failure = error;
+      } finally {
+        structure.close();
+      }
+      if (failure !== null) throw failure;
+      if (abnormal) {
+        return { closed: true, completed: false, reason: 'the run ended abnormally, so no completion was written' };
+      }
+      // A refusal (a store that holds the execution right) comes back as a value with `completed: false`,
+      // not as a throw; both are a completion that is not on disk.
+      return {
+        closed: true,
+        completed: completion?.completed !== false,
+        code: completion?.code,
+        reason: completion?.reason,
+      };
     },
     /** A caller - or a notification - that wants reception stopped without reaching into the structure. */
     requestStop: (reason) => {

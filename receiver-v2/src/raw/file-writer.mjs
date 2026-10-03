@@ -50,6 +50,24 @@ function readWrittenKeys(filePath, fsModule) {
   return keys;
 }
 
+/**
+ * Write every byte of `buffer` before answering true. A `writeSync` may write fewer bytes than asked:
+ * a short write is not an error, but treating it as the whole line would make the raw claim a durability
+ * it does not have and quietly lose the rest of the frame - the frame is then gone with the restart
+ * unable to read the torn line back. So the loop keeps writing at the offset it has reached until the
+ * buffer is exhausted; a call that makes no progress (returns a non-positive or non-integer count) is a
+ * failure, never a partial success.
+ */
+function writeAll(fsModule, fd, buffer) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fsModule.writeSync(fd, buffer, offset, buffer.length - offset);
+    if (!Number.isInteger(written) || written <= 0) return false;
+    offset += written;
+  }
+  return true;
+}
+
 function serialise(envelope) {
   return {
     market: envelope.market,
@@ -84,7 +102,8 @@ export function createFileRawWriter({ path: filePath, fsModule = fs } = {}) {
     if (written.has(key)) return true; // a resend is a no-op, not a refusal
     const line = Buffer.from(`${JSON.stringify({ key, envelope: serialise(envelope) })}\n`, 'utf8');
     try {
-      fsModule.writeSync(fd, line);
+      // Every byte of the line, then fsync: only then is the frame durable and only then is true honest.
+      if (!writeAll(fsModule, fd, line)) return false;
       fsModule.fsyncSync(fd); // durable before the true answer, as the contract requires
       written.add(key);
       return true;

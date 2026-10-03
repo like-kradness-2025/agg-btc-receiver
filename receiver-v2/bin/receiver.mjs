@@ -67,21 +67,30 @@ function releaseHold() {
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  // Whether the clean end actually happened. A stop or a close that failed - or a close that was refused
+  // the completion rather than writing it - is not a clean end, and the process must not report success
+  // (exit 0) for a run whose completion is not on disk. The next start would then read `running` and
+  // have no way to tell this stop from a crash. So the failure is carried to the exit code instead of
+  // being swallowed here.
+  let failed = false;
   if (supervisor !== null) {
     // `stop` is the clean stop: it does not mark the run abnormal, so `close` writes the completion.
     try {
       supervisor.stop();
     } catch {
-      // A stop that throws is still the stop this process is making; the close below still ends it.
+      failed = true;
     }
     try {
-      supervisor.close();
+      const outcome = supervisor.close();
+      // `close` reports its end as a value, not only by throwing: a refusal object (`completed: false`)
+      // means the completion was not written, which is exactly as much a failure as a throw.
+      if (outcome !== null && typeof outcome === 'object' && outcome.completed === false) failed = true;
     } catch {
-      // The store may already be gone; the process is leaving either way.
+      failed = true;
     }
   }
   releaseHold();
-  process.exit(0);
+  process.exit(failed ? 1 : 0);
 }
 
 function main(argv) {
