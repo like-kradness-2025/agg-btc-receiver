@@ -110,6 +110,10 @@ export function createSpool(options = {}) {
   let current = segments.length > 0 ? segments[segments.length - 1] : null;
   let dirty = false;
   let failed = null;
+  // Set by the latest drainRecords walk when a segment's bytes did not describe a length the format can
+  // have written: the walk cannot continue, and a consumer has to be able to tell that "it ended" from
+  // "it stopped at a desynchronised record". Null on a walk that read every record it was given.
+  let unreadable = null;
   let bytes = segments.reduce((sum, segment) => sum + segment.bytes, 0);
   let fsyncTimer = null;
 
@@ -300,6 +304,7 @@ export function createSpool(options = {}) {
   function* drainRecords({ limit = Infinity } = {}) {
     let read = 0;
     let startOffset = cursor.offset;
+    unreadable = null; // this walk's verdict, not an earlier one's
     for (const segment of segments) {
       if (cursor.segment !== null && segment.index < cursor.segment) continue;
       const file = path.join(dir, segment.name);
@@ -315,9 +320,11 @@ export function createSpool(options = {}) {
       let records;
       try {
         records = decoder.push(buf);
-      } catch {
+      } catch (error) {
         // A length the format cannot have written means the segment desynchronised, and nothing
-        // after it can be trusted: the walk ends here rather than inventing positions.
+        // after it can be trusted: the walk ends here rather than inventing positions. The verdict
+        // is recorded, so a consumer can stop on it instead of reading the end as a finished drain.
+        unreadable = { segment: segment.index, offset: startOffset, error };
         return;
       }
       // The end of the segment is reached exactly when every byte from the read point is a complete
@@ -407,6 +414,14 @@ export function createSpool(options = {}) {
     /** Non-null once a write failed part-way: the spool holds a torn record and takes no more. */
     get failed() {
       return failed;
+    },
+    /**
+     * The verdict of the latest `drainRecords` walk: non-null when it stopped because a segment's bytes
+     * did not describe a length the format can have written, so the consumer can stop rather than read
+     * the walk's end as a finished drain.
+     */
+    get unreadable() {
+      return unreadable;
     },
   };
 }

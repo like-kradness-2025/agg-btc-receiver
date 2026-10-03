@@ -460,6 +460,17 @@ export function createStructure({
         drainingSpool = false;
       }
       if (lastConsumed !== null) spool.advance(lastConsumed);
+      // A walk that consumed some records can still have ended at a desynchronised one: the spool's own
+      // verdict says the bytes stopped describing records, which is a corrupt spool and not a finished
+      // drain. It is reported as the same stop a record the walk could not hand back produces, so the
+      // run stops rather than carrying on and handing the board over with unreadable bytes still held.
+      if (stoppedReason === null && spool.unreadable) {
+        stoppedReason = `the spool could not hand back a record: ${
+          spool.unreadable.error?.message ?? 'the segment could not be decoded'
+        }`;
+        stoppedCode = 'spool-unreadable';
+        onDiagnostic({ market, reason: stoppedReason });
+      }
     }
     const swept = sweepRetentionInternal();
     return { walked, consumed, advanced: lastConsumed !== null, ...swept, stopped: stoppedReason, stoppedCode };

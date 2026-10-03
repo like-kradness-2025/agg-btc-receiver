@@ -39,6 +39,14 @@ import { createStructure } from './structure.mjs';
 
 export const DEFAULT_MAX_RECOVERY_ATTEMPTS = 3;
 
+/**
+ * How long a run may spend trying to reach reception before it gives up. §5.7 wants (e)'s connection
+ * retries to follow the existing backoff *and* a startup deadline: a venue that never lets a socket in
+ * is not a run that should reconnect for ever, quietly looking alive. Past the deadline the run ends
+ * non-zero, which is the only honest answer left.
+ */
+export const DEFAULT_STARTUP_DEADLINE_MS = 60_000;
+
 export function createSupervisor(options = {}) {
   const {
     market,
@@ -66,8 +74,18 @@ export function createSupervisor(options = {}) {
     // what happened and cannot change it.
     onStep = () => {},
     maxRecoveryAttempts = DEFAULT_MAX_RECOVERY_ATTEMPTS,
+    startupDeadlineMs = DEFAULT_STARTUP_DEADLINE_MS,
     ...receiveOptions
   } = options;
+
+  // The startup deadline runs on the same injected clock and timers the connection uses, so a test can
+  // drive it. They stay in `receiveOptions` and reach the connection too; only their names are borrowed
+  // here, with the same defaults the connection would apply.
+  const {
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
+    wallClockMs = () => Date.now(),
+  } = receiveOptions;
 
   if (!path) throw new TypeError('the supervisor needs a path for its store');
   if (!venue) throw new TypeError('the supervisor needs a venue to name its connections');
@@ -102,6 +120,12 @@ export function createSupervisor(options = {}) {
   // the two apart is what stops the supervisor reporting a board nobody may read as ready.
   let started = false;
   let recoveries = 0;
+  // The startup deadline timer, armed when the sequence begins and never re-armed; null once fired or
+  // disarmed. `hasServed` records that the board has actually served at some point, which is what tells
+  // the deadline the run really did reach reception - a later re-anchor is a different question, with
+  // its own bounded recovery, and must not be mistaken for a startup that never happened.
+  let startupDeadlineTimer = null;
+  let hasServed = false;
   // Whether a settle is already in progress. Carrying a recovery out runs structure operations, each of
   // which reports its own end and would otherwise call settle again from inside this one; the outer loop
   // is already owed the same answer, so a nested call returns and lets it finish.
@@ -193,6 +217,9 @@ export function createSupervisor(options = {}) {
     // middle of the startup sequence - and the depth check sits before the re-entrancy guard, so a nested
     // settle inside a supervisor operation does not mark the outer loop as running.
     if (operationDepth > 0) return;
+    // Reception has actually happened: the run reached the board, so the startup deadline has done its
+    // job and a later re-anchor must not be read as a startup that never completed.
+    if (!hasServed && serving()) hasServed = true;
     // Re-entrant calls are answered by the loop already running: the operations a recovery runs report
     // their own end, and that end must not start a second pass over the same requests. A request raised
     // by such a nested operation stays recorded and the outer loop picks it up on its next turn.
@@ -231,6 +258,28 @@ export function createSupervisor(options = {}) {
     if (!started || stopped || ended || closed) return false;
     if (structure.stats.stopped) return false;
     return structure.book.appliedBoundary.connectionId !== null && structure.book.isRunning === true;
+  }
+
+  /**
+   * Arm the startup deadline once, when the sequence begins. It fires on the run's own clock; if the run
+   * still has not reached reception - and never did - the deadline ends it non-zero rather than letting
+   * the reconnect backoff run for ever. The elapsed check makes a timer a test fires by hand, before the
+   * deadline has actually passed, a no-op, so the deadline only ever acts on real time.
+   */
+  function armStartupDeadline() {
+    if (startupDeadlineTimer !== null || ended || closed) return;
+    const armedAtMs = wallClockMs();
+    startupDeadlineTimer = setTimer(() => {
+      startupDeadlineTimer = null;
+      if (ended || stopped || closed || hasServed) return;
+      if (wallClockMs() - armedAtMs < startupDeadlineMs) return;
+      recordStop({
+        market,
+        reason: `reception was not reached within the startup deadline (${startupDeadlineMs} ms)`,
+      });
+      settle();
+    }, startupDeadlineMs);
+    if (typeof startupDeadlineTimer?.unref === 'function') startupDeadlineTimer.unref();
   }
 
   function carryStop() {
@@ -335,6 +384,8 @@ export function createSupervisor(options = {}) {
   function start() {
     return runOperation(() => {
       if (ended) return { started: false, reason: 'this supervisor has ended' };
+      // The deadline covers (a)-(e): from the moment the run tries to start until it actually receives.
+      armStartupDeadline();
       step('beginRun', {});
       const begun = stepOrStop('beginRun', () => structure.beginRun());
       if (!begun.ok) return { started: false, reason: begun.reason };
@@ -346,11 +397,14 @@ export function createSupervisor(options = {}) {
       const restored = stepOrStop('restore', () => structure.restore());
       if (!restored.ok) return { started: false, reason: restored.reason };
       if (stopRequest !== null || ended) return { started: false, reason: 'the store could not be restored' };
+      // (c): the walk is bounded per call, and the sequence must not reach (e) while the spool still holds
+      // records - the old connection is retired the moment the new one is admitted, so anything left here
+      // would never be read again. The step is wrapped like the others, so a save that throws on the way
+      // out is a stop and a non-zero end rather than an exception escaping the sequence.
       step('drain', {});
-      drainWithRetry();
-      // A drain that stopped recorded a stop: the sequence ends here rather than announcing a
-      // connection over a store whose old spool could not be drained.
-      if (stopRequest !== null || ended || structure.stats.stopped) {
+      const drained = stepOrStop('drain', () => drainWithRetry());
+      if (!drained.ok) return { started: false, reason: drained.reason };
+      if (drained.value?.ok === false || stopRequest !== null || ended || structure.stats.stopped) {
         return { started: false, reason: 'the old spool could not be drained' };
       }
       // (d): redeliver what the raw holds and the board does not have, which fixes where the old
@@ -379,23 +433,46 @@ export function createSupervisor(options = {}) {
     });
   }
 
+  /** Bytes the spool still holds, or 0 when there is no spool. The sequence's own read of "is the walk
+   *  done", so a bounded batch that left records behind is never mistaken for a finished drain. */
+  function spoolRemainingBytes() {
+    return structure.spool?.bytes ?? 0;
+  }
+
+  /**
+   * Drain the old spool until it is empty. Each walk is bounded (`drainSpool`'s own limit), so one call
+   * is not the same as a finished drain: the sequence keeps walking while records remain, and only a
+   * transient raw refusal is retried - a corrupt spool, a failed save or a refused admission stops.
+   */
   function drainWithRetry() {
     let attempts = 0;
     for (;;) {
       const drained = structure.drainSpool();
-      if (!drained?.stopped) return drained;
-      // The machine-readable code decides what a retry can improve. Only a raw that refused a record is
-      // the transient case: the spool may be handed back once the raw can take it. A spool that cannot
-      // be read, a frame the store could not save, or a connection the board has not accepted is not
-      // something a retry improves, and those stop the run. The report keeps the string form for people;
-      // the classification is the code.
-      const transient = drained.stoppedCode === 'raw-refused';
-      if (transient && attempts < maxRecoveryAttempts) {
-        attempts += 1;
-        continue;
+      if (drained?.stopped) {
+        // The machine-readable code decides what a retry can improve. Only a raw that refused a record is
+        // the transient case: the spool may be handed back once the raw can take it. A spool that cannot
+        // be read, a frame the store could not save, or a connection the board has not accepted is not
+        // something a retry improves, and those stop the run. The report keeps the string form for people;
+        // the classification is the code.
+        const transient = drained.stoppedCode === 'raw-refused';
+        if (transient && attempts < maxRecoveryAttempts) {
+          attempts += 1;
+          continue;
+        }
+        recordStop({ market, reason: `the old spool could not be drained: ${drained.stopped}` });
+        return { ...drained, ok: false };
       }
-      recordStop({ market, reason: `the old spool could not be drained: ${drained.stopped}` });
-      return drained;
+      // Not stopped, but progress is not the same as completion: a bounded walk can return with records
+      // still waiting. Handing the board over now would retire the old connection with those records
+      // unread, so the walk continues until the spool is actually empty.
+      if (spoolRemainingBytes() === 0) return { ...drained, ok: true };
+      if (!(drained?.consumed > 0)) {
+        // Bytes remain and this walk consumed none: no retry can move it, and carrying on would loop.
+        const reason = 'the old spool could not be drained to empty';
+        recordStop({ market, reason });
+        return { ...drained, stopped: reason, stoppedCode: 'not-consumed', ok: false };
+      }
+      attempts = 0; // progress was made; the retry budget applies to a stuck batch, not to the spool
     }
   }
 

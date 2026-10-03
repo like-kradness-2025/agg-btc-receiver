@@ -1334,3 +1334,302 @@ test('a re-anchor raised during the startup sequence is carried out only after s
     supervisor.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// (c) in full: one bounded walk is not a finished drain, and a spool that cannot be read or saved is a
+// stop rather than something the sequence carries on past. The old connection retires the moment the new
+// one is admitted, so anything left in the spool here would never be read again.
+// ---------------------------------------------------------------------------
+
+test('a restart drains the old spool to empty before handing the board to the new run', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const spoolDir = join(dir, 'spool');
+    seedBoundaryWithSpool(path, spoolDir, []);
+    // One record more than a single bounded walk consumes (the walk's own default limit is 512).
+    writeSpoolSegment(
+      spoolDir,
+      Buffer.concat(Array.from({ length: 513 }, (_, i) => frame(encodeEnvelope(envelope(i + 1))))),
+    );
+
+    const exits = [];
+    let writes = 0;
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path,
+      venue: 'kraken',
+      runId: 'run-2',
+      webSocketImpl: fakeSockets().impl,
+      rawWriter: () => {
+        writes += 1;
+        return true;
+      },
+      spoolDir,
+      exit: (code) => exits.push(code),
+      onStop: () => {},
+      onRefetch: () => {},
+      onDiagnostic: () => {},
+    });
+
+    const started = supervisor.start();
+    assert.equal(started.started, true, 'the old spool is drained and the new run starts');
+    assert.equal(writes, 513, 'every spilled frame is walked out, not only the first batch');
+    assert.equal(supervisor.spool.bytes, 0, 'nothing is left for a retired connection to have carried');
+    assert.deepEqual(exits, [], 'a drained spool is not a failure');
+    supervisor.close();
+  });
+});
+
+test('a save that throws while draining the old spool ends the run non-zero and writes no completion', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const spoolDir = join(dir, 'spool');
+    seedBoundaryWithSpool(path, spoolDir, []);
+    writeSpoolSegment(spoolDir, frame(encodeEnvelope(envelope(1))));
+    // A directory where the cursor file belongs makes the real cursor save fail with EISDIR, which is a
+    // genuine save failure on the drain's own path - not a route opened for the test.
+    mkdirSync(join(spoolDir, 'cursor'));
+
+    const exits = [];
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path,
+      venue: 'kraken',
+      runId: 'run-2',
+      webSocketImpl: fakeSockets().impl,
+      rawWriter: () => true,
+      spoolDir,
+      exit: (code) => exits.push(code),
+      onStop: () => {},
+      onRefetch: () => {},
+      onDiagnostic: () => {},
+    });
+
+    const started = supervisor.start();
+    assert.notEqual(started.started, true, 'a drain that could not be saved is not a start');
+    assert.deepEqual(exits, [1], 'the failure reached the stop path, not the caller');
+    assert.equal(supervisor.abnormal, true);
+    supervisor.close();
+
+    const reader = openDurability({ path, runId: 'reader-1' });
+    assert.equal(reader.lastCompleteRun(), null, 'the failed run is not recorded as complete');
+    reader.close();
+  });
+});
+
+test('a corrupt length in the old spool ends the run non-zero instead of being read as a finished drain', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const spoolDir = join(dir, 'spool');
+    seedBoundaryWithSpool(path, spoolDir, []);
+    // A length the framing can never have written: the segment desynchronised, and nothing after it can
+    // be trusted. The walk must stop on it, not report it as the end of the spool.
+    writeSpoolSegment(spoolDir, Buffer.from([255, 255, 255, 255, 0, 0, 0, 0]));
+
+    const exits = [];
+    const diagnostics = [];
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path,
+      venue: 'kraken',
+      runId: 'run-2',
+      webSocketImpl: fakeSockets().impl,
+      rawWriter: () => true,
+      spoolDir,
+      exit: (code) => exits.push(code),
+      onStop: () => {},
+      onRefetch: () => {},
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+
+    const started = supervisor.start();
+    assert.notEqual(started.started, true, 'a corrupt segment is not a finished drain');
+    assert.deepEqual(exits, [1]);
+    assert.equal(supervisor.abnormal, true);
+    assert.ok(supervisor.spool.bytes > 0, 'the unreadable bytes are left where they are');
+    assert.equal(
+      diagnostics.filter((diagnostic) => /spool could not hand back/.test(String(diagnostic.reason))).length,
+      1,
+      'the corruption is reported once',
+    );
+    supervisor.close();
+
+    const reader = openDurability({ path, runId: 'reader-1' });
+    assert.equal(reader.lastCompleteRun(), null, 'the failed run is not recorded as complete');
+    reader.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (e): reception that is never reached has a deadline. The reconnect backoff alone would run for ever,
+// which is the quiet liveness this set exists to remove.
+// ---------------------------------------------------------------------------
+
+test('a connection that never opens ends the run non-zero at the startup deadline', async () => {
+  await withDir(async (dir) => {
+    const exits = [];
+    const timers = [];
+    let time = 0;
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path: join(dir, 'state.sqlite'),
+      venue: 'kraken',
+      runId: 'run-2',
+      // Every socket attempt fails: the venue is unavailable and stays that way.
+      webSocketImpl: function unavailable() {
+        throw new Error('venue unavailable');
+      },
+      rawWriter: () => true,
+      exit: (code) => exits.push(code),
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: () => {},
+      wallClockMs: () => time,
+      onStop: () => {},
+      onRefetch: () => {},
+      onDiagnostic: () => {},
+    });
+
+    const started = supervisor.start();
+    assert.equal(started.started, true, 'the sequence itself completed');
+    // Drive the clock and every timer for far longer than the deadline. The reconnect backoff keeps
+    // scheduling attempts; the deadline must end the run rather than let that continue for ever.
+    for (let i = 0; i < 40; i += 1) {
+      time += 3600_000;
+      timers.shift()?.fn();
+    }
+    assert.equal(supervisor.ended, true, 'reception that is never reached ends the run');
+    assert.equal(supervisor.abnormal, true);
+    assert.deepEqual(exits, [1], 'and it ends non-zero');
+    supervisor.close();
+  });
+});
+
+test('a run that reached reception is not ended by its startup deadline', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const { sockets, impl } = fakeSockets();
+    const timers = [];
+    const exits = [];
+    let time = 1_792_000_000_000;
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path,
+      venue: 'kraken',
+      runId: 'run-1',
+      webSocketImpl: impl,
+      rawWriter: () => true,
+      spoolDir: join(dir, 'spool'),
+      exit: (code) => exits.push(code),
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, cleared: false, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        timer.cleared = true;
+      },
+      wallClockMs: () => time,
+      onStop: () => {},
+      onRefetch: () => {},
+      onDiagnostic: () => {},
+    });
+
+    supervisor.start();
+    // A frame anchors and serves the board: the run reached reception.
+    sockets[0].onmessage({ data: '{"seq":1}' });
+    assert.equal(supervisor.ready, true);
+
+    // Now let the deadline fire long after it would have. A run that already received is not a startup
+    // that never completed, so the deadline is spent and must do nothing.
+    const deadline = timers[0];
+    time += 3600_000;
+    deadline.fn();
+    assert.deepEqual(exits, [], 'a run that already served is not ended by the startup deadline');
+    assert.equal(supervisor.ended, false);
+    supervisor.stop();
+    supervisor.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The generation issuer is the supervisor's, not the connection's: the run's connections must number from
+// one shared source or two of them collide on the name run:venue:market:generation (C2). The test hands
+// the issuer to the supervisor only - never to a connection - and pins the wiring that carries it there.
+// ---------------------------------------------------------------------------
+
+test('the supervisor numbers the connections of a run from one shared issuer, not from each connection', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const { sockets, impl } = fakeSockets();
+    const timers = [];
+    // The run's shared issuer. It is given to the supervisor; the supervisor must pass it to the
+    // connection it builds. Without that wiring the connection would number itself, and a second
+    // connection of the same run - built here with the same issuer - would collide with it.
+    let issued = 0;
+    const issueGeneration = () => (issued += 1);
+    const supervisor = createSupervisor({
+      market: 'kraken_spot',
+      stream: 'trades',
+      adapter,
+      path,
+      venue: 'kraken',
+      runId: 'run-1',
+      webSocketImpl: impl,
+      rawWriter: () => true,
+      spoolDir: join(dir, 'spool'),
+      issueGeneration,
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, cleared: false, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        timer.cleared = true;
+      },
+      exit: () => {},
+      onStop: () => {},
+      onRefetch: () => {},
+      onDiagnostic: () => {},
+    });
+
+    supervisor.start();
+    assert.equal(issued, 1, 'the supervisor used the run issuer for the connection it built');
+    const firstId = supervisor.connection.connectionId;
+
+    // A second connection of the same run, sharing the run issuer exactly as the supervisor's did. If the
+    // supervisor had not wired its issuer through, its connection would have numbered itself and this one
+    // would reuse the same name.
+    const second = createReceiveConnection({
+      adapter,
+      market: 'kraken_spot',
+      runId: 'run-1',
+      venue: 'kraken',
+      webSocketImpl: impl,
+      issueGeneration,
+      onGeneration: (info) => {
+        info.settle?.(true);
+        return true;
+      },
+    });
+    second.start();
+    assert.notEqual(second.connectionId, firstId, 'the two connections of the run do not share a name');
+    assert.equal(issued, 2, 'and they numbered from the same run issuer');
+
+    supervisor.stop();
+    supervisor.close();
+  });
+});
