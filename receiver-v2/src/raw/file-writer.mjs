@@ -22,6 +22,33 @@ import path from 'node:path';
 
 import { dedupeKey } from '../envelope.mjs';
 
+/**
+ * Recover a file whose last line was torn by a crash or a power cut: an append only ever adds a whole
+ * line ending in `\n`, so a file that does not end in one has an incomplete record at its very end and
+ * nothing after it. Cutting back to the last newline (or to zero when there is none) drops exactly that
+ * unreconstructable fragment. The data is not lost: the spool segment that carried the frame is still
+ * there, so the frame is simply redelivered on this start. Without this, a torn tail would make every
+ * later start refuse the file as unreadable - a permanent halt over a frame the raw never had.
+ */
+function recoverIncompleteTail(filePath, fsModule) {
+  let size;
+  try {
+    size = fsModule.statSync(filePath).size;
+  } catch {
+    return; // no file yet: nothing to recover
+  }
+  if (size === 0) return;
+  let buffer;
+  try {
+    buffer = fsModule.readFileSync(filePath);
+  } catch {
+    return; // unreadable for a reason that is not a torn tail; the key read below will report it
+  }
+  if (buffer[buffer.length - 1] === 0x0a) return; // the file ends on a line boundary: nothing torn
+  const lastNewline = buffer.lastIndexOf(0x0a);
+  fsModule.truncateSync(filePath, lastNewline + 1); // 0 when the whole file is one torn line
+}
+
 /** Read back the dedupe keys a previous life of the file already wrote down. */
 function readWrittenKeys(filePath, fsModule) {
   const keys = new Set();
@@ -39,8 +66,9 @@ function readWrittenKeys(filePath, fsModule) {
     try {
       record = JSON.parse(line);
     } catch {
-      // A torn tail is a record whose bytes did not survive; the raw is the canonical record, so the
-      // process must refuse to start over a file it cannot read back rather than silently ignore it.
+      // A line in the middle of the file that cannot be read back is real corruption of the canonical
+      // record - it cannot be a torn append, which only ever damages the end - so the process refuses to
+      // start over it rather than silently ignore it. A torn *tail* was already cut back before this read.
       throw new Error(`the raw file is not readable at byte ${offset - line.length - 1}: ${filePath}`);
     }
     if (record !== null && typeof record === 'object' && typeof record.key === 'string') {
@@ -66,6 +94,23 @@ function writeAll(fsModule, fd, buffer) {
     offset += written;
   }
   return true;
+}
+
+/**
+ * Cut the file back to the length it had before a failed append, so a half-written line cannot be left
+ * behind. A `writeSync` that stops making progress has already put some bytes on disk; leaving them would
+ * make the next attempt append a whole line *after* the fragment - two records where one was meant, the
+ * first unparseable - and would make the next start refuse the file. Rolling back to the pre-write length
+ * restores the exact state the append began from, so a retry writes one whole line and a restart reads a
+ * file that ends on a line boundary.
+ */
+function rollbackTo(fsModule, fd, size) {
+  try {
+    fsModule.ftruncateSync(fd, size);
+  } catch {
+    // A trim that itself fails leaves the fragment; the write below still reports not-durable, and the
+    // start-time recovery is the second line of defence for exactly this case.
+  }
 }
 
 function serialise(envelope) {
@@ -94,6 +139,10 @@ export function createFileRawWriter({ path: filePath, fsModule = fs } = {}) {
     throw new TypeError('a raw writer needs a non-empty file path');
   }
   fsModule.mkdirSync(path.dirname(filePath), { recursive: true });
+  // Cut back a tail torn by a crash or a power cut *before* reading the keys, so a file that an earlier
+  // life left mid-line recovers instead of refusing to start for ever. The spool still holds the frame, so
+  // the fragment is redelivered rather than lost.
+  recoverIncompleteTail(filePath, fsModule);
   const written = readWrittenKeys(filePath, fsModule);
   const fd = fsModule.openSync(filePath, 'a');
 
@@ -101,14 +150,24 @@ export function createFileRawWriter({ path: filePath, fsModule = fs } = {}) {
     const key = dedupeKey(envelope);
     if (written.has(key)) return true; // a resend is a no-op, not a refusal
     const line = Buffer.from(`${JSON.stringify({ key, envelope: serialise(envelope) })}\n`, 'utf8');
+    let startSize = null;
     try {
+      // Where this append begins. An O_APPEND handle always writes at the end, so this is the length to
+      // return to if the line cannot be finished: no fragment may be left for the next start to trip on.
+      startSize = fsModule.fstatSync(fd).size;
       // Every byte of the line, then fsync: only then is the frame durable and only then is true honest.
-      if (!writeAll(fsModule, fd, line)) return false;
+      if (!writeAll(fsModule, fd, line)) {
+        if (startSize !== null) rollbackTo(fsModule, fd, startSize);
+        return false;
+      }
       fsModule.fsyncSync(fd); // durable before the true answer, as the contract requires
       written.add(key);
       return true;
     } catch {
-      return false; // not durable: the organizer treats this as a frame nothing could hold
+      // not durable: the organizer treats this as a frame nothing could hold. Any bytes the failed append
+      // did land are cut back first, so the file ends where it did before the attempt.
+      if (startSize !== null) rollbackTo(fsModule, fd, startSize);
+      return false;
     }
   }
 

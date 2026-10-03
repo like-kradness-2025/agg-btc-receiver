@@ -75,6 +75,11 @@ function shutdown() {
   let failed = false;
   if (supervisor !== null) {
     // `stop` is the clean stop: it does not mark the run abnormal, so `close` writes the completion.
+    // What `stop` does *not* do is throw for a re-entrant call: a stop that arrives while another
+    // operation holds the store's execution right is answered with a refusal value, and an exception
+    // from the structure's own stop is already absorbed by the supervisor's `stopStructure()`. So the
+    // catch below is a guard, not a routine path - but an unexpected throw is still a stop that did not
+    // cleanly happen, and it must not be reported as success.
     try {
       supervisor.stop();
     } catch {
