@@ -296,6 +296,20 @@ export function createStructure({
   const OWED_REASON = hasRawWriter
     ? 'durable in the raw and not applied to the board yet'
     : 'durable in the store and not applied to the board yet (no raw writer is configured)';
+  // A frame served straight from the ledger's own record rather than re-offered to the organizer. Its
+  // display has to match every other route: when there is no raw writer, "durable" means the store's
+  // record alone, so the result carries `rawSkipped` and the reason says so too - telling the caller a raw
+  // holds the frame when this process has none is the misreading the no-raw contract exists to prevent.
+  // Built in one place so the live resend and the restart's redelivery cannot drift apart.
+  const heldDurableNote = () => ({
+    accepted: true,
+    alreadyDurable: true,
+    reason: hasRawWriter
+      ? 'the raw already holds this frame'
+      : 'the store alone holds this frame (no raw writer is configured)',
+    ack: null,
+    ...(hasRawWriter ? {} : { rawSkipped: true }),
+  });
 
   let refusedByBook = 0;
   // Frames this process wrote into the ledger for the first time. Cumulative, like the spool and reception
@@ -746,12 +760,7 @@ export function createStructure({
       // it goes back through the organizer: a skipped frame sent through it would be rewritten to the raw
       // and reported again, which is the noise the decision exists to end.
       if (stored !== null && stored.state !== INTENT) {
-        return deliver(target, {
-          accepted: true,
-          alreadyDurable: true,
-          reason: 'the raw already holds this frame',
-          ack: null,
-        });
+        return deliver(target, heldDurableNote());
       }
       const note = organizerInternal.note(target, {
         // The intent is written before the raw is touched and confirmed in the commit that claims the frame
@@ -1196,10 +1205,7 @@ export function createStructure({
         // Through the same route as a live frame: the board may adopt an origin here, and the organizer has to
         // hear it before anything is released - a start that reached only the board would leave the raw's
         // position behind, and the next resend of that frame would be written again.
-        const result = deliver(
-          envelopeFromEntry(entry),
-          { accepted: true, alreadyDurable: true, reason: 'the raw already holds this frame', ack: null },
-        );
+        const result = deliver(envelopeFromEntry(entry), heldDurableNote());
         if (result.applied === true || result.reason === ALREADY_APPLIED) {
           appliedCount += 1;
         } else if (result.reason && NEVER_APPLICABLE.has(result.reason)) {
