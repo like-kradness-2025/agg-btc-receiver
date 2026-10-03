@@ -508,6 +508,39 @@ export function createIngestProcess({
     }
   }
 
+  /**
+   * The final tails, sealed on the reception side (ruling ⑨⑩). After reception has stopped this is the
+   * list organize judges "all acknowledged" against: every connection this process wrote a tail for,
+   * with the last sequence it received, plus whether the spool is empty. The tail is a reception fact
+   * only - it does not claim durability or application - and organize is the one that decides.
+   */
+  function sealTails() {
+    const tails = store
+      .receivedTails()
+      .filter((row) => row.market === market && (row.stream === stream || row.stream === ''))
+      .map((row) => ({ connectionId: row.connectionId, lastReceivedSeq: row.lastReceivedSeq }));
+    const spoolEmpty = spool === null ? true : spool.bytes === 0;
+    sendControlBestEffort(
+      makeMessage({
+        version: IPC_VERSION,
+        type: 'tail_sealed',
+        role_instance: instance,
+        run_id: runId,
+        payload: { tails, spool_empty: spoolEmpty },
+      }),
+    );
+    return { tails, spoolEmpty };
+  }
+
+  /**
+   * The old spool, drained oldest-first and handed back through the ordinary organize link (startup (c)).
+   * `force` because this runs before any acknowledgement has been heard; only the cursor moves on an
+   * acknowledgement, so nothing here is released by the send.
+   */
+  function drainSpool() {
+    return { resent: resendSpool({ connectionId: null, force: true }) };
+  }
+
   const spoolView =
     spool === null
       ? null
@@ -537,6 +570,13 @@ export function createIngestProcess({
 
     /** Announce this process to the supervisor. */
     announceHello,
+
+    /** Seal the final tails on the reception side (startup stop, ruling ⑨⑩). */
+    sealTails,
+    /** Drain the old spool oldest-first through the ordinary organize link (startup (c)). */
+    drainSpool,
+    /** Every receive tail this process has written, as a copy. */
+    receivedTails: () => store.receivedTails(),
 
     /** Attach (or replace) the organize channel. A generation that waited for a link is announced now. */
     attachOrganize(channel) {

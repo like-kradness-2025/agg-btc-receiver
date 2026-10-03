@@ -552,6 +552,11 @@
   - **当方の決定（記録）**: ①宛先は `(送信役, type)` の固定表で導出（共通形と封筒形式が凍結のため `to` フィールドを足さない）②**`adopted` の語彙が無い**ため organize は relay された `accepted` で採用し同じ type で確認 → **明示的な採用 type の要否は未決** ③中継は溢れを拒否するのみ（有界なメモリ滞留を置くかは未決）④organize の listen モードは段階3テストの継ぎ目として残置（経路としては使わない）⑤`accepted` に `run_id` を返す（organize の採用に必要）。
   - **段階5b の範囲（更新）**: 起動(a)〜(e) の写像・**停止順（処理/終了の分離）**・子再起動・readiness 集約・`busy_timeout=0`＋プロセス間排他＋旧所有者の終了確認・**organize→book の owed フレーム配送本体**・**実3プロセス通し**。**段階5c**: 未完 `pending_boundary` の復旧・台帳の保持期限 sweep・失効の告知先・**`bin/receiver.mjs` の置換**（⑭。ただし**運用切替は段階6の障害訓練まで不可**）。
 
+**段階5b 実装（commit `<stage5b>`）**: supervisor の結線 **`src/supervisor/run.mjs`**（役割の spawn＝既定は**同一プロセス内の `open*Process`**／supervisor 所有 router で結線／**起動順 (a)〜(e) の写像**と「**(d) が (e) より先**」を文の順序で固定＋試験で担保／**停止順の分離**＝処理順 (ingest→organize→book) と終了順 (book→organize→ingest) を別に扱い、**book の停止結果を確認するまで organize の完了記録能力を残す**・**完了は「全ACK」と「book.stop().stopped===true」の両方が成立したときだけ**（片方だけなら `completed:false, abnormal:true`）／**条件別の子再起動**（book だけ再起動し**受信世代を更新しない**・organize は spool 容量内で継続、保持不能なら受信停止＋欠測記録、記録不能なら終了1）／**readiness 集約**（切断・instance 世代不一致・**報告期限超過**で失効）／**DB単位の排他**（`<db>.owner` サイドカー＋supervisor の終了確認。`OPEN_STORES` に依存しない）／3つの役割ストアで **`busy_timeout=0`** を明示。**organize→book の owed 配送本体**（`deliverOwed`）を実装。テスト **445/445**（+10・変異2件赤）。**既存の単一プロセス経路は byte-identical** ✓。
+  - **【重要・達成していないこと】C11 の「実3プロセス」はまだ**: 既定の spawner は役割を**同一プロセス内で**起動する（**fork/exec・役割ごとの CLI・実 venue websocket のモジュール解決が未定**）。spawner は注入可能なので差し替えは閉じた変更。→ **段階5c で本物のプロセス分離を行う**（これが無いと役割独立も C11も成立しない）。
+  - **当方の決定/残置（記録）**: ①読（readiness の**報告を router が集約器へ流していない**＝役割からの定期報告は未結線。集約器自体は単体試験済み）②organize 障害時の「受信継続→organize 再起動」の配管と実 spool 容量サンプラは未実装 ③owed 配送は毎回全件送る（book が dedupe）＝配送カーソル最適化は保留 ④既定値（`reportDeadlineMs`/`startupDeadlineMs`=60s・`stopDeadlineMs`=10s・`maxRestarts`=3）は設計が定めていない当方の選択 ⑤`busy_timeout=0` は設定したが、SQLite の既定が既に 0 のため**busy 異常の専用テストは無い**。
+  - **段階5c の範囲**: **本物のプロセス分離（fork/exec＋役割ごとの CLI＋実 websocket 解決）**／readiness 報告の結線／organize 障害継続の配管／未完 `pending_boundary` の復旧／台帳の保持期限 sweep／失効の告知先／**`bin/receiver.mjs` の置換**（⑭。**運用切替は段階6の障害訓練まで不可**）。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。

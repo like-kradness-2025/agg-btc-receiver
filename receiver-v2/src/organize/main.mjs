@@ -47,6 +47,7 @@ import net from 'node:net';
 
 import { createChannel, connect } from '../ipc.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
+import { makeEnvelope } from '../envelope.mjs';
 import { internalsOf } from '../internal/wiring.mjs';
 import { openOrganizer } from './watermark.mjs';
 import { openDeliveryLedger, INTENT } from '../supervisor/delivery.mjs';
@@ -158,6 +159,12 @@ export function createOrganizeProcess({
   let sealedTails = null;
   let allAcked = false;
   let allAckedReason = 'no tail has been sealed yet';
+  // The book's recorded applied boundary, handed to organize by the supervisor at startup (b). It is
+  // recorded here even when it is empty: a restart whose ledger is empty but whose spool still holds
+  // frames must still organize them on the connection the board recorded, and organize learns that
+  // somewhere other than a frame. Its absence is never inferred.
+  let bookBoundary = null;
+  let deliveredFrames = 0;
   let stopped = false;
   let closed = false;
   let serving = true;
@@ -271,6 +278,10 @@ export function createOrganizeProcess({
         // an observation that throws is not a fact about the frame
       }
     }
+    // What is durable and owed is handed to the book here (startup (d) covers the recovery case; this
+    // covers the ordinary path, so a frame reaches the board without waiting for a resend nobody asked
+    // for). A frame the book cannot take yet stays owed - only its `applied_ack` releases it.
+    deliverOwed();
     return note;
   }
 
@@ -358,6 +369,8 @@ export function createOrganizeProcess({
       generation: acceptedGeneration,
     });
     replyAccepted(message, true, '');
+    // Now that the connection is adopted, any owed frame from a previous life can reach the board.
+    deliverOwed();
     return { accepted: true, connectionId: acceptedConnectionId };
   }
 
@@ -604,6 +617,62 @@ export function createOrganizeProcess({
   }
 
   // ---------------------------------------------------------------------------------------------
+  // The owed-frame delivery body: what is durable and not yet on the board (startup (d), ruling ③).
+  // ---------------------------------------------------------------------------------------------
+
+  /** Record the book's applied boundary handed over by the supervisor at startup (b). Never inferred. */
+  function resumeFromBoundary(boundary) {
+    bookBoundary = boundary ?? null;
+    return { recorded: bookBoundary !== null, boundary: bookBoundary };
+  }
+
+  /**
+   * Hand every confirmed-and-owed frame to the book, in arrival order (startup (d), and the ordinary
+   * path as frames become durable). The ledger holds the frame's own bytes and meta, so the envelope is
+   * reconstructed from the stored entry, never re-derived - the derived changes block rides along and a
+   * recovery delivers the same result a live frame would. Only `owed` entries are delivered; an `intent`
+   * may not be durable yet, and a `skipped` frame's fate is already written down. A frame the book
+   * refuses (for instance before its connection is adopted) simply stays owed: nothing here releases it,
+   * only the book's `applied_ack` does.
+   */
+  function deliverOwed() {
+    if (bookChannel === null) return { delivered: 0, reason: 'no book is connected to organize' };
+    let delivered = 0;
+    for (const entry of ledger.pending({ state: 'owed' })) {
+      let envelope;
+      try {
+        envelope = makeEnvelope({
+          market,
+          stream,
+          connectionId: entry.connectionId,
+          runId: entry.runId ?? null,
+          venue: entry.venue ?? null,
+          generation: entry.generation ?? null,
+          receiveSeq: entry.receiveSeq,
+          recvTsMs: entry.recvTsMs,
+          recvMonoNs: entry.recvMonoNs,
+          raw: entry.raw,
+          meta: entry.meta,
+        });
+      } catch (error) {
+        diagnostic(`an owed frame could not be rebuilt for delivery: ${error.message}`);
+        continue;
+      }
+      let ok = false;
+      try {
+        ok = bookChannel.sendEnvelope(envelope);
+      } catch (error) {
+        diagnostic(`the book link refused an owed frame: ${error.message}`);
+        ok = false;
+      }
+      if (!ok) break; // backpressure: keep the rest owed rather than dropping them
+      delivered += 1;
+      deliveredFrames += 1;
+    }
+    return { delivered };
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // The run marker and the clean end.
   // ---------------------------------------------------------------------------------------------
 
@@ -655,6 +724,22 @@ export function createOrganizeProcess({
       // a stop notification is best-effort; the state is the fact
     }
     return { stopped: true, ...completion };
+  }
+
+  /**
+   * Stop accepting frames without yet writing the completion. This is the processing stop the
+   * supervisor uses: organize must keep its completion capability until the book's stop result is
+   * confirmed, so the run is not called a normal end on "all acknowledged" alone (rulings ⑨⑩).
+   */
+  function requestStop(reason = 'a stop was requested') {
+    if (closed) return { stopped: false, reason: 'this organize process is closed' };
+    stopped = true;
+    try {
+      onStop({ market, reason });
+    } catch {
+      // a stop notification is best-effort; the state is the fact
+    }
+    return { stopped: true };
   }
 
   function handleStop(message) {
@@ -781,7 +866,10 @@ export function createOrganizeProcess({
 
     beginRun,
     stop,
+    requestStop,
     finalize,
+    deliverOwed,
+    resumeFromBoundary,
 
     requestInvalidation,
     confirmInvalidationBySupervisor,
@@ -810,6 +898,9 @@ export function createOrganizeProcess({
     },
     get allAcked() {
       return allAcked;
+    },
+    get bookBoundary() {
+      return bookBoundary;
     },
 
     close() {

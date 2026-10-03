@@ -51,6 +51,10 @@ export function openIngestStore({ path, nowMs = () => Date.now(), Database = Dat
   const db = new Database(path);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = FULL');
+  // Ruling ⑮: with each role its own process and its own file, a busy is an anomaly, not something to
+  // wait out. Set explicitly to 0 so a second writer surfaces as `database is locked` at once rather
+  // than stalling a run that looks healthy.
+  db.exec('PRAGMA busy_timeout = 0');
   db.exec(INGEST_SCHEMA);
 
   const upsert = db.prepare(

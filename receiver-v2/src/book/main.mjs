@@ -463,6 +463,8 @@ export function createBookProcess({
     handleError,
     attachOrganize,
     announceHello,
+    /** Stop serving, for the supervisor's processing stop. Returns the stop result the run must confirm. */
+    stop: () => handleStop(undefined),
 
     cancelInvalidation,
     invalidationRecords,

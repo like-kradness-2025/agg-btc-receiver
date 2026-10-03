@@ -137,6 +137,8 @@ export function openOrganizeStore({ path: dbPath, runId, nowMs = () => Date.now(
 
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = FULL');
+    // Ruling ⑮: one role, one file, one process. A busy is an anomaly; surface it at once.
+    db.exec('PRAGMA busy_timeout = 0');
     db.exec(ORGANIZE_STORE_SCHEMA);
 
     const invalidate = db.prepare('UPDATE run_marker SET state = ?, at_ms = ? WHERE state = ?');
