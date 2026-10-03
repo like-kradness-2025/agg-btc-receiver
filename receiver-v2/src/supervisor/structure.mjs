@@ -68,6 +68,11 @@ export function createStructure({
   maxWaitingEvents = 1_000,
   ledgerRetentionMs = DEFAULT_LEDGER_RETENTION_MS,
   ledgerRetentionBytes = DEFAULT_LEDGER_RETENTION_BYTES,
+  // Whether recovery is left to the caller instead of running at construction. The entry point drives the
+  // startup sequence itself - begin the run, restore the board's boundary, drain the spool, redeliver - and
+  // a recovery that ran before the run was marked running would put the restore before the begin. A test or
+  // a dry run builds a structure and drives it directly, so the default keeps the old behaviour.
+  deferRecovery = false,
   ...receiveOptions
 }) {
   // The checks that can refuse the configuration run before anything is opened: a construction that never
@@ -550,6 +555,28 @@ export function createStructure({
   }
 
   /**
+   * Restore what the store recorded about the board's boundary: which connection the board follows, where
+   * that connection's numbering starts, and what the raw already holds for it.
+   *
+   * This is the (b) step of the startup sequence and it is deliberately not conditional on the ledger
+   * holding anything. A restart whose ledger is empty but whose spool still holds spilled frames has to
+   * organize them on the connection the board recorded - and the organizer learns that connection nowhere
+   * else. Skipping this because there is nothing owed leaves the organizer with no accepted connection, so
+   * the spool walk is refused frame by frame and the spool never drains. The frames the raw already holds
+   * are declared here too, before anything is released, because a frame the raw holds above its contiguous
+   * position has no other record and the next resend of it would otherwise be written to the raw again.
+   */
+  function restoreBoundaryInternal() {
+    const owed = ledger.pending({ state: OWED });
+    const boundary = book.appliedBoundary;
+    if (boundary.connectionId !== null) {
+      followConnection(boundary.connectionId, { origin: boundary.firstSeq ?? null });
+      for (const entry of owed) organizerInternal.note(envelopeFromEntry(entry), { rawAlreadyHolds: true });
+    }
+    return { restored: boundary.connectionId !== null, owed: owed.length };
+  }
+
+  /**
    * Put one frame on the board, and say what happened to it.
    *
    * One route for every frame that reaches the board - the one that just arrived, and the one the ledger
@@ -1007,12 +1034,18 @@ export function createStructure({
       const takeover = admittedRunId === null && runId !== null && incomingRunId === runId && ownerRun !== runId;
       const accepted = admit(connectionId, { generation, firstSeq: firstSeq ?? null, runId: incomingRunId }, { takeover });
       if (!accepted.accepted) {
-        onDiagnostic({ market, reason: `the book did not accept this connection: ${accepted.reason}` });
+        // The diagnostic is best-effort and the stop is not: a hook that throws from the diagnostic must
+        // not be able to swallow the news that this connection was not admitted, which is the only thing
+        // that tells the caller to stop and exit non-zero rather than sit on a socket nobody admitted.
+        try {
+          onDiagnostic({ market, reason: `the book did not accept this connection: ${accepted.reason}` });
+        } catch {
+          // the stop below is the fact that matters
+        }
         // Reception is not allowed to start: a connection the book refused would have every frame of it
         // refused further down, after it had been stamped and counted as received. And it is not allowed
         // to be silent either: a receiver that has stopped receiving without saying so is worse than one
-        // that stopped loudly. Turning this into a stop and a non-zero exit is the supervisor's job, and
-        // there is no supervisor or entry point yet - this is as far up as the wiring can carry it today.
+        // that stopped loudly. The supervisor turns this into a stop and a non-zero exit.
         onStop({ market, reason: `this connection was not admitted: ${accepted.reason}` });
         return false;
       }
@@ -1145,14 +1178,10 @@ export function createStructure({
       // above its contiguous position has no record anywhere else, and without this the next resend of it would
       // be written to the raw again - the raw refuses a rewrite of what it has, and that refusal would be read
       // as a frame that is not durable. Telling it here is what makes the release below safe.
-      const owed = ledger.pending({ state: OWED });
-      if (owed.length > 0) {
-        const boundary = book.appliedBoundary;
-        if (boundary.connectionId !== null) {
-          followConnection(boundary.connectionId, { origin: boundary.firstSeq });
-          for (const entry of owed) organizerInternal.note(envelopeFromEntry(entry), { rawAlreadyHolds: true });
-        }
-      }
+      // (b) first, and whether or not anything is owed: the organizer has to know the board's connection
+      // before a spilled frame or a redelivered one can be organized at all, and a restart with an empty
+      // ledger is exactly the case where it would otherwise learn nothing.
+      restoreBoundaryInternal();
       const delivered = redeliverPendingInternal();
       // Then an intent, which is a frame the raw may not hold: it is offered back through the organizer,
       // which decides the write again - the one direction in which a crash leaves something recoverable.
@@ -1179,6 +1208,26 @@ export function createStructure({
     organizer: organizerView,
     ledger: ledgerView,
     spool: spoolView,
+    /**
+     * (b): put the organizer on the connection the board recorded, and tell it what the raw already holds,
+     * whether or not the ledger holds anything. The startup sequence calls this before the spool walk.
+     */
+    restore: () => {
+      if (closed) return { restored: false, reason: 'this structure is closed' };
+      return restoreBoundaryInternal();
+    },
+    /** (a): mark this run as the live one. Called by the entry point before anything is restored. */
+    beginRun: () => {
+      if (closed) return { begun: false, reason: 'this structure is closed' };
+      wiring.beginRun();
+      return { begun: true };
+    },
+    /** A clean end: reception has stopped and everything received has been acknowledged as durable. */
+    completeRun: () => {
+      if (closed) return { completed: false, reason: 'this structure is closed' };
+      wiring.completeRun();
+      return { completed: true };
+    },
     start: () => {
       if (closed) return { started: false, reason: 'this structure is closed' };
       // A structure that has stopped does not start again by being asked to: reception was closed because the
@@ -1260,6 +1309,9 @@ export function createStructure({
   const resumeInternal = api.resume;
   const startInternal = api.start;
   const stopInternal = api.stop;
+  const restoreInternal = api.restore;
+  const beginRunInternal = api.beginRun;
+  const completeRunInternal = api.completeRun;
   // A window takes the right, runs the operation, and then lets the arrivals that waited for it through -
   // all inside the same take, so an arrival is never processed in the middle of the frame that was running.
   // The wait is emptied even when the operation throws, and a full wait-list is answered for here as well:
@@ -1321,6 +1373,21 @@ export function createStructure({
     code: refusal.code,
     reason: refusal.reason,
   }));
+  api.restore = window('structure.restore', restoreInternal, (refusal) => ({
+    restored: false,
+    code: refusal.code,
+    reason: refusal.reason,
+  }));
+  api.beginRun = window('structure.beginRun', beginRunInternal, (refusal) => ({
+    begun: false,
+    code: refusal.code,
+    reason: refusal.reason,
+  }));
+  api.completeRun = window('structure.completeRun', completeRunInternal, (refusal) => ({
+    completed: false,
+    code: refusal.code,
+    reason: refusal.reason,
+  }));
   api.stop = window('structure.stop', stopInternal);
   api.close = window('structure.close', closeInternal);
 
@@ -1331,7 +1398,11 @@ export function createStructure({
   // accepts first, which is exactly the order a recovery is written in. It is driven through the guarded
   // name, so the recovery holds the store while it runs: a hook it calls cannot start a second operation and
   // hand the same frame to the same module twice.
-  constructing(() => api.resume());
+  //
+  // The entry point drives the startup sequence itself (begin the run, restore, drain, redeliver) and asks
+  // for the recovery to be deferred: a recovery that ran here would restore the board before the run was
+  // marked running, which is the order the sequence exists to fix.
+  if (!deferRecovery) constructing(() => api.resume());
 
   // The parts themselves, for the wiring: a test that drives a part directly (a book's own accept, a
   // ledger's own record) goes through this, and nothing a caller is handed reaches it.

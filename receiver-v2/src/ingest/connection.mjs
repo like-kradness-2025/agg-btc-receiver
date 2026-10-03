@@ -73,6 +73,13 @@ export function createReceiveConnection({
   openSocket = (url) => new webSocketImpl(url),
   monotonicNs = () => Number(process.hrtime.bigint()),
   wallClockMs = () => Date.now(),
+  // Who issues a connection's generation when its socket is replaced. Reception is the only thing that
+  // issues one, but the issuer is a per-run object rather than a per-connection counter: two sockets of the
+  // same run, venue and market built from two connection objects would otherwise both number themselves
+  // from 1, and their connection names - run:venue:market:generation (C2) - would collide. The entry point
+  // makes one issuer for the run and injects it into every connection that run builds; a connection opened
+  // without one numbers itself, which is all a single connection ever needs.
+  issueGeneration = null,
   silenceDeadlineMs = DEFAULT_SILENCE_DEADLINE_MS,
   stabilityMs = DEFAULT_STABILITY_MS,
   setTimer = setTimeout,
@@ -293,7 +300,7 @@ export function createReceiveConnection({
   function replaceSocket(reason) {
     if (closed) return;
     if (socket) teardownSocket(reason);
-    generation += 1;
+    generation = issueGeneration === null ? generation + 1 : issueGeneration();
     // The name of a connection is the run, the venue, the market and the generation (C2). There is no
     // fallback: a name built from the market and the generation alone is a name two runs can both hold, and
     // a hand-over of one then looks like a reconnect of the other - which is how a board and a watermark end

@@ -86,11 +86,13 @@ CREATE TABLE IF NOT EXISTS pending_boundary (
   PRIMARY KEY (market, stream)
 );
 CREATE TABLE IF NOT EXISTS received_tail (
-  connection_id TEXT NOT NULL PRIMARY KEY,
+  connection_id TEXT NOT NULL,
+  stream TEXT NOT NULL DEFAULT '',
   market TEXT NOT NULL,
   last_received_seq INTEGER NOT NULL,
   last_recv_mono_ns INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (connection_id, stream)
 );
 CREATE TABLE IF NOT EXISTS run_marker (
   run_id TEXT NOT NULL PRIMARY KEY,
@@ -111,6 +113,55 @@ CREATE TABLE IF NOT EXISTS suspected_gap (
 const STATE_RUNNING = 'running';
 const STATE_COMPLETE = 'complete';
 const STATE_INVALIDATED = 'invalidated';
+
+/**
+ * Migrate a `received_tail` written before the stream was part of its key.
+ *
+ * A connection name is made of run, venue, market and generation (C2) and does not carry the stream, so the
+ * same connection legitimately has a book tail and a trades tail. The old table could hold only one row per
+ * connection, so the two boards were overwriting each other's tail - which is a lower bound, but a lower
+ * bound for the wrong board is a lie about which frames arrived. The key gains the stream; old rows have no
+ * stream recorded and are stored with the empty marker rather than a guess, exactly as a run-less owner is
+ * (there is no way to tell which stream they belonged to, and inventing one would attribute a tail to a
+ * board that never wrote it).
+ *
+ * The primary key cannot be changed in place, so the table is rebuilt inside one transaction: a crash
+ * leaves either the old table or the new one, never a half-copied set.
+ */
+function migrateReceivedTail(db) {
+  const columns = db
+    .prepare('PRAGMA table_info(received_tail)')
+    .all()
+    .map((row) => row.name);
+  if (columns.includes('stream')) return;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(`CREATE TABLE received_tail_migrated (
+      connection_id TEXT NOT NULL,
+      stream TEXT NOT NULL DEFAULT '',
+      market TEXT NOT NULL,
+      last_received_seq INTEGER NOT NULL,
+      last_recv_mono_ns INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY (connection_id, stream)
+    )`);
+    db.exec(`INSERT INTO received_tail_migrated
+        (connection_id, stream, market, last_received_seq, last_recv_mono_ns, updated_at_ms)
+      SELECT connection_id, '', market, last_received_seq, last_recv_mono_ns, updated_at_ms
+        FROM received_tail`);
+    db.exec('DROP TABLE received_tail');
+    db.exec('ALTER TABLE received_tail_migrated RENAME TO received_tail');
+    db.exec('COMMIT');
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // the original failure is the one to report
+    }
+    throw error;
+  }
+}
+
 
 /**
  * Open the store for one run.
@@ -167,6 +218,9 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = FULL');
     db.exec(SCHEMA);
+    // An older store's received_tail has no stream in its key; the schema above leaves that old table
+    // in place, so it is rebuilt here before anything reads or writes a tail.
+    migrateReceivedTail(db);
 
     // Only an unfinished generation is invalidated. A run that closed cleanly keeps that fact: erasing
     // it would hide the very thing the marker exists to record.
@@ -356,20 +410,27 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     /**
      * Record how far this process can prove it received. A lower bound, deliberately: it is written
      * every interval rather than every frame, and nothing may treat it as a completeness claim.
+     *
+     * The tail belongs to one board: a connection name is shared by the market's book and its trades
+     * (C2), so the stream is part of what identifies the row. A caller that has no stream to give is
+     * recorded under the empty marker rather than attributed to a board that never wrote it.
      */
-    updateReceivedTail({ connectionId, market, lastReceivedSeq, lastRecvMonoNs }) {
+    updateReceivedTail({ connectionId, market, stream = '', lastReceivedSeq, lastRecvMonoNs }) {
       db.prepare(
         `INSERT OR REPLACE INTO received_tail
-           (connection_id, market, last_received_seq, last_recv_mono_ns, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?)`,
-      ).run(connectionId, market, lastReceivedSeq, lastRecvMonoNs, nowMs());
+           (connection_id, stream, market, last_received_seq, last_recv_mono_ns, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(connectionId, stream ?? '', market, lastReceivedSeq, lastRecvMonoNs, nowMs());
     },
 
-    readReceivedTail(connectionId) {
-      const row = db.prepare('SELECT * FROM received_tail WHERE connection_id = ?').get(connectionId);
+    readReceivedTail(connectionId, stream = '') {
+      const row = db
+        .prepare('SELECT * FROM received_tail WHERE connection_id = ? AND stream = ?')
+        .get(connectionId, stream ?? '');
       if (!row) return null;
       return {
         connectionId: row.connection_id,
+        stream: row.stream,
         market: row.market,
         lastReceivedSeq: row.last_received_seq,
         lastRecvMonoNs: row.last_recv_mono_ns,
@@ -461,6 +522,10 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     // The unguarded close: the wiring that holds the right for an operation of its own (a structure's
     // termination) closes the store inside it, and the public name would refuse that as a second operation.
     close: internal.close,
+    // The run marker's writes, without the right: the structure runs them inside an operation of its
+    // own (a begin or a clean end), and the public names would refuse that as a second operation.
+    beginRun: internal.beginRun,
+    completeRun: internal.completeRun,
     REENTRANT_OPERATION,
     /**
      * One structure serves a board from a store at a time. A second structure over the same board in the

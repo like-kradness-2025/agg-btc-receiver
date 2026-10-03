@@ -82,6 +82,7 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
       if (gapThrows) throw new Error('the gap hook refused');
       gaps.push(gap);
     },
+    onDiagnostic: () => {},
     onRefetch: (request) => {
       if (refetchThrowsOnce && !refetchThrew) {
         refetchThrew = true;
@@ -89,7 +90,6 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
       }
       refetch.push(request);
     },
-    onDiagnostic: () => {},
   });
   structure.accept(CONNECTION, { runId: 'run-1', generation: 1, firstSeq: 1 });
   try {
