@@ -567,6 +567,11 @@ export function createStructure({
     } else if (applied.replaced === true) {
       refetchRequested = false;
     }
+    // The board has taken the frame, so the structure asks whether its boundary is proved: a board that
+    // never leaves syncing is a board nobody may read from, and a repair that waits for a caller to ask is
+    // a repair that does not happen. The book answers with the truth - a proof covering what it applied, or
+    // the reason there is none - and only the first puts the board in service (C6, C7).
+    if (applied.applied === true) bookInternal.proveBoundary();
     // The board may have anchored its boundary on the origin this frame declares. The organizer has to hear
     // the same origin: the ceiling lives there, and a start that reached only the board would leave every
     // frame durable and unacknowledged, waiting for a start that has arrived.

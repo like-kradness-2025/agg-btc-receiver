@@ -205,3 +205,14 @@ test('a loss the ledger cannot write down takes the proof-dropping with it', asy
     { injectable: true },
   );
 });
+
+test('a frame the rule accepts puts the board in service through the structure, without a private call', async () => {
+  // The book does not put itself in service when it applies - a proof is asked for, never assumed - and the
+  // structure is the one that asks. A board that never leaves syncing is a board nobody may read from, and
+  // the way back into service must not depend on a caller remembering to ask for it (C6, C7).
+  await withStructure(async ({ structure, refetch }) => {
+    assert.equal(structure.feed(envelope(1, 1)).applied, true);
+    assert.equal(structure.book.phase, 'running', 'the structure asked, and the rule covered what was applied');
+    assert.equal(refetch.length, 0, 'nothing needed a re-anchor');
+  });
+});
