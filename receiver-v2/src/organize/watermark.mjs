@@ -24,7 +24,8 @@
  * everything waiting behind it is released at once.
  *
  * The start of a connection's numbering is the one thing that may still arrive after its frames do.
- * Until it does, the raw is safe but the ceiling does not move and nothing is acknowledged - the frames
+ * Until it does, the frame is durable - in the raw when there is a raw writer, on the store's own record
+ * when there is not (`rawSkipped`) - but the ceiling does not move and nothing is acknowledged - the frames
  * are held, and released only as far as they are contiguous once the start is known. A start that has
  * been established is never renegotiated.
  *
@@ -247,7 +248,7 @@ function openOrganizerWithin(options, wiring) {
    * holes it opens and the holes it closes go into one transaction, and a frame the store could not
    * describe must leave this process exactly as it was rather than leave a position that only exists in
    * memory. A frame can also be durable without moving the ceiling - that is a state, not a claim, and it
-   * is what tells the caller the raw is safe while the board still has nowhere to put the frame.
+   * is what tells the caller the frame is durable while the board still has nowhere to put the frame.
    */
   function planNote(seq) {
     const held = new Set(durableAboveBaseline);
@@ -440,9 +441,10 @@ function openOrganizerWithin(options, wiring) {
     /**
      * Take one envelope, in the order it was received.
      *
-     * Returns the acknowledgement to send, which is null while the raw is not yet durable or while the
-     * start of this connection's numbering is unknown. It is the caller's writeRaw that decides the
-     * first of those: this method only moves the ceiling after the hook returns.
+     * Returns the acknowledgement to send, which is null while the frame is not yet durable or while the
+     * start of this connection's numbering is unknown. It is the durability decision that comes first -
+     * the caller's writeRaw when there is a raw writer, the store's own record when there is not - and
+     * this method only moves the ceiling after it.
      *
      * A frame that is not this connection's - another board, another run, another generation - is refused
      * before the duplicate test and before the raw, because the canonical record must not hold a frame
@@ -480,9 +482,9 @@ function openOrganizerWithin(options, wiring) {
       // covers can be that - below its first sequence is a frame that was never written, whatever the ceiling
       // says, and treating it as durable would leave the canonical record without it.
       if (upToSeq !== null && seq <= upToSeq && (baselineSeq === null || seq >= baselineSeq)) {
-        // "Already durable" is not "already applied". A crash between the raw write and the board
-        // leaves exactly this frame, and a resend is the only way it comes back - so the caller is told
-        // the raw is safe and the frame may still need routing onward.
+        // "Already durable" is not "already applied". A crash between the durability decision and the
+        // board leaves exactly this frame, and a resend is the only way it comes back - so the caller is
+        // told it is durable, and the frame may still need routing onward.
         return {
           accepted: true,
           duplicate: true,

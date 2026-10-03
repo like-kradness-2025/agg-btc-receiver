@@ -15,9 +15,10 @@
  *  - an *intent* goes in before the durability decision, so the worst a crash can leave behind is an entry
  *    for a frame that may not be durable yet - which is recoverable, because the decision can be made again
  *    from the frame the entry carries;
- *  - it is *confirmed* in the same transaction that claims the frame durable - the raw write's transaction
- *    when there is a raw writer, the store's own when there is not - so an entry and the claim to have
- *    received that frame cannot exist without each other.
+ *  - it is *confirmed* in the store's own transaction that claims the frame durable - the transaction that
+ *    advances the watermark, run after the raw writer has saved the frame when there is one, and the only
+ *    record there is when there is not - so an entry and the claim to have received that frame cannot
+ *    exist without each other.
  *
  * Only a confirmed entry is delivered to the board: an intent is a frame that may not be durable yet, and
  * delivering it would put the board ahead of the canonical record. An intent that is still an intent
@@ -104,8 +105,9 @@ function openDeliveryLedgerWithin(options, wiring) {
   );
   // A state change, never a re-insert: an entry's place in the queue is where its frame arrived, and a
   // frame confirmed late must not be delivered last because of it. A decided loss is not a state to move
-  // from: confirmation is a fact about the raw, and no path - a resend, a second record, a hand-opened
-  // ledger - may resurrect a frame whose fate is already written down.
+  // from: confirmation is the durability decision - the raw's write when there is a raw writer, the store's
+  // own record when there is not - and no path - a resend, a second record, a hand-opened ledger - may
+  // resurrect a frame whose fate is already written down.
   const confirmStatement = wiring.db.prepare(
     `UPDATE delivery_ledger SET state = ?
       WHERE market = ? AND stream = ? AND connection_id = ? AND receive_seq = ? AND state <> 'skipped'`,
@@ -205,15 +207,18 @@ function openDeliveryLedgerWithin(options, wiring) {
       state,
       nowMs(),
     );
-    // A frame that is already written down can still be confirmed: the state is a fact about the raw, and
-    // an entry that was an intent when it was first written down is the same frame.
+    // A frame that is already written down can still be confirmed: the state records the durability
+    // decision - the raw's write when there is a raw writer, the store's own record when there is not -
+    // and an entry that was an intent when it was first written down is the same frame.
     if (state === OWED) confirm(envelope);
     return { recorded: result.changes === 1 };
   }
 
   /**
-   * The raw holds this frame now. Called inside the transaction that claims it durable. A loss already
-   * decided does not move: the confirmation is about the raw, and the decision about the frame stands.
+   * The frame is durable now. Called inside the store's own transaction that claims it - the one that also
+   * advances the watermark - which with a raw writer runs after the raw writer saved the frame and without
+   * one is the only record there is. A loss already decided does not move: the confirmation is about
+   * durability, and the decision about the frame stands.
    */
   function confirm(envelope) {
     const result = confirmStatement.run(OWED, market, stream, envelope.connection_id, envelope.receive_seq);
