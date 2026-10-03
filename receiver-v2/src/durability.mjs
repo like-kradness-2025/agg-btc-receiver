@@ -440,6 +440,38 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     },
 
     /**
+     * Every receive tail this store holds, one row per connection and board. A read, not a change: a
+     * restart uses it to see what earlier runs claimed to have received without being handed any write
+     * route. Rows written before the stream was part of the key carry the empty stream marker exactly as
+     * they were recorded - the migration does not guess which board they belonged to.
+     */
+    receivedTails() {
+      return db
+        .prepare(
+          'SELECT connection_id, stream, market, last_received_seq, last_recv_mono_ns, updated_at_ms FROM received_tail ORDER BY connection_id, stream',
+        )
+        .all()
+        .map((row) => ({
+          connectionId: row.connection_id,
+          stream: row.stream,
+          market: row.market,
+          lastReceivedSeq: row.last_received_seq,
+          lastRecvMonoNs: row.last_recv_mono_ns,
+          updatedAtMs: row.updated_at_ms,
+        }));
+    },
+
+    /**
+     * The state a run's marker holds, or null when this store has no marker for it. A read: a restart
+     * uses it to tell a run that closed cleanly (whose tail is therefore an upper bound) from one that
+     * did not (whose tail is followed by an interval nothing can account for, §9.2).
+     */
+    runMarkerState(runId) {
+      const row = db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get(runId);
+      return row ? row.state : null;
+    },
+
+    /**
      * A range that cannot be proven either way. Recorded, never deleted, and never reported as
      * complete: the point is that the loss stays visible after the fact.
      */
@@ -531,6 +563,10 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     // heard from inside the operation that handles the frame, and the guarded public name would refuse
     // that as a second operation. It is a write the structure owns, not a route a caller is handed.
     updateReceivedTail: internal.updateReceivedTail,
+    // Recording a suspected gap, without the right, for the same reason: a restart's recovery step records
+    // the interval an uncleaned previous run left behind from inside that operation, and the guarded public
+    // name would refuse it as a second operation. A write the structure owns, not a route a caller holds.
+    recordSuspectedGap: internal.recordSuspectedGap,
     REENTRANT_OPERATION,
     /**
      * One structure serves a board from a store at a time. A second structure over the same board in the

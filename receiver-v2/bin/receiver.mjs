@@ -126,7 +126,9 @@ function main(argv) {
   }
 
   try {
-    supervisor = createSupervisor({
+    // The startup deadline is carried only when the config named one: absent means the supervisor's own
+    // default applies, so the entrance does not pass a value the deployment never chose.
+    const supervisorOptions = {
       market: config.market,
       stream: config.stream,
       adapter,
@@ -134,6 +136,7 @@ function main(argv) {
       venue: config.venue,
       webSocketImpl: WebSocketImpl,
       spoolDir: config.spoolDir,
+      ...(config.startupDeadlineMs === undefined ? {} : { startupDeadlineMs: config.startupDeadlineMs }),
       // The supervisor chooses the code; a process turns it into its own exit code. A non-zero code is
       // the end of the run: reception is already stopped, so close (which writes no completion for an
       // abnormal end) and leave with the code the supervisor chose.
@@ -152,7 +155,8 @@ function main(argv) {
           process.exit(code);
         }
       },
-    });
+    };
+    supervisor = createSupervisor(supervisorOptions);
   } catch (error) {
     process.stderr.write(`receiver: ${error.message}\n`);
     process.exit(1);

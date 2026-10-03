@@ -175,6 +175,11 @@ export function createStructure({
   // Re-entrancy guard for the drain: it re-injects frames through the same handler a live frame gets,
   // and that handler must never be able to start a second walk of the spool it is already walking.
   let drainingSpool = false;
+  // Whether the restart's suspected-gap record has been written. The recovery path runs more than once
+  // (the startup sequence's (b) step, and then the resume that start() performs), and the interval a
+  // previous run left behind is one fact about one restart: recording it again would duplicate it with a
+  // later end. One pass per structure is what §9.2 asks for.
+  let restartGapsRecorded = false;
 
   /**
    * Report that an operation has ended and the store's execution right is free again.
@@ -627,6 +632,47 @@ export function createStructure({
   }
 
   /**
+   * Record what a restart cannot account for: the interval after each earlier run's receive tail, for the
+   * connections whose run did not close cleanly (§9.2). The tail is a lower bound on what that run heard
+   * (§8.1) - a run that did not write its completion marker may have received frames that were never made
+   * durable - so that interval must stay visible as a suspected gap rather than be smoothed over.
+   *
+   * The run marker is the only thing that can say a shutdown was clean; the tail cannot. So every tail
+   * whose run's marker is not `complete` is followed by an unaccounted interval, recorded from the moment
+   * that tail was last written to the moment this restart resumed, per connection and board. It is
+   * recorded once per restart, and never deleted (C7): a board recovered by new data does not erase the
+   * history it could not prove.
+   *
+   * The end used here is the resume moment, which is a lower bound on §9.4(2)'s "the point continuity was
+   * re-established" - that point is later (a re-subscribe and a snapshot proof). The restart moment is the
+   * fact this path knows; the difference is reported rather than guessed at.
+   */
+  function recordRestartGapsInternal() {
+    if (restartGapsRecorded) return { recorded: 0 };
+    restartGapsRecorded = true;
+    let recorded = 0;
+    for (const tail of durability.receivedTails()) {
+      // A connection name begins with the run that issued it (C2), and a run id has no colon, so the
+      // first field names the run unambiguously.
+      const tailRunId = String(tail.connectionId).split(':')[0];
+      // This run's own tail is not a past interval: this run has not ended.
+      if (tailRunId === runId) continue;
+      // Only a run with no completion marker is one that may have lost frames; a run that closed cleanly
+      // has a tail that is a true upper bound, so there is nothing to suspect.
+      if (durability.runMarkerState(tailRunId) === 'complete') continue;
+      wiring.recordSuspectedGap({
+        market: tail.market,
+        stream: tail.stream,
+        fromMs: tail.updatedAtMs,
+        toMs: nowMs(),
+        reason: `a run that did not close cleanly received up to sequence ${tail.lastReceivedSeq} on ${tail.connectionId}; frames after it are unaccounted for`,
+      });
+      recorded += 1;
+    }
+    return { recorded };
+  }
+
+  /**
    * Restore what the store recorded about the board's boundary: which connection the board follows, where
    * that connection's numbering starts, and what the raw already holds for it.
    *
@@ -639,6 +685,10 @@ export function createStructure({
    * position has no other record and the next resend of it would otherwise be written to the raw again.
    */
   function restoreBoundaryInternal() {
+    // §9.2, before the boundary is followed again: the interval each unclean earlier run left behind is
+    // recorded, so a restart cannot present a board as continuous over frames the earlier run may have
+    // received and lost. Recorded once per restart, and never deleted.
+    recordRestartGapsInternal();
     const owed = ledger.pending({ state: OWED });
     const boundary = book.appliedBoundary;
     if (boundary.connectionId !== null) {

@@ -25,11 +25,41 @@ const ADAPTERS = Object.freeze({
   bitfinex: createBitfinexAdapter,
 });
 
+/**
+ * Venues that are built but must not be operated, each with the reason. C11: the Bitfinex adapter is
+ * "当面使用禁止" until it is rewritten against the official spec (chanId management, book/trade
+ * separation) - `parse()` drops `[chanId,[price,count,amount]]` book frames and misreads a trade
+ * snapshot as a book, treating the trade id as a price. A deployment that named it would corrupt the
+ * board, so a config that names it is refused here, the same way the `"raw"` key is: a clear error
+ * before anything is opened, not a run that records data nobody can trust.
+ */
+const DISABLED_VENUES = Object.freeze({
+  bitfinex:
+    'the bitfinex adapter must not be operated (C11): it is not rewritten to the official spec, so it misreads trade snapshots as book data and the trade id as a price',
+});
+
 const REQUIRED = Object.freeze(['venue', 'market', 'database', 'spoolDir']);
+
+/**
+ * The bounds a config's `startupDeadlineMs` must sit within. §5.7 fixes 60_000 ms as the default and
+ * leaves the value changeable by configuration; the bounds keep a change from reading as "no deadline"
+ * (0 or negative) or as "no startup window at all". One second is the shortest window that can still
+ * contain a connection attempt; one hour is the longest a startup should be allowed to sit before the
+ * run ends non-zero.
+ */
+export const MIN_STARTUP_DEADLINE_MS = 1_000;
+export const MAX_STARTUP_DEADLINE_MS = 3_600_000;
 
 /** The venues a config may name, for a caller that wants to report the choice. */
 export function knownVenues() {
-  return Object.keys(ADAPTERS);
+  return Object.keys(ADAPTERS).filter((venue) => !Object.prototype.hasOwnProperty.call(DISABLED_VENUES, venue));
+}
+
+/** Refuse a venue that is built but must not be operated. Shared so loadConfig and adapterFor agree. */
+function refuseIfDisabled(venue) {
+  if (Object.prototype.hasOwnProperty.call(DISABLED_VENUES, venue)) {
+    throw new TypeError(`the venue "${venue}" is not supported: ${DISABLED_VENUES[venue]}`);
+  }
 }
 
 /**
@@ -76,12 +106,34 @@ export function loadConfig(configPath) {
   if (!Object.prototype.hasOwnProperty.call(ADAPTERS, raw.venue)) {
     throw new TypeError(`unknown venue "${raw.venue}"; known venues: ${knownVenues().join(', ')}`);
   }
+  refuseIfDisabled(raw.venue);
+  // The startup deadline is the one timing knob a deployment may set (§5.7: 60_000 ms is the default and
+  // the value stays changeable). It is validated here, before anything is opened, so an out-of-range value
+  // fails loudly rather than silently running with no deadline.
+  let startupDeadlineMs;
+  if (Object.prototype.hasOwnProperty.call(raw, 'startupDeadlineMs')) {
+    const value = raw.startupDeadlineMs;
+    if (
+      typeof value !== 'number' ||
+      !Number.isInteger(value) ||
+      value < MIN_STARTUP_DEADLINE_MS ||
+      value > MAX_STARTUP_DEADLINE_MS
+    ) {
+      throw new TypeError(
+        `the config's "startupDeadlineMs" must be an integer between ${MIN_STARTUP_DEADLINE_MS} and ${MAX_STARTUP_DEADLINE_MS} (got ${JSON.stringify(value)})`,
+      );
+    }
+    startupDeadlineMs = value;
+  }
   return Object.freeze({
     venue: raw.venue,
     market: raw.market,
     stream,
     database: raw.database,
     spoolDir: raw.spoolDir,
+    // Only present when the file names it: absent means the supervisor applies its own default, so the
+    // entrance does not turn a missing key into a value the deployment never chose.
+    ...(startupDeadlineMs === undefined ? {} : { startupDeadlineMs }),
     // The venue-specific extras, only when the file carries them. Kraken needs a symbol; Bitfinex
     // defaults to tBTCUSD. A url is optional and defaults inside the adapter.
     symbol: typeof raw.symbol === 'string' && raw.symbol.length > 0 ? raw.symbol : undefined,
@@ -91,6 +143,9 @@ export function loadConfig(configPath) {
 
 /** Build the adapter the config names, refusing a stream the adapter cannot actually carry. */
 export function adapterFor(config) {
+  // Refused here too: a caller that built a config object by hand must not be able to reach the disabled
+  // adapter through this function either. Same treatment as loadConfig.
+  refuseIfDisabled(config.venue);
   const build = ADAPTERS[config.venue];
   const options = { market: config.market };
   if (config.symbol !== undefined) options.symbol = config.symbol;

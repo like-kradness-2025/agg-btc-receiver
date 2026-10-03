@@ -15,7 +15,42 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { openDurability } from '../src/durability.mjs';
+import { createStructure } from '../src/supervisor/structure.mjs';
 import { createSupervisor } from '../src/supervisor/supervisor.mjs';
+
+/** An adapter whose frames move this board, so a socket arrival is a real delivery, not a no-op. */
+const tradesAdapter = {
+  url: 'ws://venue.test/ws',
+  stream: 'trades',
+  parse: () => ({ kind: 'data' }),
+  changesFor: (frame) => [{ side: 'bid', price: 100 + frame.receive_seq, size: 1 }],
+};
+
+/**
+ * One structure over one store, with a socket the test holds. The socket is opened by reception itself,
+ * so a frame handed to `onmessage` travels the real receive path and writes the receive tail.
+ */
+function receiveStructure(store, runId) {
+  const socket = { url: '', onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+  const structure = createStructure({
+    market: 'kraken_spot',
+    stream: 'trades',
+    adapter: tradesAdapter,
+    durability: store,
+    runId,
+    venue: 'kraken',
+    webSocketImpl: function openSocket() {
+      return socket;
+    },
+    rawWriter: () => true,
+    spoolDir: null,
+    onAck: () => {},
+    onGap: () => {},
+    onStop: () => {},
+    onDiagnostic: () => {},
+  });
+  return { structure, socket };
+}
 
 async function withDir(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'tail-'));
@@ -148,5 +183,63 @@ test('a frame received on the socket records the receive tail for its connection
     assert.equal(rows[0].stream, 'trades', 'the stream is part of the key, written not guessed');
     assert.equal(rows[0].last_received_seq, 3, 'and it holds the highest sequence received');
     assert.ok(rows[0].last_recv_mono_ns > 0, 'with the monotonic stamp of that frame');
+  });
+});
+
+test('a receive tail left by a run that did not close cleanly becomes a suspected gap on the next start', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    // run-1 receives a frame on the socket - so its receive tail is written - and then dies mid-stream:
+    // it never writes its completion marker. This is the crash §9.2 exists for, and the interval it
+    // leaves behind is exactly what a restart cannot account for.
+    const first = openDurability({ path, runId: 'run-1' });
+    const { structure: s1, socket } = receiveStructure(first, 'run-1');
+    s1.beginRun();
+    s1.start();
+    const connectionId = s1.connection.connectionId;
+    assert.ok(connectionId.length > 0, 'reception reached its connection');
+    socket.onmessage({ data: '{"seq":1,"size":1}' });
+    const tail = first.readReceivedTail(connectionId, 'trades');
+    assert.equal(tail.lastReceivedSeq, 1, 'the tail recorded what arrived before the crash');
+    s1.stop(); // no completeRun: the run ended mid-stream
+    first.close();
+
+    // The next run over the same store restores the previous boundary. The earlier run's marker is not
+    // `complete`, so the interval after its tail is recorded as a suspected gap.
+    const second = openDurability({ path, runId: 'run-2' });
+    const { structure: s2 } = receiveStructure(second, 'run-2');
+    const gaps = second.suspectedGaps({ market: 'kraken_spot' });
+    assert.equal(gaps.length, 1, 'the unaccounted interval is recorded');
+    assert.equal(gaps[0].stream, 'trades', 'for the board the tail belonged to');
+    assert.equal(gaps[0].fromMs, tail.updatedAtMs, 'it starts where the tail was last written');
+    assert.ok(gaps[0].toMs >= gaps[0].fromMs, 'and ends at the resume moment');
+    assert.match(gaps[0].reason, /did not close cleanly/);
+    assert.ok(gaps[0].reason.includes(connectionId), 'the connection it cannot account for is named');
+    s2.stop();
+    second.close();
+  });
+});
+
+test('a receive tail left by a run that closed cleanly leaves no suspected gap on the next start', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    // The same arrival, but this time the run stops on purpose: it writes its completion marker, which
+    // is the only thing that says the tail is a true upper bound rather than a lower bound with an
+    // unaccounted interval after it (§8.1).
+    const first = openDurability({ path, runId: 'run-1' });
+    const { structure: s1, socket } = receiveStructure(first, 'run-1');
+    s1.beginRun();
+    s1.start();
+    socket.onmessage({ data: '{"seq":1,"size":1}' });
+    assert.equal(first.readReceivedTail(s1.connection.connectionId, 'trades').lastReceivedSeq, 1);
+    s1.completeRun();
+    s1.stop();
+    first.close();
+
+    const second = openDurability({ path, runId: 'run-2' });
+    const { structure: s2 } = receiveStructure(second, 'run-2');
+    assert.deepEqual(second.suspectedGaps(), [], 'a clean end leaves nothing to suspect');
+    s2.stop();
+    second.close();
   });
 });

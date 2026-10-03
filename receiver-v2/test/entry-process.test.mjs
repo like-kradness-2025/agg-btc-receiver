@@ -161,6 +161,58 @@ test('a startup the structure refuses ends the process with code 1 and writes no
   });
 });
 
+test('a config that names the disabled bitfinex venue is refused, and no store is created', async () => {
+  await withDir(async (dir) => {
+    // C11: the bitfinex adapter must not be operated until it is rewritten to the official spec. A config
+    // that names it is refused outright, the same way a `"raw"` key is - before anything is opened, so a
+    // deployment cannot be told a run was recorded while the board was fed misread frames.
+    const { path, config } = writeConfig(dir, {
+      venue: 'bitfinex',
+      market: 'bitfinex_spot',
+      symbol: 'tBTCUSD',
+    });
+    const handle = startChild(path);
+    const { code } = await handle.exited;
+
+    assert.equal(code, 1, `a disabled venue is a failed run; stderr=${handle.stderr}`);
+    assert.match(handle.stderr, /bitfinex/, 'the refused venue is named');
+    assert.match(handle.stderr, /not supported|must not be operated/, 'and the reason is stated');
+    assert.equal(existsSync(config.database), false, 'nothing was opened, so no store exists');
+  });
+});
+
+test('a configured startup deadline ends a run that never reaches reception, before the default would', async () => {
+  await withDir(async (dir) => {
+    // §5.7: the 60_000 ms default stays changeable by configuration. The venue URL is unreachable, so the
+    // run can only end at its deadline; a short configured deadline proves the value reached the supervisor
+    // (with the default this child would sit for a minute).
+    const { path } = writeConfig(dir, { startupDeadlineMs: 1000 });
+    const startedAt = Date.now();
+    const handle = startChild(path);
+    const { code } = await handle.exited;
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(code, 1, `the deadline ended the run non-zero; stderr=${handle.stderr}`);
+    assert.ok(
+      elapsed >= 800 && elapsed < 20_000,
+      `the configured 1000 ms deadline was applied, not the 60 s default (elapsed ${elapsed} ms)`,
+    );
+  });
+});
+
+test('a startup deadline outside the allowed range is refused before anything is opened', async () => {
+  await withDir(async (dir) => {
+    for (const bad of [0, -1, 1.5, 3_600_001, '60000']) {
+      const { path, config } = writeConfig(dir, { startupDeadlineMs: bad });
+      const handle = startChild(path);
+      const { code } = await handle.exited;
+      assert.equal(code, 1, `"${bad}" is a failed run; stderr=${handle.stderr}`);
+      assert.match(handle.stderr, /startupDeadlineMs/, `the refused key is named for "${bad}"`);
+      assert.equal(existsSync(config.database), false, `nothing was opened for "${bad}"`);
+    }
+  });
+});
+
 test('SIGTERM stops a live receiver once: exit 0 with the completion written', async () => {
   await withDir(async (dir) => {
     const { path, config } = writeConfig(dir);
