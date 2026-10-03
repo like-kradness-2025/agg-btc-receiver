@@ -30,6 +30,7 @@ import { createReceiveConnection } from './connection.mjs';
 import { createSpool } from '../spool.mjs';
 import { openIngestStore } from './store.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
+import { attachChanges, deriveChanges } from '../changes.mjs';
 import { connect } from '../ipc.mjs';
 
 /**
@@ -105,7 +106,7 @@ export function createIngestProcess({
       // (④) the receive tail is written on the reception side, before anything else: a frame the board
       // refuses was still received, and "received" is a fact about reception, not a verdict downstream.
       writeReceivedTail(envelope);
-      return sendOrSpool(envelope);
+      return deriveAndSend(envelope);
     },
     onGeneration: handleGeneration,
     onSubscriptions: handleSubscriptions,
@@ -139,6 +140,24 @@ export function createIngestProcess({
       onDiagnostic({ market, reason: `the receive tail could not be written: ${error.message}` });
     }
   }
+
+  /**
+   * Derive the frame's level changes here and carry them on the envelope (ruling ③). The adapter is
+   * the only part that can read the raw bytes, and it is consulted once, on reception: a frame whose
+   * changes cannot be derived - no `changesFor`, a malformed shape, an unknown version - is refused
+   * and reported, never silently sent on as "an empty change".
+   */
+  function deriveAndSend(envelope) {
+    const derived = deriveChanges(adapter, envelope);
+    if (!derived.ok) {
+      onDiagnostic({ market, reason: `the level changes were refused: ${derived.reason}` });
+      onGap({ market, reason: derived.reason, seq: envelope.receive_seq });
+      return { accepted: false, reason: derived.reason };
+    }
+    return sendOrSpool(attachChanges(envelope, derived));
+  }
+
+  /** The frames this process hands on are the ones with a derived, validated changes block. */
 
   /**
    * Hand one frame to organize if the link is up and has capacity; otherwise spool it. False back from
@@ -234,6 +253,29 @@ export function createIngestProcess({
       return organizeChannelRef.sendControl(message);
     } catch (error) {
       onDiagnostic({ market, reason: `the acceptance could not be sent: ${error.message}` });
+      return false;
+    }
+  }
+
+  /**
+   * Announce this process to the supervisor (ruling ①). The router needs the role before it can route
+   * anything; a message sent before the hello is refused, so the hello goes out the moment the channel
+   * is attached, not lazily.
+   */
+  function announceHello() {
+    if (organizeChannelRef === null) return false;
+    try {
+      return organizeChannelRef.sendControl(
+        makeMessage({
+          version: IPC_VERSION,
+          type: 'hello',
+          role_instance: instance,
+          run_id: runId,
+          payload: { role: 'ingest' },
+        }),
+      );
+    } catch (error) {
+      onDiagnostic({ market, reason: `the hello could not be sent: ${error.message}` });
       return false;
     }
   }
@@ -493,9 +535,13 @@ export function createIngestProcess({
     handleControl,
     handleError,
 
+    /** Announce this process to the supervisor. */
+    announceHello,
+
     /** Attach (or replace) the organize channel. A generation that waited for a link is announced now. */
     attachOrganize(channel) {
       organizeChannelRef = channel;
+      announceHello();
       for (const pending of pendingAdmissions.values()) announceAccept(pending.message);
       if (organizeCapacity === 'ok') resendSpool({ connectionId: null });
       return true;
@@ -609,5 +655,6 @@ export async function openIngestProcess(options) {
       })
     : null;
   process = createIngestProcess({ ...rest, organizeChannel: channel });
+  if (channel !== null) process.announceHello();
   return process;
 }

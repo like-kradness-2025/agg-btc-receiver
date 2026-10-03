@@ -53,6 +53,27 @@ export async function startFakeBook(
         }),
       );
     },
+    /**
+     * The book's authorization of a connection, relayed by the supervisor in the real topology. This
+     * peer sends it directly to organize (which is the whole point of the adoption: organize reflects
+     * what the book decided).
+     */
+    sendAccepted({ requestId, connectionId, generation = 1, firstSeq = 1, takeover = false, accepted = true, reason = '' }) {
+      return channel.sendControl(
+        makeMessage({
+          version: IPC_VERSION,
+          type: 'accepted',
+          role_instance: roleInstance,
+          request_id: requestId,
+          run_id: runId,
+          market,
+          stream,
+          connection_id: connectionId,
+          generation,
+          payload: { accepted, reason, first_seq: firstSeq, takeover },
+        }),
+      );
+    },
     sendAppliedAck({ connectionId, generation = 1, upToSeq }) {
       return channel.sendControl(
         makeMessage({

@@ -28,6 +28,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { makeEnvelope } from '../src/envelope.mjs';
 import { IPC_VERSION, makeMessage } from '../src/ipc-message.mjs';
+import { CHANGES_FORMAT } from '../src/changes.mjs';
 import { createBookProcess, openBookProcess } from '../src/book/main.mjs';
 import { startFakeOrganizeForBook } from '../test-support/fake-organize-for-book.mjs';
 
@@ -36,6 +37,8 @@ const STREAM = 'trades';
 
 const change = (seq) => ({ side: 'bid', price: 100 + seq, size: seq });
 
+// A frame carries its own derived level changes (ruling ③): ingest computes them and writes them into
+// the envelope's meta, so the book reads them off the frame rather than asking an adapter.
 const envelope = (seq, { connectionId = 'conn-1', runId = 'run-1', generation = 1, venueSeq = seq } = {}) =>
   makeEnvelope({
     market: MARKET,
@@ -47,7 +50,12 @@ const envelope = (seq, { connectionId = 'conn-1', runId = 'run-1', generation = 
     recvTsMs: 1_792_000_000_000 + seq,
     recvMonoNs: 1_000_000_000 + seq,
     raw: `{"seq":${seq},"venue_seq":${venueSeq}}`,
-    meta: { first_seq: 1, venue_seq: venueSeq },
+    meta: {
+      first_seq: 1,
+      venue_seq: venueSeq,
+      changes_format: CHANGES_FORMAT,
+      changes: { replace: false, changes: [change(seq)] },
+    },
   });
 
 const sequenceAdapter = (connects) => ({
@@ -505,6 +513,35 @@ test('⑥ an applied boundary is announced with applied_ack', async () => {
 // ---------------------------------------------------------------------------------------------------
 // Ownership: the book owns its tables, and neither organize's nor ingest's
 // ---------------------------------------------------------------------------------------------------
+
+test('③ a frame with no level-changes block is refused rather than applied as empty', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'book-no-changes-'));
+  try {
+    const process = createBookProcess({ market: MARKET, stream: STREAM, runId: 'run-1', storePath: join(dir, 'book.sqlite') });
+    const channel = memoryChannel();
+    process.handleControl(acceptMessage(), channel);
+
+    const bare = makeEnvelope({
+      market: MARKET,
+      stream: STREAM,
+      connectionId: 'conn-1',
+      runId: 'run-1',
+      generation: 1,
+      receiveSeq: 1,
+      recvTsMs: 1_792_000_000_001,
+      recvMonoNs: 1_000_000_001,
+      raw: '{"seq":1}',
+      meta: { first_seq: 1 },
+    });
+    const result = process.handleEnvelope(bare, channel);
+    assert.equal(result.applied, false, 'the frame is refused, not applied');
+    assert.match(String(result.reason), /level changes were refused/);
+    assert.equal(process.board.size('bid', 101), null, 'nothing landed on the board');
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('the book owns its tables: the store has no organize table and no received_tail or spool', () => {
   const dir = mkdtempSync(join(tmpdir(), 'book-own-'));

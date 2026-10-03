@@ -36,6 +36,9 @@ const dataAdapter = {
   url: 'ws://venue.test/ws',
   stream: STREAM,
   parse: () => ({ kind: 'data' }),
+  // Level changes are derived on reception (ruling ③) and ride on the envelope. An explicit empty
+  // diff is a valid derivation; an absent one would be refused.
+  changesFor: () => ({ replace: false, changes: [] }),
   subscribeMessages: () => ['{"subscribe":"trades"}'],
   heartbeatMessage: () => null,
 };

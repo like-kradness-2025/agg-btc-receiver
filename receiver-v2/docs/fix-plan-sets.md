@@ -548,6 +548,10 @@
 **運用切替は段階6の指定障害訓練まで承認しない**。canonical raw は既承認の別課題のまま。
 **段階5の分割（実施）**: **5a**＝supervisor のソケット/ルーティング所有＋accept 経路の是正＋変化導出の ingest 移設（+ 無条件 accepted の撤去）／**5b**＝起動(a)〜(e) の写像・停止順（処理/終了の分離）・子再起動・readiness 集約・`busy_timeout=0`＋プロセス間排他＋旧所有者の終了確認・**実3プロセス通し**。
 
+**段階5a 実装（commit `<stage5a>`）**: supervisor 所有のルーター **`src/supervisor/router.mjs`**（単一ソケット・`(送信役, type)` の固定表で宛先を導出・**新しい instance は旧チャネルを閉じて置換**・宛先検証・**accept は自分が保持する pending と照合**・**認可しない／捏造しない／耐久判定しない／板に触らない**・中継は**有界で非耐久**＝溢れは拒否＋`readiness{capacity:'full'}`・**業務 payload は deep-equal で素通し**）。**accept の全経路**: ingest 発行 → router が pending 保持＋book へ → book 認可 → **`accepted:true` のときだけ organize へ** → organize が採用して確認 → ingest が受信開始（**book の成功だけでソケットは開かない**）。**organize の無条件 `accepted:true` を撤去**（生の accept は拒否）。変化導出は **`src/changes.mjs`**（`CHANGES_FORMAT='v1'`・C5 の形を厳密検証・ingest がアダプタの `changesFor` を呼ぶ・**導出不能は拒否＋診断＋欠測記録**＝空の変更として送らない・book は有効な塊の無いフレームを拒否・**spool と台帳に保持**し再配送でも同じ結果）。テスト **435/435**（+22・変異4件赤）。**既存の単一プロセス経路は byte-identical** ✓。
+  - **当方の決定（記録）**: ①宛先は `(送信役, type)` の固定表で導出（共通形と封筒形式が凍結のため `to` フィールドを足さない）②**`adopted` の語彙が無い**ため organize は relay された `accepted` で採用し同じ type で確認 → **明示的な採用 type の要否は未決** ③中継は溢れを拒否するのみ（有界なメモリ滞留を置くかは未決）④organize の listen モードは段階3テストの継ぎ目として残置（経路としては使わない）⑤`accepted` に `run_id` を返す（organize の採用に必要）。
+  - **段階5b の範囲（更新）**: 起動(a)〜(e) の写像・**停止順（処理/終了の分離）**・子再起動・readiness 集約・`busy_timeout=0`＋プロセス間排他＋旧所有者の終了確認・**organize→book の owed フレーム配送本体**・**実3プロセス通し**。**段階5c**: 未完 `pending_boundary` の復旧・台帳の保持期限 sweep・失効の告知先・**`bin/receiver.mjs` の置換**（⑭。ただし**運用切替は段階6の障害訓練まで不可**）。
+
 ## 6. 実装時の注意点（Astra 実装前レビュー 2026-09-25）
 
 1. **着手順（`state.mjs:89` から）**: migration → 復元 → **8列の保存文** → `persistAcceptance` と `commitRange` → `accept` → `apply`。

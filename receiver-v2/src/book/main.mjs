@@ -46,6 +46,7 @@
 
 import { connect } from '../ipc.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
+import { readChanges } from '../changes.mjs';
 import { internalsOf } from '../internal/wiring.mjs';
 import { openBook } from './state.mjs';
 import { INVALIDATION_INVALIDATED, openBookStore } from './store.mjs';
@@ -67,10 +68,10 @@ export function createBookProcess({
   organizeChannel = null,
   roleInstance = null,
   nowMs = () => Date.now(),
-  // How a frame's level changes are derived. In the single-process structure the venue adapter computes
-  // them from the raw bytes; in the split that derivation belongs to the side that parses (stage 5 wires
-  // it). This is the seam, and it deliberately opens no test-only route inside the product modules.
-  changesFor = null,
+  // Frames carry their own derived level changes (ruling ③): ingest computes them with the venue
+  // adapter and writes them into the envelope's `meta`, so the book reads the block off the frame and
+  // never asks an adapter of its own (the supervisor holds no adapter either). A frame with no valid
+  // block is refused - a missing derivation is not read as an empty change.
   channelOptions = {},
   onDiagnostic = () => {},
   onApplied = () => {},
@@ -169,15 +170,25 @@ export function createBookProcess({
   // -------------------------------------------------------------------------------------------
 
   function replyAccepted(message, { accepted, reason }) {
+    // The answer carries the identity the accept named plus this book's board, so the role that adopts
+    // (organize) and the role that opens the socket (ingest) can act on it without inventing anything.
     return sendControl(
       makeMessage({
         version: IPC_VERSION,
         type: 'accepted',
         role_instance: instance,
         request_id: message.request_id,
+        run_id: message.run_id ?? runId,
+        market,
+        stream,
         connection_id: message.connection_id,
         generation: message.generation,
-        payload: { accepted, reason },
+        payload: {
+          accepted,
+          reason,
+          first_seq: message.payload?.first_seq ?? 1,
+          takeover: message.payload?.takeover === true,
+        },
       }),
     );
   }
@@ -349,7 +360,14 @@ export function createBookProcess({
     if (channel !== undefined) setOrganize(channel);
     if (closed) return { applied: false, reason: 'this book process is closed' };
     if (stopped) return { applied: false, reason: 'this book process has stopped' };
-    const changes = typeof changesFor === 'function' ? changesFor(envelope) : [];
+    const read = readChanges(envelope);
+    if (read.ok !== true) {
+      framesRefused += 1;
+      // A frame with no usable level-changes block is refused outright: applying it as an empty change
+      // would silently drop the levels it carried.
+      return { applied: false, reason: `the frame's level changes were refused: ${read.reason}` };
+    }
+    const changes = read.replace ? { replace: true, levels: read.levels } : { replace: false, changes: read.changes };
     const result = book.apply({ envelope, changes });
     if (result.applied === true) {
       framesApplied += 1;

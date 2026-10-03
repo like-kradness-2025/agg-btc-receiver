@@ -78,6 +78,25 @@ function memoryChannel() {
   };
 }
 
+/**
+ * The book's authorization of a connection, which organize adopts (ruling ②): organize no longer
+ * decides an accept, it reflects the answer the supervisor relays from the book.
+ */
+function acceptedMessage({ connectionId = CID, generation = 1, firstSeq = 1, runId = RUN, requestId = 'req-accept' } = {}) {
+  return makeMessage({
+    version: IPC_VERSION,
+    type: 'accepted',
+    role_instance: 'book-1',
+    request_id: requestId,
+    run_id: runId,
+    market: MARKET,
+    stream: STREAM,
+    connection_id: connectionId,
+    generation,
+    payload: { accepted: true, reason: '', first_seq: firstSeq, takeover: false },
+  });
+}
+
 /** A whole world: a fresh directory, an organize process listening, and both fake peers connected. */
 async function setup(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'organize-proc-'));
@@ -126,9 +145,10 @@ async function setup(options = {}) {
 test('① a frame is durable (raw, then the store) before its durable_ack is sent', async () => {
   const h = await setup();
   try {
-    h.ingest.sendAccept({ connectionId: CID });
+    // The book authorizes the connection (as the supervisor relays it); organize adopts and confirms.
+    h.book.sendAccepted({ requestId: `${'ingest-1'}:accept:${CID}:1`, connectionId: CID, generation: 1, firstSeq: 1 });
     await until(() => h.ingest.state.accepted.length === 1);
-    assert.equal(h.ingest.state.accepted[0].payload.accepted, true, 'organize adopts the connection');
+    assert.equal(h.ingest.state.accepted[0].payload.accepted, true, 'organize adopts what the book authorized');
 
     h.ingest.sendFrame(envelope(1));
     await until(() => h.ingest.state.durableAcks.length === 1);
@@ -180,19 +200,7 @@ test('② a failure inside the organizer transaction rolls the watermark and the
       },
     });
     const channel = memoryChannel();
-    process.handleControl(
-      makeMessage({
-        version: IPC_VERSION,
-        type: 'accept',
-        role_instance: 'ingest-1',
-        request_id: 'req-1',
-        run_id: RUN,
-        connection_id: CID,
-        generation: 1,
-        payload: { first_seq: 1 },
-      }),
-      channel,
-    );
+    process.handleControl(acceptedMessage(), channel);
 
     assert.throws(() => process.handleEnvelope(envelope(1), channel), /injected clock failure/);
 
@@ -341,19 +349,7 @@ test('⑤ the run marker records running and invalidated, and complete only afte
     // Drive one frame and seal the tail it reaches: every tail is reached, so a clean end may be written.
     const channel = memoryChannel();
     const newCid = 'run-new:kraken:kraken_spot:1';
-    process.handleControl(
-      makeMessage({
-        version: IPC_VERSION,
-        type: 'accept',
-        role_instance: 'ingest-1',
-        request_id: 'req-1',
-        run_id: 'run-new',
-        connection_id: newCid,
-        generation: 1,
-        payload: { first_seq: 1 },
-      }),
-      channel,
-    );
+    process.handleControl(acceptedMessage({ connectionId: newCid, runId: 'run-new' }), channel);
     process.handleEnvelope(envelope(1, { connectionId: newCid, runId: 'run-new' }), channel);
     const verdict = process.handleControl(
       makeMessage({
@@ -480,6 +476,41 @@ test('⑥ all-acknowledged: every sealed tail reached, no spool, no hole - other
 // ---------------------------------------------------------------------------------------------------
 // Ownership: organize's store carries its own tables and neither the receive tail nor a spool
 // ---------------------------------------------------------------------------------------------------
+
+test('② organize authorizes nothing: a raw accept is refused and no connection is adopted', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-no-accept-'));
+  try {
+    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const channel = memoryChannel();
+    const outcome = process.handleControl(
+      makeMessage({
+        version: IPC_VERSION,
+        type: 'accept',
+        role_instance: 'ingest-1',
+        request_id: 'req-x',
+        run_id: RUN,
+        connection_id: CID,
+        generation: 1,
+        payload: { first_seq: 1 },
+      }),
+      channel,
+    );
+    assert.equal(outcome.accepted, false, 'organize does not grant an accept');
+    assert.equal(
+      channel.sent.some((m) => m.type === 'accepted'),
+      false,
+      'the unconditional accepted:true is gone',
+    );
+    assert.equal(process.acceptedConnectionId, null, 'nothing was adopted');
+    // And a frame from that connection is refused for want of an adoption.
+    const refused = process.handleEnvelope(envelope(1), channel);
+    assert.equal(refused.accepted, false);
+    assert.match(String(refused.reason), /no connection has been accepted/);
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('organize owns its tables: the store has no received_tail and no spool', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-own-'));

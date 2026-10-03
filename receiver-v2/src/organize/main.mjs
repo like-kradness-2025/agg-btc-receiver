@@ -45,7 +45,7 @@
 
 import net from 'node:net';
 
-import { createChannel } from '../ipc.mjs';
+import { createChannel, connect } from '../ipc.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
 import { internalsOf } from '../internal/wiring.mjs';
 import { openOrganizer } from './watermark.mjs';
@@ -146,6 +146,11 @@ export function createOrganizeProcess({
   let ingestChannel = null;
   let bookChannel = null;
   const channelRoles = new Map();
+  // Behind the supervisor, organize has one channel to the router, so a peer cannot be told apart by
+  // the channel it arrived on: the message's own type is the routing fact (the router already decided
+  // which role may speak it). In that mode both reply routes point at the router, which derives the
+  // destination from the message type.
+  let routerMode = false;
 
   let acceptedConnectionId = null;
   let acceptedRunId = null;
@@ -314,9 +319,34 @@ export function createOrganizeProcess({
     }
   }
 
-  function handleAccept(message) {
+  /**
+   * The adoption, and only the adoption (ruling ②). Organize no longer decides an accept: the
+   * authorization is the book's, and organize is handed the book's answer by the supervisor. When
+   * that answer arrives, organize reflects the adoption and confirms it - and that confirmation is
+   * what lets ingest open the socket. A raw `accept` reaching organize is refused: organize is not
+   * the place an acceptance is granted, and pretending to grant one here is exactly the unconditional
+   * `accepted:true` ruling ② removes.
+   */
+  function handleAcceptFromPeer(message) {
+    diagnostic(
+      'an accept arrived at organize; the book authorizes an accept and organize only adopts what the supervisor relays',
+    );
+    return { accepted: false, reason: 'organize does not authorize an accept' };
+  }
+
+  /**
+   * The book authorized the connection (relayed by the supervisor). Organize reflects the adoption in
+   * its organizer and confirms it. The confirmation carries the request identity so the acceptance can
+   * be matched back to the ingest that asked, and it is not an authorization of its own - it is the
+   * adoption's completion.
+   */
+  function adoptConnection(message) {
+    if (message.payload?.accepted === false) {
+      // The book refused; organize adopts nothing and the refusal travels on to ingest.
+      return replyAccepted(message, false, message.payload?.reason ?? 'the book refused the connection');
+    }
     if (!message.connection_id || message.connection_id.length === 0) {
-      return replyAccepted(message, false, 'an acceptance must name a connection');
+      return replyAccepted(message, false, 'an adoption must name a connection');
     }
     const firstSeq = message.payload?.first_seq;
     acceptedConnectionId = message.connection_id;
@@ -581,6 +611,26 @@ export function createOrganizeProcess({
     return organizeStore.beginRun();
   }
 
+  /** Announce this process to the supervisor. */
+  function announceHello() {
+    const channel = ingestChannel ?? bookChannel;
+    if (channel === null) return false;
+    try {
+      return channel.sendControl(
+        makeMessage({
+          version: IPC_VERSION,
+          type: 'hello',
+          role_instance: instance,
+          run_id: runId,
+          payload: { role: 'organize' },
+        }),
+      );
+    } catch (error) {
+      diagnostic(`the hello could not be sent: ${error.message}`);
+      return false;
+    }
+  }
+
   /**
    * A clean end: only when every sealed tail has been reached is a normal completion written. Writing
    * `complete` over an unaccounted tail, a raw hole or an unprocessed spool would be the one lie the
@@ -631,6 +681,9 @@ export function createOrganizeProcess({
   // ---------------------------------------------------------------------------------------------
 
   function setRole(channel, role) {
+    // Behind the supervisor there is one channel to the router, already bound; the peer is told apart
+    // by the message's type, not the channel, so nothing here needs re-attributing.
+    if (routerMode || channel === undefined || channel === null) return;
     const previous = channelRoles.get(channel);
     channelRoles.set(channel, role);
     if (role === 'ingest' && ingestChannel !== channel) ingestChannel = channel;
@@ -640,6 +693,14 @@ export function createOrganizeProcess({
       // attaches is what keeps the round trip from being lost to connection ordering (ruling ⑥).
       if (previous !== 'book') announceOutstanding();
     }
+  }
+
+  /** Behind the supervisor: one channel to the router carries both the ingest and the book traffic. */
+  function attachRouter(channel) {
+    routerMode = true;
+    ingestChannel = channel;
+    bookChannel = channel;
+    return true;
   }
 
   /** Re-announce every request the book has not answered, oldest first. */
@@ -656,7 +717,11 @@ export function createOrganizeProcess({
       }
       case 'accept':
         setRole(channel, 'ingest');
-        return handleAccept(message);
+        return handleAcceptFromPeer(message);
+      case 'accepted':
+        // The book's authorization, relayed by the supervisor: adopt and confirm (ruling ②). This is
+        // the only path that adopts a connection - there is no unconditional acceptance here.
+        return adoptConnection(message);
       case 'tail_sealed':
         setRole(channel, 'ingest');
         return handleTailSealed(message);
@@ -711,6 +776,8 @@ export function createOrganizeProcess({
     handleEnvelope,
     handleError,
     adoptChannel,
+    attachRouter,
+    announceHello,
 
     beginRun,
     stop,
@@ -796,14 +863,29 @@ export function createOrganizeProcess({
 }
 
 /**
- * Open the organize process against a unix socket path: this is the process entrance the supervisor
- * will call in stage 5 (and the tests call now). Organize listens; ingest and the book connect to it,
- * announce their role with `hello`, and speak the stage-1 vocabulary. Each channel gets its own
- * callbacks, so a message is attributed to the peer that sent it.
+ * Open the organize process. Behind the supervisor it connects to the router's socket (the supervisor
+ * owns the rendezvous, ruling ①) and adopts the single channel; standalone - the stage-3 test seam - it
+ * listens and tells its peers apart by which channel they connected on. The two are the same process;
+ * only the meeting point differs.
  */
-export async function openOrganizeProcess({ listenPath, channelOptions = {}, ...rest } = {}) {
-  if (!listenPath) throw new TypeError('the organize process needs a socket path to listen on');
+export async function openOrganizeProcess({ listenPath = null, routerSocketPath = null, channelOptions = {}, ...rest } = {}) {
+  if (!listenPath && !routerSocketPath) {
+    throw new TypeError('the organize process needs a socket path to listen on or a router to connect to');
+  }
   const process = createOrganizeProcess({ ...rest, channelOptions });
+
+  if (routerSocketPath) {
+    const channel = await connect(routerSocketPath, {
+      ...channelOptions,
+      onControl: (message) => process.handleControl(message),
+      onEnvelope: (envelope) => process.handleEnvelope(envelope),
+      onError: (error) => process.handleError(error),
+    });
+    process.attachRouter(channel);
+    process.announceHello();
+    process.rederiveInvalidations();
+    return process;
+  }
 
   const server = net.createServer((socket) => {
     let channel;
