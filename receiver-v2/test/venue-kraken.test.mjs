@@ -60,7 +60,7 @@ test('an unparsable frame is reported rather than guessed at', () => {
   assert.equal(adapter.parse(JSON.stringify({ nothing: 'useful' })), null);
 });
 
-test('a snapshot becomes level changes for both sides', () => {
+test('a snapshot replaces the whole board, as the v1 contract requires', () => {
   const raw = JSON.stringify([
     1234,
     { bs: [['49999.0', '1.5', '1.0'], ['49998.0', '2.0', '1.0']], as: [['50001.0', '0.5', '1.0']], c: '1' },
@@ -68,27 +68,35 @@ test('a snapshot becomes level changes for both sides', () => {
     'XBT/USD',
   ]);
   const changes = adapter.changesFor({ raw: Buffer.from(raw) });
-  assert.deepEqual(changes, [
-    { side: 'bid', price: 49999, size: 1.5 },
-    { side: 'bid', price: 49998, size: 2 },
-    { side: 'ask', price: 50001, size: 0.5 },
-  ]);
+  // C5: a snapshot is a replacement, not a diff - the levels it does not name are gone.
+  assert.deepEqual(changes, {
+    replace: true,
+    levels: [
+      { side: 'bid', price: 49999, size: 1.5 },
+      { side: 'bid', price: 49998, size: 2 },
+      { side: 'ask', price: 50001, size: 0.5 },
+    ],
+  });
 });
 
-test('an update with a size of zero is a level leaving, not a level of zero', () => {
+test('an update is a diff, and a size of zero is a level leaving, not a level of zero', () => {
   const raw = JSON.stringify([1234, { b: [['49999.0', '0', '1.0']], a: [] }, 'book-1000', 'XBT/USD']);
   const changes = adapter.changesFor({ raw: Buffer.from(raw) });
-  assert.deepEqual(changes, [{ side: 'bid', price: 49999, size: 0 }], 'the book removes it by size zero');
+  assert.deepEqual(
+    changes,
+    { replace: false, changes: [{ side: 'bid', price: 49999, size: 0 }] },
+    'the book removes it by size zero',
+  );
 });
 
 test('a trade frame carries no board changes', () => {
   const raw = JSON.stringify([0, [['50000.0', '1.0', '1234.5', 'b', 'm', '']], 'trade', 'XBT/USD']);
-  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(raw) }), []);
+  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(raw) }), { replace: false, changes: [] });
 });
 
 test('malformed levels are dropped rather than turned into a made-up price', () => {
   const raw = JSON.stringify([1234, { b: [['not-a-number', '1'], ['10', 'x'], []], a: [] }, 'book-1000', 'XBT/USD']);
-  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(raw) }), []);
+  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(raw) }), { replace: false, changes: [] });
 });
 
 /**

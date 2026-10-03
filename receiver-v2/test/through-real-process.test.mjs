@@ -9,8 +9,10 @@
  *
  * The websocket implementation and the venue adapter are supplied as module paths (the role CLI's
  * seams): the production default is Node's global `WebSocket` and the built-in venue adapter, but a
- * synthetic venue needs its own. The stores write to real files and the run marker is read back from
- * organize's own store.
+ * synthetic venue needs its own. Here the adapter module is a one-line rename of the *built-in
+ * kraken adapter* (so the real `changesFor`/`parse` code runs, in the v1 contract's shape), and the
+ * fake venue speaks Kraken's own frames: a `subscriptionStatus` per subscription, then book frames.
+ * The stores write to real files and the run marker is read back from organize's own store.
  */
 
 import { test } from 'node:test';
@@ -25,13 +27,20 @@ import { createRunSupervisor, RUN_ROLES } from '../src/supervisor/run.mjs';
 import { createForkSpawner } from '../src/supervisor/process-spawner.mjs';
 import { openOrganizeStore } from '../src/organize/store.mjs';
 
-const FAKE_ADAPTER = fileURLToPath(new URL('../test-support/fake-venue-adapter.mjs', import.meta.url));
+const KRAKEN_ADAPTER = fileURLToPath(new URL('../test-support/kraken-venue-adapter.mjs', import.meta.url));
 const FAKE_WEBSOCKET = fileURLToPath(new URL('../test-support/fake-websocket.mjs', import.meta.url));
 
 const MARKET = 'fake_market';
 const STREAM = 'trades';
 const VENUE = 'fake_venue';
 const RUN = 'run-real-1';
+const PAIR = 'XBT/USD';
+
+/** A Kraken book frame: the first is a snapshot (a replacement), the rest are updates (diffs). */
+const krakenFrame = (seq) =>
+  seq === 1
+    ? JSON.stringify([1234, { bs: [['100.0', '1.0', '1.0']], as: [['101.0', '1.0', '1.0']], c: '1' }, 'book-1000', PAIR])
+    : JSON.stringify([1234, { b: [[`${100 + seq}.0`, '1.0', '1.0']], a: [] }, 'book-1000', PAIR]);
 
 async function until(predicate, { timeoutMs = 20_000, stepMs = 10, label = 'the condition' } = {}) {
   const deadline = Date.now() + timeoutMs;
@@ -61,7 +70,11 @@ async function fakeVenue() {
       socket.write(`${line}\n`);
     },
     ack() {
-      socket.write('sub-ack\n');
+      // Kraken answers each subscription with its own `subscriptionStatus`; the link is established
+      // only when every expected key is acknowledged, so both are sent.
+      const status = (name) =>
+        `{"event":"subscriptionStatus","status":"subscribed","pair":["${PAIR}"],"subscription":{"name":"${name}"}}`;
+      socket.write(`${status('book')}\n${status('trade')}\n`);
     },
     close() {
       server.close();
@@ -77,8 +90,8 @@ async function withRun(fn) {
   const exits = [];
   let supervisor = null;
   const spawner = createForkSpawner({
-    adapterSpec: { url: `ws://127.0.0.1:${venue.port}` },
-    adapterModule: FAKE_ADAPTER,
+    adapterSpec: { url: `ws://127.0.0.1:${venue.port}`, symbol: PAIR },
+    adapterModule: KRAKEN_ADAPTER,
     websocketModule: FAKE_WEBSOCKET,
     readinessIntervalMs: 50,
     onDiagnostic: (d) => diagnostics.push(d),
@@ -124,7 +137,7 @@ async function serve(supervisor, venue, count) {
     if (venue.connected) venue.ack();
     await new Promise((done) => setTimeout(done, 250));
   }
-  for (let seq = 1; seq <= count; seq += 1) venue.send(`{"seq":${seq}}`);
+  for (let seq = 1; seq <= count; seq += 1) venue.send(krakenFrame(seq));
   await until(() => supervisor.children.book?.process.appliedBoundary?.upToSeq === count, {
     label: 'the board to serve every frame',
   });
@@ -211,7 +224,7 @@ test('killing the book child alone keeps reception and organization running, res
     );
 
     // The restarted book serves again on the same connection.
-    venue.send('{"seq":4}');
+    venue.send(krakenFrame(4));
     await until(() => supervisor.children.book?.process.appliedBoundary?.upToSeq === 4, {
       label: 'the restarted board to serve',
     });

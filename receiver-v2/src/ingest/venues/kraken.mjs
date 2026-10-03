@@ -259,9 +259,14 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
     },
 
     /**
-     * The board changes a frame carries. Snapshots and updates both produce level changes, and a
-     * trade frame produces none: trades do not move this book, which is how the current system
-     * behaves and therefore how this one must.
+     * The board changes a frame carries, in the v1 contract's shape (C5): a snapshot (`as`/`bs`) is
+     * `{replace:true, levels}` - it is the whole book, so the levels it does not name are gone - and
+     * an update (`a`/`b`) is `{replace:false, changes}`. A trade frame produces no changes: trades do
+     * not move this book, which is how the current system behaves and therefore how this one must.
+     *
+     * Returning a bare array (as this used to) is not one of the contract's shapes: the consumer
+     * would have to guess whether it was a replacement or a diff, and guessing wrong here is exactly
+     * how a snapshot's stale levels survive and the book ends up crossed (C5).
      */
     changesFor(envelope) {
       const raw = envelope?.raw;
@@ -270,16 +275,18 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
       try {
         data = JSON.parse(text);
       } catch {
-        return [];
+        return { replace: false, changes: [] };
       }
       const payloads = Array.isArray(data) ? channelOf(data).payloads : [data];
+      let snapshot = false;
       const changes = [];
       for (const payload of payloads) {
         if (!payload || typeof payload !== 'object') continue;
+        if (payload.as !== undefined || payload.bs !== undefined) snapshot = true;
         changes.push(...levelsToChanges(payload.b ?? payload.bs, 'bid'));
         changes.push(...levelsToChanges(payload.a ?? payload.as, 'ask'));
       }
-      return changes;
+      return snapshot ? { replace: true, levels: changes } : { replace: false, changes };
     },
 
     /**

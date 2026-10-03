@@ -123,9 +123,14 @@ export function createBitfinexAdapter({
     },
 
     /**
-     * Board changes from a book frame. Positive amount is a bid, negative is an ask, and a count of
-     * zero is the venue saying the level is gone - expressed here as the size-zero change the book
-     * already understands.
+     * Board changes from a book frame, in the v1 contract's shape (C5). Positive amount is a bid,
+     * negative is an ask, and a count of zero is the venue saying the level is gone - expressed here
+     * as the size-zero change the book already understands.
+     *
+     * A snapshot is a list of levels (each a list), and it is `{replace:true, levels}`: it is the whole
+     * book, so the levels it does not name are gone. An update is one level (a list of numbers), and
+     * it is `{replace:false, changes}`. A bare array (as this used to return) is neither of the
+     * contract's shapes, and the consumer would have to guess replacement from diff (C5).
      */
     changesFor(envelope) {
       const raw = envelope?.raw;
@@ -134,15 +139,16 @@ export function createBitfinexAdapter({
       try {
         data = JSON.parse(text);
       } catch {
-        return [];
+        return { replace: false, changes: [] };
       }
-      if (!Array.isArray(data)) return [];
+      if (!Array.isArray(data)) return { replace: false, changes: [] };
       const body = data[1];
-      if (!Array.isArray(body)) return [];
+      if (!Array.isArray(body)) return { replace: false, changes: [] };
 
       // A snapshot is a list of levels, each of them a list; an update is one level, which is a list
       // of numbers. The difference is what sits at position zero, not how deep the nesting goes.
-      const levels = Array.isArray(body[0]) ? body : [body];
+      const snapshot = Array.isArray(body[0]);
+      const levels = snapshot ? body : [body];
       const changes = [];
       for (const level of levels) {
         if (!Array.isArray(level) || level.length < 3) continue;
@@ -156,7 +162,7 @@ export function createBitfinexAdapter({
           size: count === 0 ? 0 : Math.abs(amount),
         });
       }
-      return changes;
+      return snapshot ? { replace: true, levels: changes } : { replace: false, changes };
     },
 
     venueSeqOf: () => null, // Bitfinex book frames carry no sequence number

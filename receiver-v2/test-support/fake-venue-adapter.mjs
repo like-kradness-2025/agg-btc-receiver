@@ -6,8 +6,10 @@
  * per data frame from the frame's receive sequence, so the through test exercises the whole
  * ingest -> organize -> book path without needing a real venue protocol or a boundary proof.
  *
- * The built-in kraken adapter is deliberately not used here: its `changesFor` still returns a bare
- * level array, which the split's `src/changes.mjs` (v1 contract) refuses - a real, separate gap.
+ * The built-in kraken adapter answers in the split's v1 contract now (a snapshot is a replacement, an
+ * update is a diff), so the real-process through test uses it directly (see
+ * `test-support/kraken-venue-adapter.mjs`); this synthetic adapter is kept as a minimal
+ * contract-shaped example and is no longer a workaround for that gap.
  */
 
 export function createAdapter({ url, stream = 'trades' } = {}) {

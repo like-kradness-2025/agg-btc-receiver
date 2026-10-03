@@ -74,27 +74,35 @@ test('channel frames are read by what they carry', () => {
   // The venue frames a trade update as [chanId, "tu", [id, mts, amount, price]].
   const trade = parse([7, 'tu', [1234, 1792000000000, 0.25, 50000]]);
   assert.equal(trade.trade, true, 'a trade frame is data, but it does not move this book');
-  assert.deepEqual(changesOf([7, 'tu', [1234, 1792000000000, 0.25, 50000]]), []);
+  assert.deepEqual(changesOf([7, 'tu', [1234, 1792000000000, 0.25, 50000]]), { replace: false, changes: [] });
   const pong = parse({ event: 'pong' });
   assert.equal(pong.kind, 'heartbeat');
   assert.equal(pong.answered, true, 'the server answers the ping the docs describe');
 });
 
-test('a book level becomes a board change with the right side and size', () => {
-  assert.deepEqual(changesOf([42, [[50000, 2, 1.5], [50001, 1, -0.5]]]), [
-    { side: 'bid', price: 50000, size: 1.5 },
-    { side: 'ask', price: 50001, size: 0.5 },
-  ]);
+test('a snapshot replaces the whole board, and a level becomes a change with the right side and size', () => {
+  // C5: a snapshot (a list of levels) is a replacement, not a diff.
+  assert.deepEqual(changesOf([42, [[50000, 2, 1.5], [50001, 1, -0.5]]]), {
+    replace: true,
+    levels: [
+      { side: 'bid', price: 50000, size: 1.5 },
+      { side: 'ask', price: 50001, size: 0.5 },
+    ],
+  });
 });
 
-test('a count of zero is the venue saying the level is gone', () => {
-  assert.deepEqual(changesOf([42, [50000, 0, 1.5]]), [{ side: 'bid', price: 50000, size: 0 }], 'removal');
+test('an update is a diff, and a count of zero is the venue saying the level is gone', () => {
+  assert.deepEqual(
+    changesOf([42, [50000, 0, 1.5]]),
+    { replace: false, changes: [{ side: 'bid', price: 50000, size: 0 }] },
+    'removal',
+  );
 });
 
 test('an unparsable frame is reported rather than guessed at', () => {
   assert.equal(adapter.parse('not json'), null);
   assert.equal(adapter.parse(JSON.stringify({ event: 'unknown-thing' })), null);
-  assert.deepEqual(adapter.changesFor({ raw: Buffer.from('not json') }), []);
+  assert.deepEqual(adapter.changesFor({ raw: Buffer.from('not json') }), { replace: false, changes: [] });
 });
 
 test('the adapter declares unverifiable, and a book opened with it runs without claiming a proof', async () => {
