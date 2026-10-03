@@ -2,14 +2,16 @@
  * The receiver's configuration: the file the process is started with, and the adapter the venue names.
  *
  * The process is configured from a file and only from a file (§5.7's minimal shape): `--config <JSON>`
- * names the store, the spool and the raw destination, and the venue, market and stream this run is for.
- * Nothing is read from the environment and nothing is passed on the command line beyond the path - a
- * deployment describes itself in one place, and a command line that could override a destination is a
- * second source of truth for where the canonical data goes.
+ * names the store, the spool, the venue, the market and the stream this run is for. Nothing is read from
+ * the environment and nothing is passed on the command line beyond the path - a deployment describes
+ * itself in one place, and a command line that could override a destination is a second source of truth
+ * for where the canonical data goes.
  *
- * The old six-column world already had a raw writer (`lib/raw-sqlite-writer.mjs`); this package carries
- * only its reception half. The raw destination here is therefore a plain append file (see
- * `../raw/file-writer.mjs`) and is reported as the minimal shape rather than the v6 sqlite contract.
+ * There is deliberately no raw destination. The old six-column world had a raw writer
+ * (`lib/raw-sqlite-writer.mjs`); this package carries only its reception half, and the entrance has no
+ * raw writer at all. A `"raw"` key is therefore not supported: it is refused outright rather than
+ * ignored, so a deployment that asks for a raw file fails loudly instead of being told a run was
+ * recorded when nothing was saved.
  */
 
 import { readFileSync } from 'node:fs';
@@ -23,7 +25,7 @@ const ADAPTERS = Object.freeze({
   bitfinex: createBitfinexAdapter,
 });
 
-const REQUIRED = Object.freeze(['venue', 'market', 'database', 'spoolDir', 'raw']);
+const REQUIRED = Object.freeze(['venue', 'market', 'database', 'spoolDir']);
 
 /** The venues a config may name, for a caller that wants to report the choice. */
 export function knownVenues() {
@@ -32,7 +34,7 @@ export function knownVenues() {
 
 /**
  * Read and validate the config file. Every refusal is raised before anything is opened, so a config
- * that cannot run leaves no store, no spool and no raw file behind for the next attempt to trip over.
+ * that cannot run leaves no store and no spool behind for the next attempt to trip over.
  */
 export function loadConfig(configPath) {
   if (typeof configPath !== 'string' || configPath.length === 0) {
@@ -53,6 +55,15 @@ export function loadConfig(configPath) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new TypeError('the config must be a JSON object');
   }
+  // A raw destination is not supported: this package's entrance no longer saves a raw file. The key is
+  // refused rather than ignored, so a deployment cannot carry a `"raw"` path and be told a run was
+  // recorded while nothing was written to it. Removing the write (rather than coordinating two writers on
+  // it) is the point: there is no raw path here to be dangerous.
+  if (Object.prototype.hasOwnProperty.call(raw, 'raw')) {
+    throw new TypeError(
+      'the config\u2019s "raw" is not supported: this receiver does not save a raw file (remove the "raw" key)',
+    );
+  }
   for (const key of REQUIRED) {
     if (typeof raw[key] !== 'string' || raw[key].length === 0) {
       throw new TypeError(`the config needs a non-empty "${key}"`);
@@ -71,7 +82,6 @@ export function loadConfig(configPath) {
     stream,
     database: raw.database,
     spoolDir: raw.spoolDir,
-    raw: raw.raw,
     // The venue-specific extras, only when the file carries them. Kraken needs a symbol; Bitfinex
     // defaults to tBTCUSD. A url is optional and defaults inside the adapter.
     symbol: typeof raw.symbol === 'string' && raw.symbol.length > 0 ? raw.symbol : undefined,

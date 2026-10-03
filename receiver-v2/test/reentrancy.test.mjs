@@ -1617,9 +1617,10 @@ test('a structure that fails to construct leaves no store behind', async () => {
     };
     const adapter = { url: 'ws://venue.test/ws', stream: 'trades', parse: () => ({ kind: 'data' }) };
 
-    // The check that can refuse the configuration runs before anything is opened: no file appears.
+    // The check that can refuse the configuration runs before anything is opened: no file appears. A
+    // raw writer is optional now, but a value that is neither absent nor a function is still refused.
     assert.throws(
-      () => createStructure({ ...base, adapter, rawWriter: null }),
+      () => createStructure({ ...base, adapter, rawWriter: 'not-a-function' }),
       /raw writer/,
       'the configuration cannot construct',
     );

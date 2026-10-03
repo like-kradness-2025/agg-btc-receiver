@@ -2,10 +2,9 @@
 /**
  * The receiver's process entrance.
  *
- * This is the one place that turns "a run" into "a process": it reads the config file, builds the three
- * things the supervisor cannot build for itself (the venue adapter, the raw writer, and the socket
- * implementation), drives the startup sequence, and gives the process the two answers §5.7 asks a real
- * process to give:
+ * This is the one place that turns "a run" into "a process": it reads the config file, builds the two
+ * things the supervisor cannot build for itself (the venue adapter and the socket implementation), drives
+ * the startup sequence, and gives the process the two answers §5.7 asks a real process to give:
  *
  *   - a clean end is exit 0 with the completion written: SIGINT and SIGTERM stop reception once, close
  *     the structure, write the run's completion, and leave. A second signal does not stop it again - the
@@ -21,13 +20,14 @@
  *
  * The only argument is `--config <path-to-json>`. Nothing is read from the environment and no destination
  * may be overridden on the command line: the file is the one source of truth for where the canonical data
- * goes.
+ * goes. There is no raw writer here: the entrance builds no raw destination, and a config that carries a
+ * `"raw"` key is refused rather than ignored (see `../src/entry/config.mjs`). Success of a run therefore
+ * never means "a raw file holds the data".
  */
 
 import process from 'node:process';
 
 import { loadConfig, adapterFor } from '../src/entry/config.mjs';
-import { createFileRawWriter } from '../src/raw/file-writer.mjs';
 import { createSupervisor } from '../src/supervisor/supervisor.mjs';
 
 function configPathFrom(argv) {
@@ -112,12 +112,10 @@ function main(argv) {
 
   let config;
   let adapter;
-  let rawWriter;
   let WebSocketImpl;
   try {
     config = loadConfig(configPath);
     adapter = adapterFor(config);
-    rawWriter = createFileRawWriter({ path: config.raw });
     WebSocketImpl = globalThis.WebSocket;
     if (typeof WebSocketImpl !== 'function') {
       throw new Error('this node has no global WebSocket, so the receiver has no way to open a socket');
@@ -135,7 +133,6 @@ function main(argv) {
       path: config.database,
       venue: config.venue,
       webSocketImpl: WebSocketImpl,
-      rawWriter,
       spoolDir: config.spoolDir,
       // The supervisor chooses the code; a process turns it into its own exit code. A non-zero code is
       // the end of the run: reception is already stopped, so close (which writes no completion for an

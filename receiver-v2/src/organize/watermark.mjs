@@ -76,7 +76,13 @@ function openOrganizerWithin(options, wiring) {
     market,
     stream,
     durability,
-    writeRaw,
+    // The raw stage. It is either a function that makes a frame durable in a raw (and must be durable
+    // before it returns true), or absent (null/undefined) when this process has no raw at all. Absence is
+    // represented as absence rather than a no-op writer: when there is no raw writer the raw stage is
+    // skipped, a frame is taken as durable on the store alone, and the note result carries `rawSkipped`
+    // so that fact is recorded where it is decided - a caller must not read that "durable" as "the raw
+    // holds this frame", because there is no raw.
+    writeRaw = null,
     firstSeq = 1,
     nowMs = () => Date.now(),
     capacity = () => 'ok',
@@ -85,10 +91,16 @@ function openOrganizerWithin(options, wiring) {
   // The ceiling and the holes it implies are written together, so this module needs the store's
   // transaction discipline rather than a second copy of it.
 
-  if (typeof writeRaw !== 'function') throw new TypeError('an organizer needs a way to write raw data');
-  // writeRaw must be durable before it returns, and must say so: true means the canonical record is
-  // safe. Anything else - false, a Promise, a count, silence - counts as "not durable yet", and
-  // nothing is acknowledged or advanced on the strength of it.
+  // When a raw writer is given it must be a function, and its `true` is the only thing that means
+  // durable. Anything else it returns - false, a Promise, a count, silence - counts as "not durable
+  // yet", and nothing is acknowledged or advanced on the strength of it. A value that is neither absent
+  // nor a function is refused outright.
+  if (writeRaw !== null && typeof writeRaw !== 'function') {
+    throw new TypeError('an organizer\u2019s raw writer must be a function when given');
+  }
+  // Whether this organizer has no raw stage at all. Fixed at construction, so the skip cannot change
+  // under a frame. It is reported with every note result (see `rawSkipped` below).
+  const rawSkipped = writeRaw === null;
 
   // A store written before this module was the board's own - or before a connection's start was part of its
   // record - cannot describe which board a position belonged to: its tables are keyed by connection id alone,
@@ -468,7 +480,14 @@ function openOrganizerWithin(options, wiring) {
         // "Already durable" is not "already applied". A crash between the raw write and the board
         // leaves exactly this frame, and a resend is the only way it comes back - so the caller is told
         // the raw is safe and the frame may still need routing onward.
-        return { accepted: true, duplicate: true, alreadyDurable: true, reason: 'already durable', ack: null };
+        return {
+          accepted: true,
+          duplicate: true,
+          alreadyDurable: true,
+          reason: 'already durable',
+          ack: null,
+          ...(rawSkipped ? { rawSkipped: true } : {}),
+        };
       }
 
       // The frame belongs to this connection and is not known to be durable yet, so a write is about to be
@@ -490,7 +509,11 @@ function openOrganizerWithin(options, wiring) {
       // holds above its contiguous position, which only the ledger can vouch for. The write is skipped because
       // there is nothing to write, and the rest of this method (the ceiling, the holes, the acknowledgement)
       // runs exactly as it does for a frame that has just been written.
-      const durable = rawAlreadyHolds || writeRaw(envelope) === true;
+      //
+      // With no raw writer (rawSkipped), there is no raw stage to run: the frame is taken as durable on the
+      // store's own record alone. This is the one case in which `durable` does *not* mean "the raw holds this
+      // frame" - there is no raw - and the result carries `rawSkipped` so the caller sees the difference.
+      const durable = rawAlreadyHolds || rawSkipped || writeRaw(envelope) === true;
       if (!durable) {
         // The raw is not safe, so the watermark does not move and no acknowledgement is emitted.
         return { accepted: true, durable: false, reason: 'raw not durable yet', ack: null };
@@ -506,6 +529,7 @@ function openOrganizerWithin(options, wiring) {
           durable: true,
           reason: 'the board was handed over while this frame was written',
           ack: null,
+          ...(rawSkipped ? { rawSkipped: true } : {}),
         };
       }
 
@@ -530,7 +554,7 @@ function openOrganizerWithin(options, wiring) {
       if (plan.lowestHeld !== undefined) lowestHeldWithoutBaseline = plan.lowestHeld;
       durableAboveBaseline.clear();
       for (const held of plan.held) durableAboveBaseline.add(held);
-      return plan.result;
+      return rawSkipped ? { ...plan.result, rawSkipped: true } : plan.result;
     },
 
     /** Holes seen and not yet filled: the ranges this process cannot claim to have. */

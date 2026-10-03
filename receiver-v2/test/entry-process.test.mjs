@@ -45,7 +45,6 @@ function writeConfig(dir, overrides = {}) {
     symbol: 'XBT/USD',
     database: join(dir, 'state.sqlite'),
     spoolDir: join(dir, 'spool'),
-    raw: join(dir, 'raw.log'),
     url: UNREACHABLE,
     ...overrides,
   };
@@ -127,6 +126,21 @@ test('a config that cannot be read ends the process with code 1', async () => {
     const { code } = await handle.exited;
     assert.equal(code, 1, 'a missing config file is a failed run');
     assert.match(handle.stderr, /config file could not be read/);
+  });
+});
+
+test('a config that asks for a raw file is refused, and no raw file is written', async () => {
+  await withDir(async (dir) => {
+    // There is no raw writer in the entrance any more. A `"raw"` key is not silently ignored - it is
+    // refused before anything is opened, so a deployment cannot believe a raw file was saved.
+    const rawPath = join(dir, 'raw.log');
+    const { path } = writeConfig(dir, { raw: rawPath });
+    const handle = startChild(path);
+    const { code } = await handle.exited;
+
+    assert.equal(code, 1, `a config with a raw destination is a failed run; stderr=${handle.stderr}`);
+    assert.match(handle.stderr, /"raw" is not supported/);
+    assert.equal(existsSync(rawPath), false, 'nothing was written to the raw path');
   });
 });
 

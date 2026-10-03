@@ -54,6 +54,11 @@ export function createStructure({
   Database = null,
   durability = null,
   webSocketImpl,
+  // The raw writer is optional. It is the caller's hook that makes a frame durable in a raw, and only
+  // its `true` may be acknowledged as durable. When it is absent there is no raw stage to run: the frame
+  // is taken as durable on the store's own record alone (see the organizer's `writeRaw` below). The
+  // entrance deliberately does not carry one - removing the raw write is what removes the dangerous path
+  // - but a test or a dry run may still pass one, and a structure given one behaves exactly as before.
   rawWriter,
   spoolDir = null,
   maxQueuedFrames = 5_000,
@@ -83,7 +88,14 @@ export function createStructure({
 }) {
   // The checks that can refuse the configuration run before anything is opened: a construction that never
   // runs must not leave a store - or a file - behind for the next attempt to trip over.
-  if (typeof rawWriter !== 'function') throw new TypeError('the structure needs a raw writer');
+  //
+  // The raw writer is optional: absent means there is no raw stage to run, which is what the entrance
+  // relies on. A value that is neither absent nor a function is a configuration error and is refused here,
+  // before the store and the spool exist.
+  if (rawWriter !== undefined && rawWriter !== null && typeof rawWriter !== 'function') {
+    throw new TypeError('the structure\u2019s raw writer must be a function when given');
+  }
+  const hasRawWriter = typeof rawWriter === 'function';
   // A structure that organizes one stream while its adapter carries another can only produce frames the
   // board will refuse as belonging to another board - after they have been written to the raw. The
   // mismatch is therefore refused here, before the book and the spool exist.
@@ -196,10 +208,16 @@ export function createStructure({
           market,
           stream,
           durability,
-          writeRaw: (envelope) => {
-            const written = rawWriter(envelope);
-            return written === true; // only a durable write may be acknowledged
-          },
+          // The raw stage: a function when a raw writer was given (and only its `true` is durable), or
+          // null when there is none - the organizer then skips the raw stage and takes the frame as
+          // durable on the store alone. There is no no-op writer standing in for a missing one: absence
+          // is represented as absence, so "durable" can never be mistaken here for "a raw holds this".
+          writeRaw: hasRawWriter
+            ? (envelope) => {
+                const written = rawWriter(envelope);
+                return written === true; // only a durable write may be acknowledged
+              }
+            : null,
           capacity: () => (stopped ? 'stopped' : 'ok'),
           nowMs,
         },
@@ -275,7 +293,9 @@ export function createStructure({
   ]);
   const ALREADY_APPLIED = 'already applied';
   const NEVER_APPLICABLE = new Set(['below the first sequence']);
-  const OWED_REASON = 'durable in the raw and not applied to the board yet';
+  const OWED_REASON = hasRawWriter
+    ? 'durable in the raw and not applied to the board yet'
+    : 'durable in the store and not applied to the board yet (no raw writer is configured)';
 
   let refusedByBook = 0;
   // Frames this process wrote into the ledger for the first time. Cumulative, like the spool and reception
