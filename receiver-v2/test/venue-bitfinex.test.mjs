@@ -1,7 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { createBitfinexAdapter } from '../src/ingest/venues/bitfinex.mjs';
+import { makeEnvelope } from '../src/envelope.mjs';
+import { openDurability } from '../src/durability.mjs';
+import { openBook } from '../src/book/state.mjs';
 
 const adapter = createBitfinexAdapter({ market: 'bitfinex_spot', symbol: 'tBTCUSD' });
 const parse = (payload) => adapter.parse(JSON.stringify(payload));
@@ -89,4 +95,40 @@ test('an unparsable frame is reported rather than guessed at', () => {
   assert.equal(adapter.parse('not json'), null);
   assert.equal(adapter.parse(JSON.stringify({ event: 'unknown-thing' })), null);
   assert.deepEqual(adapter.changesFor({ raw: Buffer.from('not json') }), []);
+});
+
+test('the adapter declares unverifiable, and a book opened with it runs without claiming a proof', async () => {
+  // Explicit, not left to the default: a book frame here carries no sequence and no checksum, so
+  // there is nothing to prove and the declaration says so rather than the absence of one.
+  assert.equal(adapter.boundary, 'unverifiable');
+  assert.equal(adapter.connects, undefined, 'an unverifiable venue brings no rule to decide a frame');
+
+  const dir = await mkdtemp(join(tmpdir(), 'bitfinex-proof-'));
+  const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+  try {
+    const book = openBook({ market: 'bitfinex_spot', stream: 'trades', durability: store, adapter });
+    const frame = [42, [[50000, 2, 1.5]]];
+    const envelope = makeEnvelope({
+      market: 'bitfinex_spot',
+      stream: 'trades',
+      connectionId: 'conn-1',
+      receiveSeq: 1,
+      recvTsMs: 1_792_000_000_000,
+      recvMonoNs: 1_000_000,
+      raw: Buffer.from(JSON.stringify(frame)),
+      meta: { first_seq: 1 },
+    });
+    book.accept('conn-1', { firstSeq: 1 });
+    assert.equal(book.apply({ envelope, changes: adapter.changesFor(envelope) }).applied, true);
+
+    const proof = book.proveBoundary();
+    assert.equal(proof.proven, true, 'a venue with no means of proof may still run');
+    assert.equal(proof.kind, 'unverifiable');
+    assert.equal(proof.verified, false, 'but nothing is described as proven');
+    assert.match(proof.reason, /unverifiable|without a boundary proof/);
+    assert.equal(book.isRunning, true);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

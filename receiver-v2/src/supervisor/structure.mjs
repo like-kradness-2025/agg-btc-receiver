@@ -63,6 +63,7 @@ export function createStructure({
   onGap = () => {},
   onStop = () => {},
   onDiagnostic = () => {},
+  onRefetch = () => {},
   nowMs = () => Date.now(),
   maxWaitingEvents = 1_000,
   ledgerRetentionMs = DEFAULT_LEDGER_RETENTION_MS,
@@ -135,6 +136,9 @@ export function createStructure({
   // spool, and only if the spool cannot hold it either does reception stop. (Across processes the
   // same decision is made when the channel reports a full queue.)
   let stopped = false;
+  // Whether a re-anchor has already been asked for. The request is a state, not a per-frame report: a
+  // broken proof refuses every ordinary frame that follows it, and one request is what a recovery needs.
+  let refetchRequested = false;
   // The terminal state: close() has completed. Nothing may act on a closed structure - its store may
   // already serve another structure for this board, and a frame taken here would land in that other life.
   let closed = false;
@@ -156,7 +160,7 @@ export function createStructure({
   // them, and neither does anything a caller is handed - see `internal/wiring.mjs`.
   const { book, ledger, organizer } = constructing(() =>
     wiring.whileChange(() => ({
-      book: constructorOf('book')({ market, stream, durability, nowMs }, wiring),
+      book: constructorOf('book')({ market, stream, durability, nowMs, adapter }, wiring),
       // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
       // this process, because the frames it names are only recoverable while that knowledge survives a crash.
       ledger: constructorOf('ledger')({ durability, market, stream, nowMs }, wiring),
@@ -235,7 +239,13 @@ export function createStructure({
   //   never applicable    it belongs to numbering this connection cannot use - recorded as a permanent
   //                       loss rather than held for a delivery that will not happen
   //   anything else       durable and unapplied: held here, reported once, offered again on accept
-  const HELD_BY_BOOK = new Set(['waiting for the first sequence', 'gap before this sequence']);
+  const HELD_BY_BOOK = new Set([
+    'waiting for the first sequence',
+    'gap before this sequence',
+    // A frame refused because the boundary proof is broken is not a loss: it is durable and owed, and a
+    // replacement re-anchors the board it is waiting for. It stays owed, like a frame held for a hole.
+    'the boundary proof is broken',
+  ]);
   const ALREADY_APPLIED = 'already applied';
   const NEVER_APPLICABLE = new Set(['below the first sequence']);
   const OWED_REASON = 'durable in the raw and not applied to the board yet';
@@ -276,6 +286,38 @@ export function createStructure({
   }
 
   /**
+   * A missing range is a fact about the connection that lost it. When it is the connection the board is
+   * following, the proof the board holds no longer covers what is on it, so the proof is dropped - a
+   * proof that outlived its range would put the board straight back into service on the next success.
+   * A loss of any other connection is history, and it must not block the board running now (C7, C11).
+   */
+  function invalidateProofForMissing(connectionId, reason) {
+    const followed = book.appliedBoundary.connectionId;
+    if (followed === null || connectionId !== followed) return;
+    const result = bookInternal.invalidateProof(
+      connectionId,
+      `a range of this connection was declared missing: ${reason}`,
+    );
+    if (result?.invalidated) requestRefetch(connectionId);
+  }
+
+  /**
+   * Ask for a re-anchor: the board is not serving, and only a fresh replacement puts it back. It is a
+   * request, made once per broken proof - the re-subscribe that answers it belongs to the entry point that
+   * does not exist yet, and this is as far up as the wiring can carry it.
+   */
+  function requestRefetch(connectionId) {
+    if (refetchRequested) return;
+    refetchRequested = true;
+    onRefetch({
+      market,
+      stream,
+      connectionId,
+      reason: 'the board needs a re-anchor: no replacement has arrived',
+    });
+  }
+
+  /**
    * Declare the entries past the retention bound missing, oldest first.
    *
    * §9.1 bounds how long organize keeps a frame the board has not taken: the earlier of five minutes or
@@ -307,6 +349,8 @@ export function createStructure({
       if (decided) {
         swept += 1;
         onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: entry.receiveSeq });
+        // A range the board was following is now known to be missing: its proof has to go with it.
+        invalidateProofForMissing(entry.connectionId, reason);
       }
       remaining -= entry.bytes;
     }
@@ -497,6 +541,13 @@ export function createStructure({
       envelope: target,
       changes: adapter.changesFor ? adapter.changesFor(target) : [],
     });
+    // A frame the proof refused left the board broken: only a replacement re-anchors it, so ask for one.
+    // A replacement that did land answered the request, and a later break may ask again.
+    if (applied.proofBroken === true) {
+      requestRefetch(book.appliedBoundary.connectionId);
+    } else if (applied.replaced === true) {
+      refetchRequested = false;
+    }
     // The board may have anchored its boundary on the origin this frame declares. The organizer has to hear
     // the same origin: the ceiling lives there, and a start that reached only the board would leave every
     // frame durable and unacknowledged, waiting for a start that has arrived.
@@ -827,6 +878,9 @@ export function createStructure({
     },
     get appliedBoundary() {
       return { ...book.appliedBoundary };
+    },
+    get proof() {
+      return { ...book.proof };
     },
     get ownerEstablished() {
       return book.ownerEstablished;

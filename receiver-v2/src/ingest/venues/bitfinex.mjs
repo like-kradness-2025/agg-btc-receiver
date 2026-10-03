@@ -39,6 +39,12 @@ export function createBitfinexAdapter({
     url,
     stream,
 
+    // The proof this venue can give: none. A Bitfinex book frame carries no sequence number and no
+    // checksum, so there is nothing to judge a frame against - declared explicitly rather than left to
+    // the default, so the choice is on the record and a later reader does not mistake the absence for
+    // an oversight. The book runs on the levels it applies, but claims no boundary it did not prove.
+    boundary: 'unverifiable',
+
     subscribeMessages: () => [
       JSON.stringify({
         event: 'subscribe',

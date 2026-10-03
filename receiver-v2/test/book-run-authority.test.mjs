@@ -702,12 +702,16 @@ test('an acceptance that fails changes nothing: not the phase, not what the boar
       changes: [{ side: 'bid', price: 103, size: 3 }],
     });
     assert.equal(held.reason, 'gap before this sequence');
+    // C7: detecting the hole put the board back to syncing, and that is the phase the acceptance that
+    // fails must leave exactly where it found it.
+    assert.equal(book.phase, 'syncing', 'a hole takes the board out of service');
+    const phaseBeforeFailure = book.phase;
     armWriteFailure(APPLIED_BOUNDARY_WRITE);
     assert.throws(
       () => book.accept('conn-2', { generation: 5, runId: 'run-A', firstSeq: 1 }),
       /injected write failure/,
     );
-    assert.equal(book.phase, 'running');
+    assert.equal(book.phase, phaseBeforeFailure, 'the failed acceptance did not move the phase');
     const filled = book.apply({ envelope: envelope(2, 'conn-1', 1, 'run-A'), changes: [] });
     assert.equal(filled.applied, true);
     assert.equal(filled.alsoApplied, 1, 'the frame it was holding came out with the hole');
