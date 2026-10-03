@@ -28,11 +28,18 @@ import { makeEnvelope } from '../envelope.mjs';
 
 export const DEFAULT_SILENCE_DEADLINE_MS = 15_000; // measured: a real stall runs 20s+, normal gaps do not
 export const DEFAULT_STABILITY_MS = 60_000; // attempts reset only after the link has held this long
+// C3: how long an expected subscription may go unanswered before the link is failed. A venue that
+// accepts what it was asked for answers within this window; one that does not is not a usable link.
+export const DEFAULT_ACK_DEADLINE_MS = 10_000;
 
 const UNSUBSCRIBED = 'unsubscribed';
 const PENDING = 'pending';
 const ACKNOWLEDGED = 'acknowledged';
 const FAILED = 'failed';
+// The connection's own state while its subscription is failed. Distinct from `awaiting-subscription`:
+// "we have not heard yet" and "the venue refused / never answered" are different facts, and only the
+// latter blocks the link from being reported as serving (C3).
+const SUBSCRIPTION_FAILED_STATE = 'subscription-failed';
 
 /**
  * A copy of one subscription's record, nested data included.
@@ -92,6 +99,17 @@ export function createReceiveConnection({
   // its own, or keeps it in order when one is already running. Nothing is done from the event entry itself.
   onEvent = (_label, work) => work(),
   onFailure = () => {},
+  // C3: how establishment is decided for this connection. `explicit` waits for the venue's
+  // acknowledgement of every expected subscription; `first-data` treats the first data frame of the
+  // stream as establishment (a venue that does not answer). Declared per connection, not per venue
+  // (C11), so a venue can be received from more than one way.
+  ackMode = adapter?.ackMode ?? 'explicit',
+  // C3: how long the expected subscriptions may go unanswered before the link is failed.
+  ackDeadlineMs = DEFAULT_ACK_DEADLINE_MS,
+  // C3: the set of subscription keys this connection asks for. The adapter names them, because only it
+  // knows the keys its own `parse()` answers with. Absent means the connection was not told a set, and
+  // establishment falls back to "every acknowledgement heard so far is a success".
+  expectedSubscriptions = adapter?.expectedSubscriptions ?? null,
   onSubscriptions = () => {},
   onState = () => {},
   onDiagnostic = () => {},
@@ -100,12 +118,23 @@ export function createReceiveConnection({
     throw new TypeError('reception needs an adapter that can parse a message');
   }
   if (!webSocketImpl) throw new TypeError('reception needs a websocket implementation');
+  if (ackMode !== 'explicit' && ackMode !== 'first-data') {
+    throw new TypeError(`unknown ack mode: ${JSON.stringify(ackMode)}`);
+  }
+  if (!Number.isFinite(ackDeadlineMs) || ackDeadlineMs <= 0) {
+    throw new TypeError('the ack deadline must be a positive number of milliseconds');
+  }
 
   let generation = 0;
   let connectionId = null;
   let socket = null;
   let receiveSeq = 0;
   let subscriptionState = UNSUBSCRIBED;
+  // C3: the keys asked for on the current socket, or null when the connection was not told a set. The
+  // ack deadline timer for that same socket, and the reason the link failed (for the band's report).
+  let expectedKeys = null;
+  let ackTimer = null;
+  let subscriptionFailure = null;
   let lastHeardMs = 0;
   let silentTimer = null;
   let stabilityTimer = null;
@@ -121,6 +150,100 @@ export function createReceiveConnection({
    */
   function snapshotSubscriptions() {
     return new Map([...subscriptions].map(([key, entry]) => [key, copySubscription(entry)]));
+  }
+
+  /** The adapter's expected set for this connection, as a Set of keys, or null when it declares none. */
+  function expectedKeysOf() {
+    const declared = typeof expectedSubscriptions === 'function' ? expectedSubscriptions() : expectedSubscriptions;
+    return Array.isArray(declared) && declared.length > 0 ? new Set(declared) : null;
+  }
+
+  /**
+   * C3: whether the link is established. With a declared expected set, establishment is exactly "every
+   * expected key has been acknowledged" - one unanswered key is not a usable link. Without a declared
+   * set the connection only knows what it has heard, so establishment is "every acknowledgement heard so
+   * far is a success", which is the behaviour before the set was carried. A refusal always wins: one
+   * failed key is a failed link, whether or not it was in the expected set.
+   */
+  function computeSubscriptionState() {
+    const entries = [...subscriptions.values()];
+    if (entries.some((entry) => entry.state === FAILED)) return FAILED;
+    if (expectedKeys !== null) {
+      const allAcked = [...expectedKeys].every((key) => subscriptions.get(key)?.state === ACKNOWLEDGED);
+      return allAcked ? ACKNOWLEDGED : PENDING;
+    }
+    if (entries.length === 0) return UNSUBSCRIBED;
+    return entries.every((entry) => entry.state === ACKNOWLEDGED) ? ACKNOWLEDGED : PENDING;
+  }
+
+  function clearAckTimer() {
+    if (ackTimer !== null) {
+      clearTimer(ackTimer);
+      ackTimer = null;
+    }
+  }
+
+  /** Report the subscription state and follow it with the connection's own state (C3: "the band's state"). */
+  function publishSubscriptionState(reason = '') {
+    onSubscriptions({
+      market,
+      generation,
+      connectionId,
+      state: subscriptionState,
+      subscriptions: snapshotSubscriptions(),
+      ...(reason ? { reason } : {}),
+    });
+    setState(
+      subscriptionState === ACKNOWLEDGED
+        ? 'subscribed'
+        : subscriptionState === FAILED
+          ? SUBSCRIPTION_FAILED_STATE
+          : 'awaiting-subscription',
+    );
+  }
+
+  /**
+   * C3: the ack deadline for the current socket. It is armed when the subscriptions are sent, and it is
+   * about the socket that sent them - a replacement's window is a new one. When it passes with the link
+   * not established, the link is failed: waiting for ever is how a run sits looking alive while it
+   * cannot receive the stream it was admitted for.
+   */
+  function armAckDeadline() {
+    clearAckTimer();
+    const armedFor = socket;
+    const armedGeneration = generation;
+    ackTimer = setTimer(() => {
+      ackTimer = null;
+      if (closed) return;
+      onEvent('ack-deadline', () => {
+        if (closed || socket !== armedFor || generation !== armedGeneration) return;
+        if (subscriptionState === ACKNOWLEDGED) return;
+        failSubscription('the subscription ack deadline passed');
+      });
+    }, ackDeadlineMs);
+    if (typeof ackTimer?.unref === 'function') ackTimer.unref();
+  }
+
+  /** C3: record the link as failed, with every expected key that was never acknowledged marked failed. */
+  function failSubscription(reason) {
+    if (closed) return;
+    clearAckTimer();
+    subscriptionFailure = reason;
+    subscriptionState = FAILED;
+    if (expectedKeys !== null) {
+      for (const key of expectedKeys) {
+        if (subscriptions.get(key)?.state === ACKNOWLEDGED) continue;
+        const previous = subscriptions.get(key);
+        subscriptions.set(key, {
+          state: FAILED,
+          atMs: wallClockMs(),
+          detail: reason,
+          askedAtMs: previous?.askedAtMs ?? previous?.atMs ?? wallClockMs(),
+        });
+      }
+    }
+    publishSubscriptionState(reason);
+    onDiagnostic({ market, generation, reason: `subscription failed: ${reason}` });
   }
 
   function setState(next, detail = '') {
@@ -251,14 +374,13 @@ export function createReceiveConnection({
         detail: parsed.detail ?? '',
         askedAtMs: entry.askedAtMs ?? entry.atMs,
       });
-      // "We asked" is not "they agreed": only an acknowledged subscription makes the link usable.
-      subscriptionState = [...subscriptions.values()].every((s) => s.state === ACKNOWLEDGED)
-        ? ACKNOWLEDGED
-        : [...subscriptions.values()].some((s) => s.state === FAILED)
-          ? FAILED
-          : PENDING;
-      onSubscriptions({ market, generation, state: subscriptionState, subscriptions: snapshotSubscriptions() });
-      setState(subscriptionState === ACKNOWLEDGED ? 'subscribed' : 'awaiting-subscription');
+      // "We asked" is not "they agreed": only an acknowledged subscription makes the link usable, and
+      // with a declared expected set the link is established only when every expected key is acknowledged
+      // (C3). A refusal is a failure whatever the set says.
+      subscriptionState = computeSubscriptionState();
+      subscriptionFailure = subscriptionState === FAILED ? parsed.detail || 'a subscription was refused' : null;
+      if (subscriptionState === ACKNOWLEDGED) clearAckTimer();
+      publishSubscriptionState(subscriptionFailure ?? '');
       return;
     }
     if (parsed.kind === 'shutdown') {
@@ -267,6 +389,14 @@ export function createReceiveConnection({
       return;
     }
     if (parsed.kind === 'data') {
+      // C3 first-data: a venue that never answers is established by the first frame of the stream itself.
+      // Only a data frame establishes it - a heartbeat or a subscription event does not.
+      if (ackMode === 'first-data' && subscriptionState !== ACKNOWLEDGED) {
+        clearAckTimer();
+        subscriptionFailure = null;
+        subscriptionState = ACKNOWLEDGED;
+        publishSubscriptionState('the first data frame established the stream');
+      }
       onEnvelope(stamp(raw, atMs, atNs));
       return;
     }
@@ -276,6 +406,7 @@ export function createReceiveConnection({
   function teardownSocket(reason) {
     clearSilenceTimer();
     clearStabilityTimer();
+    clearAckTimer();
     if (!socket) return;
     const dying = socket;
     socket = null;
@@ -290,6 +421,10 @@ export function createReceiveConnection({
     }
     subscriptions.clear();
     subscriptionState = UNSUBSCRIBED;
+    // The next socket asks for its own set and gets its own window: what this one asked for says
+    // nothing about it (C3).
+    expectedKeys = null;
+    subscriptionFailure = null;
     onDiagnostic({ market, generation, reason: `socket torn down (${reason})` });
   }
 
@@ -348,8 +483,15 @@ export function createReceiveConnection({
           if (closed || socket !== next || generation !== fromGeneration) return;
           noteHeard();
           setState('subscribing');
-          for (const message of adapter.subscribeMessages?.() ?? []) next.send(message);
+          const subscribeMessages = adapter.subscribeMessages?.() ?? [];
+          for (const message of subscribeMessages) next.send(message);
           next.send?.(adapter.heartbeatMessage?.() ?? '');
+          // C3: the expected set is registered where the request is sent, and the ack window opens with
+          // it. A venue that answers is judged by its expected set (one unanswered key is not a link); a
+          // first-data venue is judged by its first data frame. A connection that asked for nothing and
+          // does not use first-data arms no window: there is nothing to wait for.
+          expectedKeys = expectedKeysOf();
+          if (ackMode === 'first-data' || subscribeMessages.length > 0) armAckDeadline();
           armStabilityTimer();
         });
       };
@@ -436,9 +578,19 @@ export function createReceiveConnection({
     },
     stop() {
       closed = true;
+      // The subscription verdict is captured before the socket is torn down: a stop that follows a failed
+      // subscription must still report that the stream was never established (C3), rather than reading as
+      // if nothing had been asked.
+      const lastState = subscriptionState;
+      const lastFailure = subscriptionFailure;
       clearSilenceTimer();
       clearStabilityTimer();
+      clearAckTimer();
       if (socket) teardownSocket('stopped');
+      if (lastState === FAILED) {
+        subscriptionState = FAILED;
+        subscriptionFailure = lastFailure;
+      }
       setState('stopped');
     },
     get generation() {
@@ -458,6 +610,13 @@ export function createReceiveConnection({
     },
     get subscriptionState() {
       return subscriptionState;
+    },
+    /** C3: how this connection decides establishment, and why it last failed (null when it did not). */
+    get ackMode() {
+      return ackMode;
+    },
+    get subscriptionFailure() {
+      return subscriptionFailure;
     },
     get subscriptions() {
       return snapshotSubscriptions();

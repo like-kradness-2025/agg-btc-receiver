@@ -184,7 +184,9 @@ test('the link is only usable once the subscription is acknowledged', () => {
 
   h.sockets[0].deliver('{"rejected":"depth"}');
   assert.equal(h.connection.subscriptionState, 'failed', 'a refused subscription is not a usable link');
-  assert.equal(h.connection.state, 'awaiting-subscription');
+  // C3: a failed subscription has its own state, distinct from "we have not heard yet". The old
+  // `awaiting-subscription` collapsed the refusal into the waiting case.
+  assert.equal(h.connection.state, 'subscription-failed');
 });
 
 test('a shutdown announcement replaces the socket instead of waiting for the silence deadline', () => {

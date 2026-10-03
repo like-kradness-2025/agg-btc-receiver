@@ -196,6 +196,12 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
     // so the book resolves it once and never has to interpret the frames to find out.
     boundary: 'checksum',
 
+    // C3: Kraken answers every subscribe with a `subscriptionStatus` event, so establishment is explicit.
+    // The expected set is the two subscriptions this adapter sends; their keys are the ones `parse()`
+    // builds from the same name and pair, so an acknowledgement is matched to the request it answers.
+    ackMode: 'explicit',
+    expectedSubscriptions: () => [`book:${symbol}`, `trade:${symbol}`],
+
     subscribeMessages: () => [
       JSON.stringify({ event: 'subscribe', pair: [symbol], subscription: { name: 'book', depth: bookDepth } }),
       JSON.stringify({ event: 'subscribe', pair: [symbol], subscription: { name: 'trade' } }),

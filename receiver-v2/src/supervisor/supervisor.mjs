@@ -65,6 +65,7 @@ export function createSupervisor(options = {}) {
     onRefetch = () => {},
     onGap = () => {},
     onAck = () => {},
+    onSubscriptions = () => {},
     onDiagnostic = () => {},
     // Where the news that the run ended badly goes. A test hands in a spy; a process sets its own code.
     exit = (code) => {
@@ -199,6 +200,25 @@ export function createSupervisor(options = {}) {
     onOperationEnd: () => settle(),
     onGap,
     onAck,
+    // C3: the subscription's establishment is the band's own state. Reception reports it here; the
+    // failed case is also a stop, so a connection that cannot establish the stream it was admitted for
+    // ends the run rather than sitting at `receiver: started` while it cannot serve. The caller's own
+    // observation runs first and cannot change the fact (C12).
+    onSubscriptions: (info) => {
+      try {
+        onSubscriptions(info);
+      } catch {
+        // an observation that throws is not a fact about the subscription
+      }
+      if (info?.state === 'failed') {
+        recordStop({
+          market,
+          reason: `the subscription failed: ${info.reason ?? 'the venue refused it'}`,
+          connectionId: info.connectionId ?? null,
+        });
+        settle();
+      }
+    },
     onDiagnostic: (diagnostic) => {
       try {
         onDiagnostic(diagnostic);
@@ -265,6 +285,10 @@ export function createSupervisor(options = {}) {
   function serving() {
     if (!started || stopped || ended || closed) return false;
     if (structure.stats.stopped) return false;
+    // C3: a connection whose subscription is failed is not one that may be reported as serving, whatever
+    // the board's phase says - a refused or unanswered subscription means the stream this board needs was
+    // never established.
+    if (structure.stats.subscriptionState === 'failed') return false;
     return structure.book.appliedBoundary.connectionId !== null && structure.book.isRunning === true;
   }
 
