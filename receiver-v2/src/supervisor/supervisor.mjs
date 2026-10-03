@@ -78,13 +78,21 @@ export function createSupervisor(options = {}) {
     ...receiveOptions
   } = options;
 
-  // The startup deadline runs on the same injected clock and timers the connection uses, so a test can
-  // drive it. They stay in `receiveOptions` and reach the connection too; only their names are borrowed
-  // here, with the same defaults the connection would apply.
+  // The startup deadline runs on the same injected timers the connection uses, so a test can drive it.
+  // They stay in `receiveOptions` and reach the connection too; only their names are borrowed here, with
+  // the same defaults the connection would apply.
+  //
+  // The deadline's *elapsed* is measured on a monotonic clock, not the wall clock - the same treatment the
+  // envelopes already give recv_mono_ns. A wall clock can be corrected backwards; a deadline measured
+  // against it would then read a negative elapsed, judge the deadline unmet and - the timer already spent -
+  // drop the monitoring for good, leaving a run with a venue that never lets a socket in looking alive for
+  // ever. The monotonic clock cannot go backwards, so the elapsed is always honest. `wallClockMs` is left
+  // in `receiveOptions` (the connection still stamps its records with it) and is deliberately not used
+  // here.
   const {
     setTimer = setTimeout,
     clearTimer = clearTimeout,
-    wallClockMs = () => Date.now(),
+    monotonicMs = () => Number(process.hrtime.bigint()) / 1e6,
   } = receiveOptions;
 
   if (!path) throw new TypeError('the supervisor needs a path for its store');
@@ -261,24 +269,41 @@ export function createSupervisor(options = {}) {
   }
 
   /**
-   * Arm the startup deadline once, when the sequence begins. It fires on the run's own clock; if the run
+   * Arm the startup deadline once, when the sequence begins. It fires on the run's own timers; if the run
    * still has not reached reception - and never did - the deadline ends it non-zero rather than letting
-   * the reconnect backoff run for ever. The elapsed check makes a timer a test fires by hand, before the
-   * deadline has actually passed, a no-op, so the deadline only ever acts on real time.
+   * the reconnect backoff run for ever.
+   *
+   * The elapsed check runs on the monotonic clock, not the wall clock. That is what makes the deadline
+   * survive a clock correction: a wall clock that is set back cannot make the elapsed shrink below the
+   * deadline and leave the run unmonitored. And a timer that fires *early* - because a test drove it by
+   * hand, or the timer ran ahead of the clock - does not drop the monitoring either: the firing re-arms
+   * the timer for exactly the time left, so the deadline is never lost and still acts the moment it is
+   * really due. The state guard (an ended, stopped, or already-serving run) is checked first and spends the
+   * timer: a run that reached reception must never be ended by a deadline for a startup that did happen.
    */
   function armStartupDeadline() {
     if (startupDeadlineTimer !== null || ended || closed) return;
-    const armedAtMs = wallClockMs();
-    startupDeadlineTimer = setTimer(() => {
+    const armedAtMs = monotonicMs();
+    const fire = () => {
+      if (ended || stopped || closed || hasServed) {
+        startupDeadlineTimer = null;
+        return;
+      }
+      const remaining = startupDeadlineMs - (monotonicMs() - armedAtMs);
+      if (remaining > 0) {
+        // Fired before the deadline had really passed: keep the monitoring by re-arming for the remainder.
+        startupDeadlineTimer = setTimer(fire, remaining);
+        if (typeof startupDeadlineTimer?.unref === 'function') startupDeadlineTimer.unref();
+        return;
+      }
       startupDeadlineTimer = null;
-      if (ended || stopped || closed || hasServed) return;
-      if (wallClockMs() - armedAtMs < startupDeadlineMs) return;
       recordStop({
         market,
         reason: `reception was not reached within the startup deadline (${startupDeadlineMs} ms)`,
       });
       settle();
-    }, startupDeadlineMs);
+    };
+    startupDeadlineTimer = setTimer(fire, startupDeadlineMs);
     if (typeof startupDeadlineTimer?.unref === 'function') startupDeadlineTimer.unref();
   }
 

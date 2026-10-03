@@ -19,7 +19,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { makeEnvelope, encodeEnvelope, frame } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { createStructure } from '../src/supervisor/structure.mjs';
-import { createSupervisor } from '../src/supervisor/supervisor.mjs';
+import { createSupervisor, DEFAULT_STARTUP_DEADLINE_MS } from '../src/supervisor/supervisor.mjs';
 import { createReceiveConnection } from '../src/ingest/connection.mjs';
 import { internalsOf } from '../src/internal/wiring.mjs';
 
@@ -1495,7 +1495,10 @@ test('a connection that never opens ends the run non-zero at the startup deadlin
         return timer;
       },
       clearTimer: () => {},
-      wallClockMs: () => time,
+      // The deadline measures elapsed on the monotonic clock now, so the test drives that clock; the
+      // wall clock is left at its default and is no longer consulted for the deadline. `time` is the
+      // monitor's own monotonic timeline.
+      monotonicMs: () => time,
       onStop: () => {},
       onRefetch: () => {},
       onDiagnostic: () => {},
@@ -1562,6 +1565,149 @@ test('a run that reached reception is not ended by its startup deadline', async 
     assert.equal(supervisor.ended, false);
     supervisor.stop();
     supervisor.close();
+  });
+});
+
+/**
+ * A supervisor whose venue never lets a socket in, with its timers and both clocks under the test's hand.
+ * `mono` is the deadline's monotonic timeline and is what `setTimer`'s due times are measured against;
+ * `wall` is a separate value the test may move anywhere, backwards included, without moving `mono`. The
+ * timer's `advanceTo(t)` fires every pending timer due at or before `t`, in due order, and then parks the
+ * monotonic clock at `t`; `handFire(timer)` fires one timer where the monotonic clock already stands.
+ */
+function deadlineHarness(dir) {
+  const timers = [];
+  const exits = [];
+  let mono = 0;
+  let wall = 1_000_000;
+  const supervisor = createSupervisor({
+    market: 'kraken_spot',
+    stream: 'trades',
+    adapter,
+    path: join(dir, 'state.sqlite'),
+    venue: 'kraken',
+    runId: 'run-deadline',
+    webSocketImpl: function unavailable() {
+      throw new Error('venue unavailable');
+    },
+    rawWriter: () => true,
+    exit: (code) => exits.push(code),
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, due: mono + ms, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      timer.cleared = true;
+    },
+    monotonicMs: () => mono,
+    wallClockMs: () => wall,
+    onStop: () => {},
+    onRefetch: () => {},
+    onDiagnostic: () => {},
+  });
+  return {
+    supervisor,
+    exits,
+    timers,
+    get mono() {
+      return mono;
+    },
+    get wall() {
+      return wall;
+    },
+    setWall: (value) => {
+      wall = value;
+    },
+    handFire: (timer) => {
+      timer.cleared = true;
+      timer.fn();
+    },
+    advanceTo: (target) => {
+      for (;;) {
+        const next = timers
+          .filter((timer) => !timer.cleared && timer.due <= target)
+          .sort((a, b) => a.due - b.due)[0];
+        if (!next) break;
+        mono = next.due;
+        next.cleared = true;
+        next.fn();
+      }
+      mono = target;
+    },
+  };
+}
+
+test('the startup deadline ends the run at its boundary and not a millisecond before', async () => {
+  await withDir(async (dir) => {
+    // The length is part of the contract, not an incidental default: this pins it so a change to the
+    // constant is a red test rather than a silently-loosened deadline.
+    assert.equal(DEFAULT_STARTUP_DEADLINE_MS, 60_000, 'the startup deadline is pinned to 60_000 ms');
+
+    const h = deadlineHarness(dir);
+    h.supervisor.start();
+
+    h.advanceTo(59_999);
+    assert.equal(h.supervisor.ended, false, 'at 59_999 ms reception that was never reached is still trying');
+    assert.deepEqual(h.exits, [], 'and the run has not ended');
+
+    h.advanceTo(60_000);
+    assert.equal(h.supervisor.ended, true, 'at 60_000 ms the startup deadline ends the run');
+    assert.equal(h.supervisor.abnormal, true);
+    assert.deepEqual(h.exits, [1], 'and it ends non-zero');
+
+    // The monitor is spent: it must not end anything a second time as the clocks keep moving.
+    h.advanceTo(3_600_000);
+    assert.equal(h.supervisor.ended, true);
+    assert.deepEqual(h.exits, [1]);
+    h.supervisor.close();
+  });
+});
+
+test('a deadline that fires early re-arms for the time left instead of losing the monitor', async () => {
+  await withDir(async (dir) => {
+    const h = deadlineHarness(dir);
+    h.supervisor.start();
+    const deadline = h.timers[0];
+    assert.equal(deadline.ms, DEFAULT_STARTUP_DEADLINE_MS, 'the deadline is the first timer the sequence arms');
+
+    // The timer runs while the monotonic clock is only 45_000 ms in: it fires 15_000 ms before the
+    // deadline has really passed. It must keep the monitor by re-arming for exactly the remainder.
+    h.advanceTo(45_000);
+    assert.equal(h.supervisor.ended, false, 'an early firing is not the deadline');
+    h.handFire(deadline);
+    const rearmed = h.timers.find((timer) => !timer.cleared && timer.ms === 15_000);
+    assert.ok(rearmed, 'the early firing re-armed for the remaining 15_000 ms');
+
+    // Now let the monotonic clock really reach the deadline: the re-armed timer fires and ends the run.
+    h.advanceTo(60_000);
+    assert.equal(h.supervisor.ended, true, 'the deadline still acts once it is really due');
+    assert.deepEqual(h.exits, [1]);
+    h.supervisor.close();
+  });
+});
+
+test('a wall-clock correction backwards cannot lose the startup deadline', async () => {
+  await withDir(async (dir) => {
+    const h = deadlineHarness(dir);
+    h.supervisor.start();
+
+    h.advanceTo(59_999);
+    assert.equal(h.supervisor.ended, false, 'just short of the deadline the run is still trying');
+
+    // The wall clock is corrected backwards by one second. The deadline is measured on the monotonic
+    // clock, so this must not shrink the elapsed time or drop the monitor; the run still ends at 60_000.
+    h.setWall(h.wall - 1_000);
+    h.advanceTo(60_000);
+    assert.equal(h.supervisor.ended, true, 'a backward wall-clock step cannot leave the run unmonitored');
+    assert.deepEqual(h.exits, [1], 'and it ends non-zero');
+
+    // An hour later the monitor did not quietly vanish: reception was never reached, and the run stayed
+    // ended rather than reconnecting for ever.
+    h.advanceTo(3_600_000);
+    assert.equal(h.supervisor.ended, true);
+    assert.deepEqual(h.exits, [1]);
+    h.supervisor.close();
   });
 });
 
