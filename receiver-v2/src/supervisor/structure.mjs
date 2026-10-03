@@ -711,9 +711,11 @@ export function createStructure({
         return { ...note, spooled: true };
       }
       // Nothing could hold it. Reception stops and the gap is written down, which is the only honest
-      // outcome left: continuing would mean pretending the frame was handled.
-      onGap({ market, reason: 'raw refused and the spool could not hold it', seq: envelope.receive_seq });
+      // outcome left: continuing would mean pretending the frame was handled. The stop is the state that
+      // matters and the report is only news of it, so the stop is recorded first - a hook that throws must
+      // not leave reception running, or the next frame is taken by a process with nowhere to put it.
       stopReception('nothing could hold the frame');
+      onGap({ market, reason: 'raw refused and the spool could not hold it', seq: envelope.receive_seq });
       return { ...note, stopped: true };
     } catch (error) {
       // An exception from a caller's hook stops reception and the caller hears about it. That includes the
@@ -722,8 +724,10 @@ export function createStructure({
       // has taken the frame - and continuing from there would leave a durable frame with no record that it
       // is owed, which is the loss this set exists to prevent. A refusal returned by the guard, by contrast,
       // writes nothing and needs no stop.
-      onGap({ market, reason: `failure while handling a frame: ${error.message}`, seq: envelope.receive_seq });
+      // Same order as above: the stop is recorded before it is reported, because the report can throw and
+      // the stop cannot be left undone. Note the report about the failure is itself a hook a caller supplies.
       stopReception(error.message);
+      onGap({ market, reason: `failure while handling a frame: ${error.message}`, seq: envelope.receive_seq });
       return { accepted: false, reason: 'failure', error };
     }
   }

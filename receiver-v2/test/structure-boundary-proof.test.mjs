@@ -44,13 +44,14 @@ const exactSuccessor = ({ previous, current, replace }) =>
 
 let clock = 1_000_000;
 
-async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false, gapThrows = false } = {}) {
+async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false, gapThrows = false, rawRefuses = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'proof-structure-'));
   const base = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
   const inject = injectable ? withInjectableWrites(base) : null;
   const store = inject ? inject.durability : base;
   const refetch = [];
   const gaps = [];
+  let rawCalls = 0;
   const structure = createStructure({
     market: MARKET,
     stream: STREAM,
@@ -71,7 +72,10 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
     webSocketImpl: function unused() {
       throw new Error('this test feeds frames directly');
     },
-    rawWriter: () => true,
+    rawWriter: () => {
+      rawCalls += 1;
+      return !rawRefuses;
+    },
     nowMs: () => clock,
     onGap: (gap) => {
       if (gapThrows) throw new Error('the gap hook refused');
@@ -82,7 +86,7 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], 
   });
   structure.accept(CONNECTION, { runId: 'run-1', generation: 1, firstSeq: 1 });
   try {
-    return await fn({ structure, store, refetch, gaps, dir, parts: internalsOf(structure), ...(inject ? { inject } : {}) });
+    return await fn({ structure, store, refetch, gaps, dir, rawWrites: () => rawCalls, parts: internalsOf(structure), ...(inject ? { inject } : {}) });
   } finally {
     structure.stop();
     store.close();
@@ -270,5 +274,24 @@ test('a report that throws does not leave the board serving on a range the store
       assert.equal(refetch.length, 1, 'and a re-anchor was asked for');
     },
     { gapThrows: true },
+  );
+});
+
+test('a stop that could not be reported is still a stop', async () => {
+  // When nothing can hold the frame, stopping is the state that matters and the report is only news of it.
+  // A hook that throws must not leave reception running: the next frame would be taken by a process with
+  // nowhere to put it, and nothing would say so (measured before the fix: nothing owed, not stopped).
+  await withStructure(
+    async ({ structure, rawWrites }) => {
+      assert.throws(() => structure.feed(envelope(1, 1)), /the gap hook refused/, 'the report could not be made');
+      assert.equal(structure.stats.stopped, true, 'reception is stopped all the same');
+
+      const reached = rawWrites();
+      // The stopped reception reports the frame the same way, and the hook throws here too - the point is
+      // that the raw is not reached again: reception is not taking frames it has nowhere to put.
+      assert.throws(() => structure.feed(envelope(2, 2)), /the gap hook refused/);
+      assert.equal(rawWrites(), reached, 'the raw is not reached again');
+    },
+    { rawRefuses: true, gapThrows: true },
   );
 });
