@@ -49,6 +49,7 @@ export function withInjectableWrites(store) {
 }
 
 export const APPLIED_BOUNDARY_WRITE = /INSERT OR REPLACE INTO applied_boundary/;
+export const BOOK_MISSING_WRITE = /INSERT OR REPLACE INTO book_missing_record/;
 export const RETIRED_RUN_WRITE = /INSERT OR REPLACE INTO retired_run/;
 export const WATERMARK_WRITE = /INSERT OR REPLACE INTO organized_watermark/;
 export const LEDGER_INTENT_WRITE = /INSERT OR IGNORE INTO delivery_ledger/;

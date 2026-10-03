@@ -298,3 +298,97 @@ test('a missing record of the followed connection invalidates the proof, and a r
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('a frame the rule refuses is not applied merely because the board is unanchored', async () => {
+  // The first frame of a range has nothing before it, and that is exactly the frame that would build the
+  // anchor - but having nothing before it is not permission to believe it. The rule is consulted, with no
+  // `previous` to lean on, so a board with nothing to anchor on stays unanchored rather than anchored on a
+  // frame nobody verified (C6).
+  await withBook(
+    async ({ book }) => {
+      book.accept('conn-1', { firstSeq: 1 });
+      const refused = book.apply({ envelope: envelope(1, 2), changes: [change(1)] });
+      assert.equal(refused.applied, false, 'the rule refused the frame that would have built the anchor');
+      assert.match(refused.reason, /proof is broken/);
+      assert.equal(book.appliedBoundary.upToSeq, null, 'nothing was applied');
+      assert.equal(book.board.size('bid', 101), null, 'and no level landed');
+      assert.equal(book.proveBoundary().proven, false, 'an unjudged range is not a proof');
+    },
+    sequenceAdapter(({ previous, current }) => previous !== null && current.meta.venue_seq === previous.meta.venue_seq + 1),
+  );
+});
+
+test('a proof that broke is written down, and the frame it refused is not applied after a restart', async () => {
+  // Fail-closed across a restart: a break kept only in memory comes back as a merely unanchored board, and
+  // the very frame the rule refused would then be applied with nothing left to say it was refused (C6).
+  await withBook(async ({ book, store, dir }) => {
+    book.accept('conn-1', { firstSeq: 1 });
+    assert.equal(book.apply({ envelope: envelope(1, 1), changes: [change(1)] }).applied, true);
+    assert.match(book.apply({ envelope: envelope(2, 9), changes: [change(2)] }).reason, /proof is broken/);
+    store.close();
+
+    const second = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const reopened = openBook({ market: MARKET, stream: STREAM, durability: second, adapter: sequenceAdapter() });
+    assert.equal(reopened.appliedBoundary.upToSeq, 1, 'the position came back');
+    const again = reopened.apply({ envelope: envelope(2, 9), changes: [change(2)] });
+    assert.equal(again.applied, false, 'the frame the rule refused is still not applied');
+    assert.match(again.reason, /proof is broken/);
+    assert.equal(reopened.board.size('bid', 102), null);
+    assert.equal(reopened.proveBoundary().proven, false);
+    second.close();
+  }, sequenceAdapter());
+});
+
+test('a replacement behind a hole re-anchors the proof past it, and the past hole stays history', async () => {
+  await withBook(async ({ book }) => {
+    book.accept('conn-1', { firstSeq: 1 });
+    assert.equal(book.apply({ envelope: envelope(1, 1), changes: [change(1)] }).applied, true);
+    assert.equal(book.apply({ envelope: envelope(3, 3), changes: [change(3)] }).applied, false, 'held behind the hole');
+    assert.equal(book.openGaps().length, 1, 'the hole is recorded');
+
+    const replaced = book.apply({ envelope: envelope(5, 20), changes: { replace: true, levels: [change(5)] } });
+    assert.equal(replaced.applied, true);
+    assert.equal(replaced.replaced, true);
+    const proof = book.proveBoundary();
+    assert.equal(proof.proven, true, 'the replacement re-anchored past the hole');
+    assert.equal(proof.anchorSeq, 5, 'the anchor is where the replacement stood');
+    assert.equal(book.openGaps().length, 1, 'and the hole is still recorded: a loss is history');
+  }, sequenceAdapter());
+});
+
+test('a hole that is filled puts the board back in service by itself', async () => {
+  await withBook(async ({ book }) => {
+    book.accept('conn-1', { firstSeq: 1 });
+    for (const seq of [1, 2]) assert.equal(book.apply({ envelope: envelope(seq, seq), changes: [change(seq)] }).applied, true);
+    assert.equal(book.proveBoundary().proven, true);
+    assert.equal(book.isRunning, true);
+
+    assert.equal(book.apply({ envelope: envelope(4, 4), changes: [change(4)] }).applied, false, 'a hole holds it');
+    assert.equal(book.isRunning, false, 'and takes the board out of service (C7)');
+
+    const filling = book.apply({ envelope: envelope(3, 3), changes: [change(3)] });
+    assert.equal(filling.applied, true);
+    assert.equal(filling.alsoApplied, 1, 'the frame the hole held follows it');
+    assert.equal(book.isRunning, true, 'the board serves again without anyone asking');
+    assert.equal(book.appliedBoundary.upToSeq, 4, 'the position is whole again');
+  }, sequenceAdapter());
+});
+
+test('a frame the proof refuses does not write the origin it declared', async () => {
+  // The declaration is a fact about the connection, and a refused frame establishes nothing - an origin
+  // written anyway is a fact the connection never established, which a restart would then believe.
+  await withBook(
+    async ({ book }) => {
+      book.accept('conn-1', {});
+      const refused = book.apply({
+        envelope: envelope(5, 9, 'conn-1', { meta: { first_seq: 5, venue_seq: 9 } }),
+        changes: [change(5)],
+      });
+      assert.equal(refused.applied, false);
+      assert.match(refused.reason, /proof is broken/);
+      assert.equal(book.appliedBoundary.firstSeq, null, 'the origin it declared was not written');
+      assert.equal(book.appliedBoundary.upToSeq, null);
+    },
+    sequenceAdapter(({ previous }) => previous !== null),
+  );
+});

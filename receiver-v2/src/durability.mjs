@@ -202,6 +202,11 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
    * Exposed because every module that owns part of this store needs the same discipline, and because a
    * BEGIN that never succeeded must not be rolled back (there is nothing to roll back) and a rollback
    * that fails must not replace the error that caused it.
+   *
+   * A caller that has to make two records agree - the ledger's row for a loss and the board's proof, say -
+   * opens one transaction around both: the modules write their statements through the connection they are
+   * handed, so a transaction taken here covers them all. Nothing below takes a transaction of its own, and
+   * a second BEGIN is an error rather than a way to nest.
    */
   function inTransaction(fn) {
     let begun = false;

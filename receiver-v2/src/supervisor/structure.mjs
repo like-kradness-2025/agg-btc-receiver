@@ -286,19 +286,29 @@ export function createStructure({
   }
 
   /**
+   * The write half of invalidateProofForMissing: drop the proof of the connection the board follows, and
+   * say whether that is what happened. It is separate so the two records this decision makes - the
+   * ledger's row for the loss and the dropped proof - can be written inside one transaction, with the
+   * refetch request (a hook) outside it.
+   */
+  function dropFollowedProof(connectionId, reason) {
+    const followed = book.appliedBoundary.connectionId;
+    if (followed === null || connectionId !== followed) return false;
+    const result = bookInternal.invalidateProof(
+      connectionId,
+      `a range of this connection was declared missing: ${reason}`,
+    );
+    return result?.invalidated === true;
+  }
+
+  /**
    * A missing range is a fact about the connection that lost it. When it is the connection the board is
    * following, the proof the board holds no longer covers what is on it, so the proof is dropped - a
    * proof that outlived its range would put the board straight back into service on the next success.
    * A loss of any other connection is history, and it must not block the board running now (C7, C11).
    */
   function invalidateProofForMissing(connectionId, reason) {
-    const followed = book.appliedBoundary.connectionId;
-    if (followed === null || connectionId !== followed) return;
-    const result = bookInternal.invalidateProof(
-      connectionId,
-      `a range of this connection was declared missing: ${reason}`,
-    );
-    if (result?.invalidated) requestRefetch(connectionId);
+    if (dropFollowedProof(connectionId, reason)) requestRefetch(connectionId);
   }
 
   /**
@@ -345,12 +355,21 @@ export function createStructure({
       const reason = tooOld
         ? `the delivery ledger's retention bound passed this frame: it is older than ${ledgerRetentionMs} ms`
         : `the delivery ledger's retention bound passed this frame: the ledger holds more than ${ledgerRetentionBytes} bytes`;
-      const { decided } = ledgerInternal.skip(entry.connectionId, entry.receiveSeq, reason);
+      // The loss and the proof it invalidates are one fact about the store, so they are written in one
+      // transaction: a ledger row that says the range is gone while the board still holds a proof over it
+      // is a state only a crash could leave, and the restart would then apply frames the proof never
+      // covered. The report and the request are hooks, so they are made after the commit.
+      const { decided, invalidated } = wiring.inTransaction(() => {
+        const skipped = ledgerInternal.skip(entry.connectionId, entry.receiveSeq, reason);
+        return {
+          decided: skipped.decided,
+          invalidated: skipped.decided ? dropFollowedProof(entry.connectionId, reason) : false,
+        };
+      });
       if (decided) {
         swept += 1;
         onGap({ market, reason: `this frame can never be applied: ${reason}`, seq: entry.receiveSeq });
-        // A range the board was following is now known to be missing: its proof has to go with it.
-        invalidateProofForMissing(entry.connectionId, reason);
+        if (invalidated) requestRefetch(entry.connectionId);
       }
       remaining -= entry.bytes;
     }

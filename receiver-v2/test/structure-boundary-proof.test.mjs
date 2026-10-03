@@ -18,6 +18,7 @@ import { makeEnvelope } from '../src/envelope.mjs';
 import { openDurability } from '../src/durability.mjs';
 import { createStructure } from '../src/supervisor/structure.mjs';
 import { internalsOf } from '../src/internal/wiring.mjs';
+import { withInjectableWrites, BOOK_MISSING_WRITE } from '../test-support/failing-store.mjs';
 
 const CONNECTION = 'conn-1';
 const MARKET = 'kraken_spot';
@@ -43,9 +44,11 @@ const exactSuccessor = ({ previous, current, replace }) =>
 
 let clock = 1_000_000;
 
-async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [] } = {}) {
+async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [], injectable = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'proof-structure-'));
-  const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+  const base = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+  const inject = injectable ? withInjectableWrites(base) : null;
+  const store = inject ? inject.durability : base;
   const refetch = [];
   const gaps = [];
   const structure = createStructure({
@@ -76,7 +79,7 @@ async function withStructure(fn, { connects = exactSuccessor, replaceSeqs = [] }
   });
   structure.accept(CONNECTION, { runId: 'run-1', generation: 1, firstSeq: 1 });
   try {
-    return await fn({ structure, store, refetch, gaps, dir, parts: internalsOf(structure) });
+    return await fn({ structure, store, refetch, gaps, dir, parts: internalsOf(structure), ...(inject ? { inject } : {}) });
   } finally {
     structure.stop();
     store.close();
@@ -106,7 +109,7 @@ test('a frame whose proof fails leaves the levels, the position and the ledger u
 });
 
 test('the retention sweep of the followed connection drops the proof and asks for a re-anchor', async () => {
-  await withStructure(async ({ structure, refetch, parts }) => {
+  await withStructure(async ({ structure, refetch, parts, store }) => {
     assert.equal(structure.feed(envelope(1, 1)).applied, true);
     assert.equal(parts.book.proveBoundary().proven, true, 'the board is serving before the loss');
 
@@ -121,6 +124,12 @@ test('the retention sweep of the followed connection drops the proof and asks fo
     assert.match(proof.reason, /proof is broken/);
     assert.equal(structure.book.phase, 'syncing');
     assert.equal(refetch.length, 1, 'and a re-anchor is requested once');
+
+    // The record is what a restart and an operator read, so it carries the reason the range was lost.
+    const record = internalsOf(store).db
+      .prepare('SELECT reason FROM book_missing_record WHERE market = ? AND stream = ?')
+      .get(MARKET, STREAM);
+    assert.match(String(record?.reason ?? ''), /retention bound/, 'the record says why the range is gone');
   });
 });
 
@@ -155,5 +164,44 @@ test('a replacement frame re-anchors the board after a broken proof', async () =
       assert.equal(structure.book.board.size('bid', 503), 1, 'and replaced the board');
     },
     { replaceSeqs: [3] },
+  );
+});
+
+test('a proof broken while the waiting queue drains asks for a re-anchor', async () => {
+  // A break found while draining is the same event as a break found on a frame that arrived on its own, and
+  // it has to reach the same place: the queue stops where it is, and the structure asks for a re-anchor
+  // rather than leaving a board that cannot serve with nobody told (C7).
+  await withStructure(async ({ structure, refetch }) => {
+    assert.equal(structure.feed(envelope(1, 1)).applied, true);
+    assert.equal(structure.feed(envelope(3, 30)).applied, false, 'held behind the hole');
+
+    const filled = structure.feed(envelope(2, 2));
+    assert.equal(filled.applied, true, 'the hole is filled by the frame that was missing');
+    assert.equal(filled.proofBroken, true, 'and the frame behind it failed its proof on the way in');
+    assert.equal(structure.book.appliedBoundary.upToSeq, 2, 'the position stops where the queue stopped');
+    assert.equal(structure.book.phase, 'syncing');
+    assert.equal(refetch.length, 1, 'the structure asks for a re-anchor');
+    assert.equal(structure.ledger.find(CONNECTION, 3).state, 'owed', 'and the refused frame is still owed to the board');
+  });
+});
+
+test('a loss the ledger cannot write down takes the proof-dropping with it', async () => {
+  // The row that says a range is gone and the proof that range invalidates are one fact about this store,
+  // so they are written together: a store holding the row and the proof at once is the state a restart
+  // would misread, and it must not be reachable through a half-failure.
+  await withStructure(
+    async ({ structure, refetch, parts, inject }) => {
+      assert.equal(structure.feed(envelope(1, 1)).applied, true);
+      assert.equal(parts.book.proveBoundary().proven, true, 'the board is serving before the loss');
+      assert.equal(parts.ledger.record(envelope(7, 7, { meta: null }), 'durable and held').recorded, true);
+      clock += 10 * 60 * 1000;
+
+      inject.armWriteFailure(BOOK_MISSING_WRITE);
+      assert.throws(() => structure.drainSpool(), /injected write failure/, 'the write was refused');
+      assert.equal(structure.ledger.find(CONNECTION, 7).state, 'owed', 'the loss was not decided');
+      assert.equal(parts.book.proveBoundary().proven, true, 'and the proof still stands');
+      assert.equal(refetch.length, 0, 'nothing is reported, because nothing was decided');
+    },
+    { injectable: true },
   );
 });

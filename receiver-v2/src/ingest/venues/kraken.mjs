@@ -301,20 +301,10 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
         mirrorSeeded = false;
       }
 
-      // The first book frame a book applies while it is unanchored is not put in front of the rule
-      // (stage A: an anchor is built by applying, not by proving), so the mirror would start empty and
-      // the next frame could never match. That frame's levels are taken from the frame the book hands
-      // back as `previous` - never from a slot of our own, which would be a memory the book does not
-      // know the rule depends on.
-      if (!mirrorSeeded && previous) {
-        const seed = bookFrameOf(previous);
-        if (seed !== null) {
-          applyFrameTo(mirror, seed);
-          mirrorSeeded = true;
-          mirrorConnectionId = previous?.connection_id ?? null;
-        }
-      }
-
+      // No seeding from a `previous` frame: the rule now judges the first book frame of a range too, and
+      // that frame is judged against the mirror the frame itself produces - which is exactly what a
+      // snapshot proves. A mirror carried over from a frame the rule never saw would be a memory the
+      // book does not know the rule depends on, and it would make the first frame's own proof meaningless.
       if (frame.checksum === null) return false; // fail-closed: no checksum, no proof
 
       const candidate = candidateMirror(frame);

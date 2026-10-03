@@ -320,6 +320,10 @@ function openBookWithin(options, wiring) {
   // position past data that has not arrived and make that data permanently unapplicable, but
   // discarding them would mean the missing frame arrives and nothing else follows.
   const waiting = new Map(); // receive_seq -> { envelope, changes }
+  // Whether the last walk over the waiting queue ended because the rule refused a held frame. The caller
+  // hears it as a proof break, so a re-anchor can be asked for - a break found while draining is the same
+  // event as a break found on a frame that arrived on its own.
+  let lastDrainBroke = false;
 
   const boundaryStatement = wiring.db.prepare(
     `INSERT OR REPLACE INTO applied_boundary
@@ -446,14 +450,15 @@ function openBookWithin(options, wiring) {
   /**
    * Whether this frame connects to what came before, as the adapter's rule decides it.
    *
-   * The rule is the proof: a bare number does not connect anything by itself. An unanchored book does not
-   * consult it for an ordinary diff - the first applied frame builds the anchor, and that is how a hole is
-   * filled - but a replacement is always judged, because it is self-contained and its own proof is the only
-   * thing that authorises the re-anchor.
+   * The rule is the proof: a bare number does not connect anything by itself, and a venue number going up
+   * is not a connection either. The rule is consulted for every frame a verifiable venue sends, including
+   * the first of a range - the frame that builds an anchor is judged on its own, with nothing before it,
+   * which is exactly how a snapshot proves itself. An unanchored book is not a book that believes
+   * anything: it is a book whose range is not verified yet, and only the frames the rule accepts become
+   * part of that range.
    */
   function frameConnects(envelope, frame) {
     if (proofKind === UNVERIFIABLE) return true;
-    if (!frame.replace && proof.state === UNANCHORED) return true;
     return connectionRule({
       previous: provenEnvelope,
       current: envelope,
@@ -462,19 +467,38 @@ function openBookWithin(options, wiring) {
     }) === true;
   }
 
-  /** The proof held over this frame: it binds to the connection and extends the verified range. */
-  function recordVerifiedProof(envelope, seq) {
-    if (proof.state === UNANCHORED || proof.state === BROKEN) proof.anchorSeq = seq;
+  /**
+   * The proof held over this frame: it binds to the connection and extends the verified range.
+   *
+   * A replacement re-anchors - its own position is where the proof starts again - so the hole records
+   * older than it are history and must not block the recovery (C7). Nothing else moves the anchor: a diff
+   * extends the range the proof already has.
+   */
+  function recordVerifiedProof(envelope, seq, { reanchor = false } = {}) {
+    if (reanchor || proof.state === UNANCHORED || proof.state === BROKEN) proof.anchorSeq = seq;
     proof.state = HOLDING;
     proof.connectionId = envelope.connection_id;
     proof.upToSeq = seq;
     provenEnvelope = envelope;
   }
 
-  /** The rule did not hold: the proof is dropped and the board stops serving until a replacement. */
-  function markProofBroken(envelope) {
+  /**
+   * The rule did not hold: the proof is dropped and the board stops serving until a replacement.
+   *
+   * The break is written down rather than kept in memory: a restart that came back merely unanchored
+   * would apply the very frames the rule refused, with nothing left to say they were refused (C6,
+   * fail-closed across a restart). A replacement clears the record, because re-anchoring is what
+   * answers it.
+   */
+  function markProofBroken(envelope, reason = 'the boundary rule did not hold over this frame') {
+    const connectionId = envelope?.connection_id ?? proof.connectionId;
+    // The write comes first, and the in-memory book follows it: a record that cannot be written must leave
+    // the book exactly as it was, memory included - the discipline every durable change here follows.
+    if (connectionId !== null) {
+      missingRecordStatement.run(market, stream, connectionId, reason, nowMs());
+    }
     proof.state = BROKEN;
-    proof.connectionId = envelope?.connection_id ?? proof.connectionId;
+    proof.connectionId = connectionId;
     proof.anchorSeq = null;
     proof.upToSeq = null;
     phase = SYNCING;
@@ -576,6 +600,7 @@ function openBookWithin(options, wiring) {
    */
   function drainWaiting() {
     let count = 0;
+    lastDrainBroke = false;
     for (;;) {
       if (applied.upToSeq === null) break;
       const nextSeq = applied.upToSeq + 1;
@@ -583,6 +608,7 @@ function openBookWithin(options, wiring) {
       const held = waiting.get(nextSeq);
       if (proof.state === BROKEN || !frameConnects(held.envelope, held.frame)) {
         if (proof.state !== BROKEN) markProofBroken(held.envelope);
+        lastDrainBroke = true;
         break;
       }
       commitRange({ frame: held.frame, next: { ...applied, upToSeq: nextSeq } });
@@ -594,6 +620,76 @@ function openBookWithin(options, wiring) {
       count += 1;
     }
     return count;
+  }
+
+  /**
+   * The snapshot has been checked against the stream. Only this puts the book back in service; a
+   * fresh book has proven nothing, and reaching this with no connection accepted is not possible.
+   *
+   * C6: a connection existing is not a boundary, and a declared origin is not a proof either - what is
+   * required is a range that was actually applied. Corrected: the adapter's own rule has to have held
+   * over that range since the anchor. A range the rule never judged, or whose proof broke, is not a
+   * boundary. Note the loose comparison: on reopen the field comes back undefined rather than null.
+   *
+   * A closure rather than a method, because the book itself asks this question when a hole it recorded
+   * is filled: the board knows when its range is whole again, and a repair that waits to be asked for is
+   * a repair that does not happen (C7).
+   */
+  function proveNow() {
+    if (applied.connectionId !== null && applied.upToSeq == null) {
+      return { proven: false, kind: proofKind, verified: false, reason: 'the board holds nothing from this connection yet' };
+    }
+    // C7: an open hole within the range the proof covers is not a boundary either. Holes older than the
+    // anchor are history - exactly the past losses a replacement re-anchors over - so they are deliberately
+    // not consulted here, or a board could never recover from one.
+    const openForThisConnection = wiring.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM book_gap
+         WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL AND waiting_for >= ?`,
+      )
+      .get(market, stream, applied.connectionId, proof.anchorSeq ?? -1).n;
+    if (openForThisConnection > 0) {
+      return { proven: false, kind: proofKind, verified: false, reason: 'this connection has an unresolved hole' };
+    }
+    if (applied.connectionId === null) {
+      return { proven: false, kind: proofKind, verified: false, reason: 'no connection accepted yet' };
+    }
+    if (proof.state === BROKEN) {
+      return { proven: false, kind: proofKind, verified: false, reason: PROOF_BROKEN };
+    }
+    if (proofKind === UNVERIFIABLE) {
+      // C6: a venue with no means of proof may still run - but nothing here is a proof, and the result says
+      // both things rather than dressing the running up as one.
+      phase = RUNNING;
+      return {
+        proven: true,
+        kind: UNVERIFIABLE,
+        verified: false,
+        reason: 'the book runs without a boundary proof: this venue is unverifiable',
+        anchorSeq: proof.anchorSeq,
+        upToSeq: proof.upToSeq,
+      };
+    }
+    const covers =
+      proof.state === HOLDING &&
+      proof.connectionId === applied.connectionId &&
+      proof.anchorSeq !== null &&
+      proof.upToSeq === applied.upToSeq;
+    if (!covers) {
+      return { proven: false, kind: proofKind, verified: false, reason: 'no verified range covers the applied position' };
+    }
+    phase = RUNNING;
+    return {
+      proven: true,
+      kind: proofKind,
+      verified: true,
+      reason:
+        proofKind === 'checksum'
+          ? 'the top levels of the board are proved against the connection (checksum)'
+          : 'the connection rule is proved over the applied range (sequence)',
+      anchorSeq: proof.anchorSeq,
+      upToSeq: proof.upToSeq,
+    };
   }
 
   const api = {
@@ -834,10 +930,11 @@ function openBookWithin(options, wiring) {
         lowestSeenWithoutOrigin = lowestSeenWithoutOrigin === null ? seq : Math.min(lowestSeenWithoutOrigin, seq);
       }
 
-      // The origin this frame declares is a fact about the connection, so it is written down the moment
-      // it is relied on - not kept in memory until some later frame happens to move the position. An
-      // origin that lived only in memory could be completed differently afterwards, and completing it to
-      // a sequence that has already arrived is a way to jump a hole this book has already recorded.
+      // The origin a frame declares is judged here, before anything is written, because a declaration
+      // refused for being too high must not be replaceable by a later one that skips this very frame -
+      // the in-memory ceiling below is what holds that. The declaration itself is written down only once
+      // the frame has passed every check: a frame the proof refuses writes nothing, origin included.
+      let declaredOrigin = null;
       if (applied.firstSeq === null && envelope.meta?.first_seq != null) {
         const declared = envelope.meta.first_seq;
         // A connection's numbering starts at or before the first frame that carries it, so a frame declaring an
@@ -847,8 +944,16 @@ function openBookWithin(options, wiring) {
         if (declared > seq || (lowestSeenWithoutOrigin !== null && declared > lowestSeenWithoutOrigin)) {
           return { applied: false, reason: 'the origin this frame declares is beyond frames that have already arrived' };
         }
-        persistAcceptance({ ...applied, firstSeq: declared });
+        declaredOrigin = declared;
       }
+
+      // The declaration is written down wherever the frame is relied on - held for a hole, or applied -
+      // and never on a frame the proof refuses: a refused frame writes nothing, origin included.
+      const declareOrigin = () => {
+        if (declaredOrigin !== null && applied.firstSeq === null) {
+          persistAcceptance({ ...applied, firstSeq: declaredOrigin });
+        }
+      };
 
       const frame = normalizeFrame(changes);
       const firstSeq = applied.firstSeq ?? envelope.meta?.first_seq ?? null;
@@ -861,11 +966,12 @@ function openBookWithin(options, wiring) {
           markProofBroken(envelope);
           return { applied: false, reason: PROOF_BROKEN, proofBroken: true };
         }
+        if (declaredOrigin !== null) declareOrigin();
         commitReplacement({
           frame,
           next: { ...applied, connectionId: applied.connectionId, upToSeq: seq, firstSeq },
         });
-        recordVerifiedProof(envelope, seq);
+        recordVerifiedProof(envelope, seq, { reanchor: true });
         // The replacement accounts for the board from here on: frames it has overtaken are no longer
         // ahead of the position and are dropped. The hole records stay (C7) - they are history.
         waiting.clear();
@@ -894,12 +1000,14 @@ function openBookWithin(options, wiring) {
         if (seq > firstSeq) {
           // The first sequence never arrived. That hole is a fact, and this frame is kept until it
           // is filled rather than dropped on the floor.
+          declareOrigin();
           recordGap(firstSeq, seq);
           waiting.set(seq, { envelope, frame });
           return { applied: false, reason: 'waiting for the first sequence', waitingFor: firstSeq };
         }
       } else if (seq !== applied.upToSeq + 1) {
         // A hole: record it, keep this frame, and let the position stay where the board really is.
+        declareOrigin();
         recordGap(applied.upToSeq + 1, seq);
         waiting.set(seq, { envelope, frame });
         return { applied: false, reason: 'gap before this sequence', waitingFor: applied.upToSeq + 1 };
@@ -912,8 +1020,13 @@ function openBookWithin(options, wiring) {
         return { applied: false, reason: PROOF_BROKEN, proofBroken: true };
       }
 
+      // A hole the proof already covered does not break the proof, it only takes the board out of service
+      // (C7) - so whether this frame may put it back is decided by the state the proof was in before it.
+      const wasHolding = proof.state === HOLDING;
+
       // The origin this frame is anchored on is recorded with the position it makes durable: a boundary
       // whose start is only in memory is a boundary that cannot be shown again after a restart.
+      declareOrigin();
       commitRange({
         frame,
         next: { ...applied, connectionId: applied.connectionId, upToSeq: seq, firstSeq },
@@ -921,7 +1034,11 @@ function openBookWithin(options, wiring) {
       recordVerifiedProof(envelope, seq);
       closeGaps(seq);
       const alsoApplied = drainWaiting();
-      return { applied: true, reason: 'applied', alsoApplied };
+      // The range a hole cut this connection's proof across is whole again, and the proof still covers it:
+      // the board goes back to serving by itself, because a repair that waits to be asked for is a repair
+      // that does not happen. A break found while draining is reported as the break it is.
+      if (!lastDrainBroke && wasHolding && phase !== RUNNING) proveNow();
+      return { applied: true, reason: 'applied', alsoApplied, ...(lastDrainBroke ? { proofBroken: true } : {}) };
     },
 
     /** Holes this book is waiting for. Unfilled ones are what it cannot claim to have. */
@@ -944,70 +1061,10 @@ function openBookWithin(options, wiring) {
       phase = SYNCING;
     },
 
-    /**
-     * The snapshot has been checked against the stream. Only this puts the book back in service; a
-     * fresh book has proven nothing, and reaching this with no connection accepted is not possible.
-     *
-     * C6: a connection existing is not a boundary, and a declared origin is not a proof either - what is
-     * required is a range that was actually applied. Corrected: the adapter's own rule has to have held
-     * over that range since the anchor. A range the rule never judged, or whose proof broke, is not a
-     * boundary. Note the loose comparison: on reopen the field comes back undefined rather than null.
-     */
+    /** The guarded door to `proveNow`: a caller asks whether the boundary is proved, and only a proven
+     *  boundary puts the book back in service. See `proveNow` for what a proof has to be. */
     proveBoundary() {
-      if (applied.connectionId !== null && applied.upToSeq == null) {
-        return { proven: false, kind: proofKind, verified: false, reason: 'the board holds nothing from this connection yet' };
-      }
-      // C7: an open hole within the range the proof covers is not a boundary either. Holes older than the
-      // anchor are history - exactly the past losses a replacement re-anchors over - so they are deliberately
-      // not consulted here, or a board could never recover from one.
-      const openForThisConnection = wiring.db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM book_gap
-           WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL AND waiting_for >= ?`,
-        )
-        .get(market, stream, applied.connectionId, proof.anchorSeq ?? -1).n;
-      if (openForThisConnection > 0) {
-        return { proven: false, kind: proofKind, verified: false, reason: 'this connection has an unresolved hole' };
-      }
-      if (applied.connectionId === null) {
-        return { proven: false, kind: proofKind, verified: false, reason: 'no connection accepted yet' };
-      }
-      if (proof.state === BROKEN) {
-        return { proven: false, kind: proofKind, verified: false, reason: PROOF_BROKEN };
-      }
-      if (proofKind === UNVERIFIABLE) {
-        // C6: a venue with no means of proof may still run - but nothing here is a proof, and the result says
-        // both things rather than dressing the running up as one.
-        phase = RUNNING;
-        return {
-          proven: true,
-          kind: UNVERIFIABLE,
-          verified: false,
-          reason: 'the book runs without a boundary proof: this venue is unverifiable',
-          anchorSeq: proof.anchorSeq,
-          upToSeq: proof.upToSeq,
-        };
-      }
-      const covers =
-        proof.state === HOLDING &&
-        proof.connectionId === applied.connectionId &&
-        proof.anchorSeq !== null &&
-        proof.upToSeq === applied.upToSeq;
-      if (!covers) {
-        return { proven: false, kind: proofKind, verified: false, reason: 'no verified range covers the applied position' };
-      }
-      phase = RUNNING;
-      return {
-        proven: true,
-        kind: proofKind,
-        verified: true,
-        reason:
-          proofKind === 'checksum'
-            ? 'the top levels of the board are proved against the connection (checksum)'
-            : 'the connection rule is proved over the applied range (sequence)',
-        anchorSeq: proof.anchorSeq,
-        upToSeq: proof.upToSeq,
-      };
+      return proveNow();
     },
 
     /**
@@ -1021,8 +1078,10 @@ function openBookWithin(options, wiring) {
      */
     invalidateProof(connectionId, reason = 'a range of this connection was declared missing') {
       if (connectionId !== applied.connectionId) return { invalidated: false };
-      markProofBroken({ connection_id: connectionId });
-      missingRecordStatement.run(market, stream, connectionId, reason, nowMs());
+      // The record and the dropped proof are the same fact, so the reason is written with them: writing a
+      // default first and overwriting it would leave the store saying one thing and then the other, and
+      // the reason is what the restart reads.
+      markProofBroken({ connection_id: connectionId }, reason);
       return { invalidated: true };
     },
   };
