@@ -137,6 +137,26 @@ function main(argv) {
       webSocketImpl: WebSocketImpl,
       spoolDir: config.spoolDir,
       ...(config.startupDeadlineMs === undefined ? {} : { startupDeadlineMs: config.startupDeadlineMs }),
+      // A-2: the process's own reporting. A failure that ends the run has to leave its reason behind
+      // *before* the exit, which is what these two lines are for: a stop (a refused subscription, a
+      // deadline, a raw that refused) writes its reason to stderr, and so does every diagnostic reception
+      // and the board raise. Nothing here is a capability - they are observations the supervisor already
+      // makes; the point is that a process that ends non-zero is not silent about why.
+      onStop: (stop) => {
+        process.stderr.write(`receiver: stopping${stop?.reason ? `: ${stop.reason}` : ''}\n`);
+      },
+      onDiagnostic: (diagnostic) => {
+        process.stderr.write(`receiver: diagnostic${diagnostic?.reason ? `: ${diagnostic.reason}` : ''}\n`);
+      },
+      // A-2: establishment is its own display, kept apart from `receiver: started`. `started` says the
+      // process reached reception (a socket is open and admitted); it says nothing about the stream being
+      // established. A venue whose subscription is acknowledged is what this line reports - and a venue
+      // whose subscription failed ends the run through `onStop` above rather than hiding behind `started`.
+      onSubscriptions: (info) => {
+        if (info?.state === 'acknowledged') {
+          process.stdout.write(`receiver: established ${info.connectionId ?? ''}\n`);
+        }
+      },
       // The supervisor chooses the code; a process turns it into its own exit code. A non-zero code is
       // the end of the run: reception is already stopped, so close (which writes no completion for an
       // abnormal end) and leave with the code the supervisor chose.
@@ -176,8 +196,11 @@ function main(argv) {
   }
   // Reception was admitted: hold the process open until a signal or a failure ends the run.
   holdOpen();
-  // The readiness line: a run that reached reception. It is how an operator - or a test - knows the
-  // process is past its startup sequence and a signal now means an orderly stop.
+  // A-2: the process-start line. It says the startup sequence completed and reception was admitted - a
+  // socket is open and the book took the connection - which is what an operator (or a test) needs to know
+  // before a signal means "an orderly stop". It is deliberately NOT the delivery-established line: whether
+  // the stream was established is a separate fact, reported by `receiver: established` when the venue
+  // acknowledges the subscription (and a failed one ends the run through `receiver: stopping` above).
   process.stdout.write(`receiver: started ${supervisor.connection?.connectionId ?? ''}\n`);
 }
 

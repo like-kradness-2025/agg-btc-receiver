@@ -209,6 +209,11 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
 
     // Kraken sends its own heartbeats; there is nothing for us to send, and inventing a ping the
     // venue does not expect would be a change in behaviour rather than a transplant.
+    //
+    // C4: `null` is the contract's third keep-alive form - "send nothing". It is not "send an empty
+    // frame": reception skips the send entirely, and the silence deadline (a separate question) still
+    // watches the link. Kraken's liveness evidence is the heartbeats it receives, which `parse` classifies
+    // as `heartbeat` rather than data.
     heartbeatMessage: () => null,
 
     /**

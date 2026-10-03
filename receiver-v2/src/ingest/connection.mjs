@@ -138,6 +138,12 @@ export function createReceiveConnection({
   let lastHeardMs = 0;
   let silentTimer = null;
   let stabilityTimer = null;
+  // C4: the keep-alive the adapter declares for the current socket, in its three forms, and the timer that
+  // carries it. Kept apart from the silence deadline above: a venue that sends nothing is still watched for
+  // silence, and disabling the keep-alive never disables that watch (they answer different questions).
+  let keepAlivePlan = null;
+  let keepAliveTimer = null;
+  let noActivityTimer = null;
   let attempts = 0;
   let closed = false;
   let state = 'idle';
@@ -318,6 +324,9 @@ export function createReceiveConnection({
   function noteHeard() {
     lastHeardMs = wallClockMs();
     armSilenceTimer();
+    // C4 no-activity form: hearing anything resets the silence window, so the keep-alive is sent only when
+    // the socket has really gone quiet - a venue still talking is not pinged.
+    if (keepAlivePlan?.form === 'noactivity') scheduleNoActivityTick(socket);
   }
 
   function stamp(raw, atMs, atNs) {
@@ -377,10 +386,17 @@ export function createReceiveConnection({
       // "We asked" is not "they agreed": only an acknowledged subscription makes the link usable, and
       // with a declared expected set the link is established only when every expected key is acknowledged
       // (C3). A refusal is a failure whatever the set says.
+      const wasFailed = subscriptionState === FAILED;
       subscriptionState = computeSubscriptionState();
       subscriptionFailure = subscriptionState === FAILED ? parsed.detail || 'a subscription was refused' : null;
       if (subscriptionState === ACKNOWLEDGED) clearAckTimer();
       publishSubscriptionState(subscriptionFailure ?? '');
+      // A-2: the refusal is a fact the run has to face, and its reason belongs on the diagnostic path -
+      // not carried only by the stop the supervisor raises afterwards. Reported as the link enters
+      // `failed`; a link that recovers and refuses again is a new failure and reports again.
+      if (subscriptionState === FAILED && !wasFailed) {
+        onDiagnostic({ market, generation, reason: `subscription failed: ${subscriptionFailure}` });
+      }
       return;
     }
     if (parsed.kind === 'shutdown') {
@@ -403,10 +419,148 @@ export function createReceiveConnection({
     onDiagnostic({ market, generation, reason: `unhandled message kind ${parsed.kind}` });
   }
 
+  /**
+   * C4: the keep-alive the adapter declares, resolved once per socket.
+   *
+   * The adapter returns one of the three forms the contract names - `{ intervalMs, payload() }` for a
+   * periodic send, `{ noActivityMs, payload() }` for a send only when the socket has gone quiet, or `null`
+   * for no keep-alive at all - or, for the adapters written before the forms existed, a single message
+   * string sent once on open (the legacy `heartbeatMessage` shape). `keepAlive` is authoritative when the
+   * adapter declares it; otherwise `heartbeatMessage` is asked. A shape that is none of these is a
+   * configuration error: it is reported as a diagnostic when the socket opens rather than sent as garbage.
+   */
+  function resolveKeepAlive() {
+    let spec;
+    if (adapter.keepAlive !== undefined) {
+      spec = typeof adapter.keepAlive === 'function' ? adapter.keepAlive() : adapter.keepAlive;
+    } else if (typeof adapter.heartbeatMessage === 'function') {
+      spec = adapter.heartbeatMessage();
+    } else {
+      spec = adapter.heartbeatMessage;
+    }
+    if (spec === undefined || spec === null) return { form: 'none', payload: null };
+    if (typeof spec === 'string' || Buffer.isBuffer(spec)) return { form: 'once', payload: () => spec };
+    if (typeof spec === 'object') {
+      const payload = typeof spec.payload === 'function' ? spec.payload : () => spec.payload;
+      if (spec.intervalMs !== undefined) {
+        if (!Number.isFinite(spec.intervalMs) || spec.intervalMs <= 0) {
+          throw new TypeError('keep-alive intervalMs must be a positive number of milliseconds');
+        }
+        return { form: 'interval', intervalMs: spec.intervalMs, payload };
+      }
+      if (spec.noActivityMs !== undefined) {
+        if (!Number.isFinite(spec.noActivityMs) || spec.noActivityMs <= 0) {
+          throw new TypeError('keep-alive noActivityMs must be a positive number of milliseconds');
+        }
+        return { form: 'noactivity', noActivityMs: spec.noActivityMs, payload };
+      }
+      throw new TypeError('keep-alive must be { intervalMs, payload() }, { noActivityMs, payload() } or null');
+    }
+    throw new TypeError(`unknown keep-alive form: ${JSON.stringify(spec)}`);
+  }
+
+  function clearKeepAliveTimers() {
+    if (keepAliveTimer !== null) {
+      clearTimer(keepAliveTimer);
+      keepAliveTimer = null;
+    }
+    if (noActivityTimer !== null) {
+      clearTimer(noActivityTimer);
+      noActivityTimer = null;
+    }
+  }
+
+  /**
+   * Send one keep-alive frame, or nothing. A payload that resolves to null, undefined or an empty frame is
+   * deliberately not sent: an empty string is not a keep-alive, and sending one is a frame the venue has to
+   * interpret (the bug this replaced). An adapter that depends on the venue's own heartbeats declares
+   * `null` and reaches here never.
+   */
+  function sendKeepAlive(activeSocket) {
+    if (keepAlivePlan === null || keepAlivePlan.payload === null) return;
+    let message;
+    try {
+      message = keepAlivePlan.payload();
+    } catch (error) {
+      onDiagnostic({ market, generation, reason: 'a keep-alive payload could not be built', error: String(error) });
+      return;
+    }
+    if (message === null || message === undefined || message === '') return;
+    if (Buffer.isBuffer(message) && message.length === 0) return;
+    activeSocket.send?.(message);
+  }
+
+  /** Arm the keep-alive for a socket that has just opened, replacing whatever the previous socket had. */
+  function armKeepAlive(activeSocket) {
+    clearKeepAliveTimers();
+    try {
+      keepAlivePlan = resolveKeepAlive();
+    } catch (error) {
+      keepAlivePlan = { form: 'none', payload: null };
+      onDiagnostic({ market, generation, reason: `keep-alive declaration refused: ${error.message}` });
+      return;
+    }
+    if (keepAlivePlan.form === 'once') {
+      sendKeepAlive(activeSocket);
+      return;
+    }
+    if (keepAlivePlan.form === 'interval') {
+      scheduleIntervalTick(activeSocket);
+      return;
+    }
+    if (keepAlivePlan.form === 'noactivity') {
+      scheduleNoActivityTick(activeSocket);
+    }
+    // 'none': nothing is sent. The silence deadline still runs - disabling the keep-alive is not the same
+    // question as watching for silence, and the two are kept apart on purpose.
+  }
+
+  /** C4 interval form: a rhythm, so the first send is one interval away rather than an opening burst. */
+  function scheduleIntervalTick(activeSocket) {
+    const armedFor = activeSocket;
+    const armedGeneration = generation;
+    const delay = keepAlivePlan.intervalMs;
+    keepAliveTimer = setTimer(() => {
+      keepAliveTimer = null;
+      if (closed) return;
+      onEvent('keep-alive', () => {
+        if (closed || socket !== armedFor || generation !== armedGeneration || keepAlivePlan === null) return;
+        sendKeepAlive(armedFor);
+        scheduleIntervalTick(armedFor);
+      });
+    }, delay);
+    if (typeof keepAliveTimer?.unref === 'function') keepAliveTimer.unref();
+  }
+
+  /** C4 no-activity form: re-armed whenever anything is heard, so it fires only after real silence. */
+  function scheduleNoActivityTick(activeSocket) {
+    if (noActivityTimer !== null) {
+      clearTimer(noActivityTimer);
+      noActivityTimer = null;
+    }
+    if (keepAlivePlan === null || keepAlivePlan.form !== 'noactivity' || closed) return;
+    const armedFor = activeSocket;
+    const armedGeneration = generation;
+    const delay = keepAlivePlan.noActivityMs;
+    noActivityTimer = setTimer(() => {
+      noActivityTimer = null;
+      if (closed) return;
+      onEvent('keep-alive', () => {
+        if (closed || socket !== armedFor || generation !== armedGeneration || keepAlivePlan === null) return;
+        sendKeepAlive(armedFor);
+        // No answer is assumed: the window restarts, and silence that continues fires it again.
+        scheduleNoActivityTick(armedFor);
+      });
+    }, delay);
+    if (typeof noActivityTimer?.unref === 'function') noActivityTimer.unref();
+  }
+
   function teardownSocket(reason) {
     clearSilenceTimer();
     clearStabilityTimer();
     clearAckTimer();
+    clearKeepAliveTimers();
+    keepAlivePlan = null;
     if (!socket) return;
     const dying = socket;
     socket = null;
@@ -485,7 +639,9 @@ export function createReceiveConnection({
           setState('subscribing');
           const subscribeMessages = adapter.subscribeMessages?.() ?? [];
           for (const message of subscribeMessages) next.send(message);
-          next.send?.(adapter.heartbeatMessage?.() ?? '');
+          // C4: the keep-alive the adapter declares, in whichever of the three forms. A null declaration
+          // sends nothing at all - never an empty frame, which is what the old `?? ''` fallback did.
+          armKeepAlive(next);
           // C3: the expected set is registered where the request is sent, and the ack window opens with
           // it. A venue that answers is judged by its expected set (one unanswered key is not a link); a
           // first-data venue is judged by its first data frame. A connection that asked for nothing and

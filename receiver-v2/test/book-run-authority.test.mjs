@@ -920,12 +920,15 @@ test('a board whose owner has not been established takes no frames at all', asyn
     assert.equal(early.applied, false);
     assert.match(early.reason, /has not been established/);
     assert.equal(book.board.size('bid', 100), null, 'nothing reached the board');
+    // A-1: this store predates the board-side anchor, so its applied position was rebuilt at open - not
+    // copied from the boundary, which would bless a position the board was never checked against. The
+    // refused frame must still leave the rebuilt position exactly where the migration left it.
     assert.equal(
       internalsOf(store).db
         .prepare('SELECT up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?')
         .get('kraken_spot', 'book').up_to_receive_seq,
-      7,
-      'and the position in the store did not move',
+      null,
+      'and the rebuilt position in the store did not move',
     );
 
     // Once the owner is established - the one accept that is allowed to say who it is - the same frame applies.

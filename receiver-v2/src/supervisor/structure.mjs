@@ -204,7 +204,7 @@ export function createStructure({
   // them, and neither does anything a caller is handed - see `internal/wiring.mjs`.
   const { book, ledger, organizer } = constructing(() =>
     wiring.whileChange(() => ({
-      book: constructorOf('book')({ market, stream, durability, nowMs, adapter }, wiring),
+      book: constructorOf('book')({ market, stream, durability, nowMs, adapter, onDiagnostic }, wiring),
       // What the raw holds and the board does not have yet. It is a record in the store rather than a map in
       // this process, because the frames it names are only recoverable while that knowledge survives a crash.
       ledger: constructorOf('ledger')({ durability, market, stream, nowMs }, wiring),

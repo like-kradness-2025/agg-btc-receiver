@@ -35,6 +35,13 @@
  * 6. A missing record of the connection the board follows is a hole in the range it proved. It is written down
  *    where it is decided, so a restart comes back waiting for a re-anchor rather than proving a range with a
  *    hole in it. A record of another connection is history, and it must not block a new board.
+ * 7. The board's applied position is kept on the board as well as in the boundary record, in one
+ *    transaction with the levels (§9.4(1)), and the two are compared at startup. What that comparison can
+ *    and cannot see is worth stating plainly, because it is the whole reach of this defence: it detects a
+ *    disagreement between the anchor and the boundary, including either of them missing. It does NOT
+ *    detect damage to the board's contents on its own (a level changed without either record moving), a
+ *    tamper that alters both records consistently, or a second instance racing on the same store. The
+ *    anchor is a witness to the record, not a proof of the board.
  */
 
 import { bindConstructor, bindInternals, internalsOf } from '../internal/wiring.mjs';
@@ -126,6 +133,13 @@ CREATE TABLE IF NOT EXISTS book_missing_record (
   declared_at_ms INTEGER NOT NULL,
   PRIMARY KEY (market, stream, connection_id)
 );
+CREATE TABLE IF NOT EXISTS board_anchor (
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  up_to_receive_seq INTEGER,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (market, stream)
+);
 `;
 
 /** Read-only view of a board: the levels this process currently believes in. */
@@ -174,7 +188,10 @@ bindConstructor('book', openBookWithin);
 
 function openBookWithin(options, wiring) {
   const {
-    market, stream, durability, nowMs = () => Date.now(), adapter = null
+    market, stream, durability, nowMs = () => Date.now(), adapter = null,
+    // A-1: a refusal here is fail-closed and has to leave a reason behind. The hook is the caller's
+    // (best-effort by contract); a diagnostic that throws must not replace the refusal itself.
+    onDiagnostic = () => {},
   } = options;
   if (!market || !stream) throw new TypeError('a book needs a market and a stream');
   // The boundary proof is the adapter's, resolved once here so nothing downstream has to interpret a
@@ -186,7 +203,72 @@ function openBookWithin(options, wiring) {
   // rather than its own copy of it: a half-written ownership chain is not recoverable.
 
 
+  // A-1: the board-side anchor. The applied boundary record says where the *organizer* believes the
+  // board stands; the anchor is the board's own position, written in the same transaction as the levels
+  // and the boundary so the two can never drift. At startup the two are compared and a disagreement -
+  // or a board that has one and not the other - is a contract violation (§9.4(1)), refused fail-closed.
+  //
+  // Whether the anchor table was already part of this store decides how an old store is treated. A table
+  // that did not exist before this open is a store from before the anchor, and no anchor can be copied
+  // from the boundary: that would bless an inconsistency between board and record that nobody checked.
+  const anchorTableExisted =
+    wiring.db
+      .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'board_anchor'")
+      .get() !== undefined;
+
   wiring.db.exec(BOOK_SCHEMA);
+  const anchorStatement = wiring.db.prepare(
+    `INSERT OR REPLACE INTO board_anchor (market, stream, up_to_receive_seq, updated_at_ms)
+     VALUES (?, ?, ?, ?)`,
+  );
+
+  /** A refusal that leaves a reason behind: the diagnostic first (best-effort), then the error. */
+  function refuse(detail) {
+    try {
+      onDiagnostic({ market, stream, reason: `refusing to open the board: ${detail}` });
+    } catch {
+      // the diagnostic is best-effort by contract; the refusal below is the fact that matters
+    }
+    const error = new Error(`the board-side anchor and the applied boundary disagree for ${market}/${stream}: ${detail}`);
+    error.code = 'BOARD_ANCHOR_MISMATCH';
+    throw error;
+  }
+
+  if (!anchorTableExisted) {
+    // An old store: it predates the board-side anchor, so the applied position it carries was never
+    // checked against the board. It is not copied (that would ratify an unverified position); it is
+    // rebuilt - the position is dropped back to "nothing applied yet", which is the fail-closed reading
+    // of a position the board cannot confirm, and the anchor is written to match. The ownership facts
+    // (connection, run, origin) are kept: they are established by their own migration, not by the
+    // position. A board that already claimed nothing is left as it is, and the anchor simply says so.
+    const legacyBoards = wiring.db.prepare('SELECT market, stream, up_to_receive_seq FROM applied_boundary').all();
+    if (legacyBoards.length > 0) {
+      const rollbackPosition = wiring.db.prepare(
+        'UPDATE applied_boundary SET up_to_receive_seq = NULL WHERE market = ? AND stream = ?',
+      );
+      const stampedAt = nowMs();
+      wiring.inTransaction(() => {
+        for (const legacy of legacyBoards) {
+          rollbackPosition.run(legacy.market, legacy.stream);
+          anchorStatement.run(legacy.market, legacy.stream, null, stampedAt);
+        }
+      });
+      const changed = legacyBoards.filter((legacy) => legacy.up_to_receive_seq !== null);
+      if (changed.length > 0) {
+        try {
+          onDiagnostic({
+            market,
+            stream,
+            reason:
+              'board anchor rebuilt: this store predates the board-side anchor, so its recorded applied position was not copied (it could not be checked against the board); the position was reset to "nothing applied yet" and a replacement must re-anchor',
+          });
+        } catch {
+          // best-effort
+        }
+      }
+    }
+  }
+
   const board = createBoard();
 
   // The board comes back from the store, not from a caller's memory, and it comes back together with
@@ -249,6 +331,31 @@ function openBookWithin(options, wiring) {
        FROM applied_boundary WHERE market = ? AND stream = ?`,
     )
     .get(market, stream);
+
+  // A-1: compare the board's own anchor against the applied boundary record before anything is trusted.
+  // The two are written in one transaction, so a disagreement is a contract violation (§9.4(1)): either
+  // side leading the other is refused, not only the direction that would lose data - a store that drifted
+  // at all is a store whose transaction discipline was broken, and there is no safe way to guess which
+  // side is right. A board missing from one and not the other is refused the same way: one side absent
+  // means the pair can no longer be compared, and guessing in either direction is how the loss happens.
+  const anchorRow = wiring.db
+    .prepare('SELECT up_to_receive_seq FROM board_anchor WHERE market = ? AND stream = ?')
+    .get(market, stream);
+  {
+    const boundaryPresent = row !== undefined;
+    const anchorPresent = anchorRow !== undefined;
+    const boundaryUpTo = boundaryPresent ? (row.up_to_receive_seq ?? null) : null;
+    const anchorUpTo = anchorPresent ? (anchorRow.up_to_receive_seq ?? null) : null;
+    if (boundaryPresent !== anchorPresent || boundaryUpTo !== anchorUpTo) {
+      const detail =
+        boundaryPresent && !anchorPresent
+          ? 'the applied boundary record exists but its board-side anchor does not: the record may lead the board'
+          : anchorPresent && !boundaryPresent
+            ? 'the board-side anchor exists but the applied boundary record does not'
+            : `the board-side anchor is at up_to_receive_seq=${anchorUpTo === null ? 'null' : anchorUpTo} while the applied boundary record is at ${boundaryUpTo === null ? 'null' : boundaryUpTo}; written in one transaction, the two may not disagree`;
+      refuse(detail);
+    }
+  }
 
   let applied = row
     ? {
@@ -407,6 +514,9 @@ function openBookWithin(options, wiring) {
         next.firstSeq ?? null,
         nowMs(),
       );
+      // The board's own anchor moves with the boundary in this same transaction (§9.4(1)): a position
+      // remembered on only one side is exactly the drift the startup comparison exists to catch.
+      anchorStatement.run(market, stream, next.upToSeq ?? null, nowMs());
     });
     // Only after the commit does the in-memory book follow the store.
     if (retiring) retiredRuns.add(retiredKey);
@@ -545,6 +655,7 @@ function openBookWithin(options, wiring) {
         next.firstSeq ?? null,
         nowMs(),
       );
+      anchorStatement.run(market, stream, next.upToSeq ?? null, nowMs());
     });
     // Only after the commit does the in-memory board follow the store.
     for (const change of frame.changes) board.apply(change);
@@ -571,6 +682,7 @@ function openBookWithin(options, wiring) {
         next.firstSeq ?? null,
         nowMs(),
       );
+      anchorStatement.run(market, stream, next.upToSeq ?? null, nowMs());
       clearMissingRecordStatement.run(market, stream, next.connectionId);
     });
     // Only after the commit does the in-memory board follow the store.
