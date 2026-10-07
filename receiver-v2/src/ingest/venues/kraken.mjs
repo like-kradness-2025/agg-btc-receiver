@@ -28,6 +28,18 @@
 
 const IGNORED_EVENTS = new Set(['systemStatus', 'heartbeat', 'pong', 'ping']);
 
+function normalizeSubscriptionSymbols(value) {
+  if (typeof value === 'string' && value.length > 0) return [value];
+  if (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((symbol) => typeof symbol === 'string' && symbol.length > 0)
+  ) {
+    return value;
+  }
+  return null;
+}
+
 /**
  * The CRC32 Kraken's rule ends in, over the zlib polynomial (0xEDB88320), reflected, init and final
  * xor all-ones - the same function `zlib.crc32` gives. The table is built once per process.
@@ -109,6 +121,30 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
     } catch {
       return null;
     }
+    if (!Array.isArray(data) && data?.channel === 'book') {
+      if (data.type !== 'snapshot' && data.type !== 'update') return { checksum: null, snapshot: false, levels: [] };
+      const rows = Array.isArray(data.data) ? data.data : [];
+      const levels = [];
+      let checksum = null;
+      for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        if (row.symbol !== symbol) continue;
+        if (row.checksum != null && checksum === null) checksum = String(row.checksum);
+        for (const [side, name] of [['bid', 'bids'], ['ask', 'asks']]) {
+          for (const level of Array.isArray(row[name]) ? row[name] : []) {
+            if (!level || typeof level !== 'object') continue;
+            const price = String(level.price ?? '');
+            const qty = String(level.qty ?? '');
+            if (price !== '' && qty !== '') levels.push({ side, price, qty });
+          }
+        }
+      }
+      return {
+        checksum,
+        snapshot: data.type === 'snapshot',
+        levels,
+      };
+    }
     const payloads = Array.isArray(data)
       ? channelOf(data).payloads
       : data && typeof data === 'object' && (data.as || data.bs || data.a || data.b)
@@ -189,7 +225,7 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
   }
 
   return {
-    url: url ?? 'wss://ws.kraken.com',
+    url: url ?? 'wss://ws.kraken.com/v2',
     stream,
 
     // The proof this venue can give: a CRC32 over the top of the book, not a sequence. Declared here
@@ -203,8 +239,8 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
     expectedSubscriptions: () => [`book:${symbol}`, `trade:${symbol}`],
 
     subscribeMessages: () => [
-      JSON.stringify({ event: 'subscribe', pair: [symbol], subscription: { name: 'book', depth: bookDepth } }),
-      JSON.stringify({ event: 'subscribe', pair: [symbol], subscription: { name: 'trade' } }),
+      JSON.stringify({ method: 'subscribe', params: { channel: 'book', depth: bookDepth, symbol: [symbol], snapshot: true } }),
+      JSON.stringify({ method: 'subscribe', params: { channel: 'trade', symbol: [symbol], snapshot: true } }),
     ],
 
     // Kraken sends its own heartbeats; there is nothing for us to send, and inventing a ping the
@@ -231,12 +267,23 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
       }
 
       if (!Array.isArray(data)) {
+        if (data.method === 'subscribe') {
+          const result = data.result ?? data;
+          const params = data.params ?? {};
+          const channel = result.channel ?? params.channel ?? 'unknown';
+          const symbols = normalizeSubscriptionSymbols(result.symbol ?? params.symbol);
+          if (symbols === null) return null;
+          const key = `${channel}:${symbols.join(',')}`;
+          const success = result.success ?? data.success;
+          const ok = success === true;
+          return { kind: 'subscription', key, ok, detail: result.error ?? data.error ?? '' };
+        }
         if (data.event === 'subscriptionStatus') {
           const ok = data.status === 'subscribed';
           const key = `${data.subscription?.name ?? 'unknown'}:${(data.pair ?? []).join(',') || '*'}`;
           return { kind: 'subscription', key, ok, detail: data.errorMessage ?? data.status ?? '' };
         }
-        if (data.event === 'error') {
+        if (data.event === 'error' || data.success === false) {
           // An error frame is reported as a failed subscription rather than dropped: it is the venue
           // saying something went wrong, and that has to leave a trace.
           return {
@@ -246,7 +293,10 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
             detail: data.errorMessage ?? JSON.stringify(data),
           };
         }
-        if (IGNORED_EVENTS.has(data.event)) return { kind: 'heartbeat', answered: data.event === 'pong' };
+        if (data.channel === 'heartbeat' || IGNORED_EVENTS.has(data.event)) {
+          return { kind: 'heartbeat', answered: data.event === 'pong' };
+        }
+        if (data.channel === 'book' || data.channel === 'trade') return { kind: 'data' };
         const hasBook = Boolean(data.as || data.bs || data.a || data.b);
         if (hasBook) return { kind: 'data' };
         return null;
@@ -276,6 +326,20 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
         data = JSON.parse(text);
       } catch {
         return { replace: false, changes: [] };
+      }
+      if (!Array.isArray(data) && data?.channel === 'book') {
+        const changes = [];
+        for (const row of Array.isArray(data.data) ? data.data : []) {
+          if (row?.symbol !== symbol) continue;
+          for (const [side, name] of [['bid', 'bids'], ['ask', 'asks']]) {
+            for (const level of Array.isArray(row?.[name]) ? row[name] : []) {
+              const price = Number(level?.price);
+              const size = Number(level?.qty);
+              if (Number.isFinite(price) && Number.isFinite(size)) changes.push({ side, price, size });
+            }
+          }
+        }
+        return data.type === 'snapshot' ? { replace: true, levels: changes } : { replace: false, changes };
       }
       const payloads = Array.isArray(data) ? channelOf(data).payloads : [data];
       let snapshot = false;

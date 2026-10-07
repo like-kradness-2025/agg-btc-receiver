@@ -26,11 +26,24 @@ import { readFileSync } from 'node:fs';
 
 import { createKrakenAdapter } from '../ingest/venues/kraken.mjs';
 import { createBitfinexAdapter } from '../ingest/venues/bitfinex.mjs';
+import { createBinanceSpotAdapter, createBinanceFuturesAdapter, createBinanceCoinMFuturesAdapter } from '../ingest/venues/binance-spot.mjs';
+import { createBybitPerpAdapter, createBybitSpotAdapter } from '../ingest/venues/bybit.mjs';
+import { createOkxPerpAdapter, createOkxSpotAdapter } from '../ingest/venues/okx.mjs';
 
 /** The venues this package can receive from. Adding a venue is adding its adapter here. */
 const ADAPTERS = Object.freeze({
   kraken: createKrakenAdapter,
   bitfinex: createBitfinexAdapter,
+  binance_spot: createBinanceSpotAdapter,
+  binance_spot_usdc: (options) => createBinanceSpotAdapter({ ...options, symbol: options.symbol ?? 'BTCUSDC' }),
+  binance_spot_fdusd: (options) => createBinanceSpotAdapter({ ...options, symbol: options.symbol ?? 'BTCFDUSD' }),
+  binance_perp: createBinanceFuturesAdapter,
+  binance_perp_btcusdc: (options) => createBinanceFuturesAdapter({ ...options, symbol: options.symbol ?? 'BTCUSDC' }),
+  binance_coinm_perp: createBinanceCoinMFuturesAdapter,
+  bybit_perp: createBybitPerpAdapter,
+  bybit_spot: createBybitSpotAdapter,
+  okx_perp: createOkxPerpAdapter,
+  okx_spot: createOkxSpotAdapter,
 });
 
 /**
@@ -42,8 +55,7 @@ const ADAPTERS = Object.freeze({
  * before anything is opened, not a run that records data nobody can trust.
  */
 const DISABLED_VENUES = Object.freeze({
-  bitfinex:
-    'the bitfinex adapter must not be operated (C11): it is not rewritten to the official spec, so it misreads trade snapshots as book data and the trade id as a price',
+  binance_coinm_perp: 'COIN-M is implemented read-only but remains disabled until production admission is verified',
 });
 
 const REQUIRED = Object.freeze(['venue', 'market', 'spoolDir']);
@@ -110,7 +122,6 @@ export function loadConfig(configPath) {
       throw new TypeError(`the config needs a non-empty "${key}"`);
     }
   }
-  const stream = raw.stream ?? 'trades';
   // The three role databases. Named explicitly: each is opened and held by exactly one role process
   // (ruling ⑮), so the deployment - not a naming convention this file invents - says where each goes.
   if (raw.stores === null || typeof raw.stores !== 'object' || Array.isArray(raw.stores)) {
@@ -124,6 +135,7 @@ export function loadConfig(configPath) {
     }
     stores[role] = rolePath;
   }
+  const stream = raw.stream ?? (raw.venue === 'bitfinex' ? 'book' : 'trades');
   if (typeof stream !== 'string' || stream.length === 0) {
     throw new TypeError('the config\'s "stream" must be a non-empty string');
   }
@@ -173,6 +185,7 @@ export function loadConfig(configPath) {
     // defaults to tBTCUSD. A url is optional and defaults inside the adapter.
     symbol: typeof raw.symbol === 'string' && raw.symbol.length > 0 ? raw.symbol : undefined,
     url: typeof raw.url === 'string' && raw.url.length > 0 ? raw.url : undefined,
+    restUrl: typeof raw.restUrl === 'string' && raw.restUrl.length > 0 ? raw.restUrl : undefined,
   });
 }
 
@@ -185,13 +198,15 @@ export function adapterFor(config) {
   const options = { market: config.market };
   if (config.symbol !== undefined) options.symbol = config.symbol;
   if (config.url !== undefined) options.url = config.url;
+  if (config.restUrl !== undefined) options.restUrl = config.restUrl;
   const adapter = build(options);
   // A structure that organizes one stream while its adapter carries another can only produce frames the
   // board refuses - after they have been written to the raw. Refuse here, before anything is opened.
   if (adapter.stream !== config.stream) {
-    throw new Error(
-      `the ${config.venue} adapter carries the ${adapter.stream} stream, but the config names ${config.stream}`,
-    );
+    const detail = config.venue === 'bitfinex'
+      ? 'not supported: Bitfinex is book-only; the configured stream must be book'
+      : `the ${config.venue} adapter carries the ${adapter.stream} stream, but the config names ${config.stream}`;
+    throw new Error(detail);
   }
   return adapter;
 }

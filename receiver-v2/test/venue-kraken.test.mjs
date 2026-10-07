@@ -5,20 +5,77 @@ import { createKrakenAdapter } from '../src/ingest/venues/kraken.mjs';
 
 const adapter = createKrakenAdapter({ market: 'kraken_spot', symbol: 'XBT/USD' });
 
-test('the subscribe payloads are the ones the working connector sends', () => {
+const KRAKEN_V2_BOOK_SUBSCRIPTION_ACK = {
+  method: 'subscribe',
+  result: { channel: 'book', depth: 10, snapshot: true, symbol: 'BTC/USD' },
+  success: true,
+  time_in: '2026-10-07T00:00:00.000000Z',
+  time_out: '2026-10-07T00:00:00.001000Z',
+};
+
+const KRAKEN_V2_TRADE_SUBSCRIPTION_ACK = {
+  method: 'subscribe',
+  result: { channel: 'trade', symbol: 'BTC/USD' },
+  success: true,
+  time_in: '2026-10-07T00:00:00.000000Z',
+  time_out: '2026-10-07T00:00:00.001000Z',
+};
+
+test('Kraken v2 string-symbol subscription acknowledgements parse as successful subscriptions', () => {
+  assert.deepEqual(adapter.parse(JSON.stringify(KRAKEN_V2_BOOK_SUBSCRIPTION_ACK)), {
+    kind: 'subscription',
+    key: 'book:BTC/USD',
+    ok: true,
+    detail: '',
+  });
+  assert.deepEqual(adapter.parse(JSON.stringify(KRAKEN_V2_TRADE_SUBSCRIPTION_ACK)), {
+    kind: 'subscription',
+    key: 'trade:BTC/USD',
+    ok: true,
+    detail: '',
+  });
+});
+
+test('Kraken v2 malformed subscription symbol shapes fail closed', () => {
+  for (const symbol of [{ value: 'BTC/USD' }, ['BTC/USD', 42], 42, null]) {
+    const frame = {
+      method: 'subscribe',
+      result: { channel: 'book', symbol },
+      success: true,
+    };
+    assert.equal(adapter.parse(JSON.stringify(frame)), null, `invalid symbol shape: ${JSON.stringify(symbol)}`);
+  }
+});
+
+test('Kraken Spot v2 uses the v2 endpoint, method/params subscriptions, and v2 acknowledgements', () => {
+  assert.equal(adapter.url, 'wss://ws.kraken.com/v2');
+  const messages = adapter.subscribeMessages().map((message) => JSON.parse(message));
+  assert.deepEqual(messages, [
+    { method: 'subscribe', params: { channel: 'book', depth: 1000, symbol: ['XBT/USD'], snapshot: true } },
+    { method: 'subscribe', params: { channel: 'trade', symbol: ['XBT/USD'], snapshot: true } },
+  ]);
+  assert.deepEqual(
+    adapter.parse(JSON.stringify({ method: 'subscribe', result: { channel: 'book', symbol: ['XBT/USD'], success: true } })),
+    { kind: 'subscription', key: 'book:XBT/USD', ok: true, detail: '' },
+  );
+  assert.deepEqual(
+    adapter.parse(JSON.stringify({ method: 'subscribe', result: { channel: 'trade', symbol: ['XBT/USD'], success: true } })),
+    { kind: 'subscription', key: 'trade:XBT/USD', ok: true, detail: '' },
+  );
+});
+
+test('the v2 subscribe payloads and endpoint are explicit', () => {
   const messages = adapter.subscribeMessages().map((message) => JSON.parse(message));
   assert.deepEqual(messages[0], {
-    event: 'subscribe',
-    pair: ['XBT/USD'],
-    subscription: { name: 'book', depth: 1000 },
+    method: 'subscribe',
+    params: { channel: 'book', depth: 1000, symbol: ['XBT/USD'], snapshot: true },
   });
   assert.deepEqual(messages[1], {
-    event: 'subscribe',
-    pair: ['XBT/USD'],
-    subscription: { name: 'trade' },
+    method: 'subscribe',
+    params: { channel: 'trade', symbol: ['XBT/USD'], snapshot: true },
   });
   assert.equal(adapter.heartbeatMessage(), null, 'Kraken sends its own heartbeats');
-  assert.equal(adapter.url, 'wss://ws.kraken.com');
+  assert.equal(adapter.url, 'wss://ws.kraken.com/v2');
 });
 
 test('liveness frames are recognised as liveness, not as data', () => {
@@ -48,12 +105,46 @@ test('a subscription is only agreed when the venue says so', () => {
   assert.match(error.detail, /bad pair/);
 });
 
-test('book and trade array frames are data', () => {
-  const bookFrame = [1234, { b: [['49999.0', '1.5', '1.0']], a: [], c: '1234567' }, 'book-1000', 'XBT/USD'];
-  assert.equal(adapter.parse(JSON.stringify(bookFrame)).kind, 'data');
-  const tradeFrame = [0, [['50000.0', '1.0', '1234.5', 'b', 'm', '']], 'trade', 'XBT/USD'];
-  assert.equal(adapter.parse(JSON.stringify(tradeFrame)).kind, 'data');
+test('v2 book snapshot/update and trade frames are classified and translated without trade leakage', () => {
+  const snapshot = {
+    channel: 'book',
+    type: 'snapshot',
+    data: [{
+      symbol: 'XBT/USD',
+      bids: [{ price: '101.0', qty: '2.0' }],
+      asks: [{ price: '103.0', qty: '1.0' }],
+      checksum: 'ignored-by-changes',
+    }],
+  };
+  assert.deepEqual(adapter.parse(JSON.stringify(snapshot)), { kind: 'data' });
+  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(JSON.stringify(snapshot)) }), {
+    replace: true,
+    levels: [
+      { side: 'bid', price: 101, size: 2 },
+      { side: 'ask', price: 103, size: 1 },
+    ],
+  });
+
+  const update = {
+    channel: 'book',
+    type: 'update',
+    data: [{ symbol: 'XBT/USD', bids: [{ price: '101.0', qty: '0' }], asks: [] }],
+  };
+  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(JSON.stringify(update)) }), {
+    replace: false,
+    changes: [{ side: 'bid', price: 101, size: 0 }],
+  });
+
+  const trade = {
+    channel: 'trade',
+    type: 'update',
+    data: [{ symbol: 'XBT/USD', trades: [{ price: '102.0', qty: '0.5', side: 'buy' }] }],
+  };
+  assert.deepEqual(adapter.parse(JSON.stringify(trade)), { kind: 'data' });
+  assert.deepEqual(adapter.changesFor({ raw: Buffer.from(JSON.stringify(trade)) }), { replace: false, changes: [] });
 });
+
+
 
 test('an unparsable frame is reported rather than guessed at', () => {
   assert.equal(adapter.parse('not json at all'), null);
@@ -165,6 +256,58 @@ const officialSnapshot = (checksum) => [
   'XBT/USD',
 ];
 
+test('v2 book frames for another symbol or without a valid type fail closed', () => {
+  const wrongSymbol = {
+    channel: 'book',
+    type: 'snapshot',
+    data: [{
+      symbol: 'ETH/USD',
+      bids: [{ price: '101.0', qty: '2.0' }],
+      asks: [],
+      checksum: String(checksumOf({ bids: [['101.0', '2.0']], asks: [] })),
+    }],
+  };
+  assert.equal(freshKraken().connects({ current: envelopeOf(wrongSymbol) }), false);
+
+  const missingType = {
+    channel: 'book',
+    data: [{
+      symbol: 'XBT/USD',
+      bids: [{ price: '101.0', qty: '2.0' }],
+      asks: [],
+      checksum: String(checksumOf({ bids: [['101.0', '2.0']], asks: [] })),
+    }],
+  };
+  assert.equal(freshKraken().connects({ current: envelopeOf(missingType) }), false);
+});
+test('v2 book checksums gate snapshot and update state', () => {
+  const rule = freshKraken();
+  const snapshot = {
+    channel: 'book',
+    type: 'snapshot',
+    data: [{
+      symbol: 'XBT/USD',
+      bids: [{ price: '101.0', qty: '2.0' }, { price: '100.0', qty: '1.0' }],
+      asks: [{ price: '103.0', qty: '1.0' }],
+      checksum: String(checksumOf({ bids: [['101.0', '2.0'], ['100.0', '1.0']], asks: [['103.0', '1.0']] })),
+    }],
+  };
+  assert.equal(rule.connects({ current: envelopeOf(snapshot) }), true);
+
+  const update = {
+    channel: 'book',
+    type: 'update',
+    data: [{
+      symbol: 'XBT/USD',
+      bids: [{ price: '102.0', qty: '3.0' }],
+      asks: [],
+      checksum: String(checksumOf({ bids: [['102.0', '3.0'], ['101.0', '2.0'], ['100.0', '1.0']], asks: [['103.0', '1.0']] })),
+    }],
+  };
+  assert.equal(rule.connects({ current: envelopeOf(update) }), true);
+  update.data[0].checksum = String(Number(update.data[0].checksum) + 1);
+  assert.equal(rule.connects({ current: envelopeOf(update) }), false, 'a wrong checksum refuses the update');
+});
 test('the official fixed example checksums through the adapter rule', () => {
   assert.equal(adapter.boundary, 'checksum', 'the venue declares the proof it can give');
   assert.equal(typeof adapter.connects, 'function', 'and brings the rule that decides it');

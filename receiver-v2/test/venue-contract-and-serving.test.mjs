@@ -37,6 +37,7 @@ import { createStructure } from '../src/supervisor/structure.mjs';
 const kraken = createKrakenAdapter({ market: 'kraken_spot', symbol: 'XBT/USD' });
 const bitfinex = createBitfinexAdapter({ market: 'bitfinex_spot', symbol: 'tBTCUSD' });
 const krakenPayload = (frame) => ({ raw: Buffer.from(JSON.stringify(frame)) });
+bitfinex.parse(JSON.stringify({ event: 'subscribed', channel: 'book', symbol: 'tBTCUSD', chanId: 42 }));
 
 // The rule's own formatting and CRC32, reimplemented here so the checksums are the test's own oracle
 // and never produced by the adapter under test.

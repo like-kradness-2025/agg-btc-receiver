@@ -135,6 +135,8 @@ export function createReceiveConnection({
   let expectedKeys = null;
   let ackTimer = null;
   let subscriptionFailure = null;
+  let preparationPending = false;
+  let preparationFrames = [];
   let lastHeardMs = 0;
   let silentTimer = null;
   let stabilityTimer = null;
@@ -147,6 +149,7 @@ export function createReceiveConnection({
   let attempts = 0;
   let closed = false;
   let state = 'idle';
+  let maintenancePaused = false;
   const subscriptions = new Map();
 
   /**
@@ -372,6 +375,13 @@ export function createReceiveConnection({
     if (!parsed) return;
 
     if (parsed.kind === 'heartbeat') {
+      if (typeof adapter.acceptDepthEvent === 'function' && parsed.seq !== undefined) {
+        const accepted = adapter.acceptDepthEvent(raw);
+        if (accepted?.status === 'resync' || accepted?.status === 'malformed') {
+          replaceSocket('venue sequence/checksum failure');
+          return;
+        }
+      }
       if (parsed.answered) onDiagnostic({ market, generation, reason: 'heartbeat answered' });
       return;
     }
@@ -404,7 +414,49 @@ export function createReceiveConnection({
       replaceSocket('venue-shutdown');
       return;
     }
+    if (parsed.kind === 'maintenance') {
+      maintenancePaused = parsed.resume !== true;
+      onDiagnostic({ market, generation, reason: parsed.resume ? 'venue maintenance ended' : 'venue entered maintenance', detail: parsed.detail ?? '' });
+      if (parsed.resume) {
+        for (const message of adapter.subscribeMessages?.() ?? []) socket?.send?.(message);
+      }
+      setState(parsed.resume ? 'subscribed' : 'maintenance', parsed.detail ?? '');
+      return;
+    }
+    if (parsed.kind === 'protocol-error') {
+      onDiagnostic({ market, generation, reason: `venue protocol error: ${parsed.reason ?? 'unknown'}` });
+      replaceSocket('venue-protocol-error');
+      return;
+    }
+    // A connection may carry valid non-book data alongside a depth stream (for example Binance's
+    // combined trade + depth URL). It is valid stream data, but it is not an input to the adapter's
+    // depth sequence/checksum verifier. Forwarding it there turns an unrelated trade into a false
+    // sequence failure; depth frames still take the verifier below.
+    if (parsed.kind === 'data' && ackMode === 'first-data' && subscriptionState !== ACKNOWLEDGED) {
+      clearAckTimer();
+      subscriptionFailure = null;
+      subscriptionState = ACKNOWLEDGED;
+      publishSubscriptionState('the first data frame established the stream');
+    }
+    if (parsed.kind === 'data' && parsed.trade === true) return;
+    if (parsed.kind === 'data' || parsed.kind === 'checksum') {
+      if (typeof adapter.acceptDepthEvent === 'function') {
+        const accepted = adapter.acceptDepthEvent(raw);
+        if (accepted?.status === 'resync' || accepted?.status === 'malformed') {
+          replaceSocket('venue sequence/checksum failure');
+          return;
+        }
+        if (parsed.kind === 'checksum') {
+          for (const released of accepted?.released ?? []) onEnvelope(stamp(released, atMs, atNs));
+          return;
+        }
+        if (accepted?.status !== 'applied') return;
+        for (const released of accepted?.released ?? []) onEnvelope(stamp(released, atMs, atNs));
+        if (accepted?.released) return;
+      }
+    }
     if (parsed.kind === 'data') {
+      if (maintenancePaused) return;
       // C3 first-data: a venue that never answers is established by the first frame of the stream itself.
       // Only a data frame establishes it - a heartbeat or a subscription event does not.
       if (ackMode === 'first-data' && subscriptionState !== ACKNOWLEDGED) {
@@ -560,6 +612,8 @@ export function createReceiveConnection({
     clearStabilityTimer();
     clearAckTimer();
     clearKeepAliveTimers();
+    preparationPending = false;
+    preparationFrames = [];
     keepAlivePlan = null;
     if (!socket) return;
     const dying = socket;
@@ -630,12 +684,7 @@ export function createReceiveConnection({
         next.onopen = () => {
         if (socket !== next) return;
         const fromGeneration = generation;
-        onEvent('open', () => {
-          // Checked again where the work runs: a socket that was replaced while this announcement
-          // waited is not receiving any more, and subscribing on it would talk to a connection that
-          // is already gone.
-          if (closed || socket !== next || generation !== fromGeneration) return;
-          noteHeard();
+        const finishOpen = () => {
           setState('subscribing');
           const subscribeMessages = adapter.subscribeMessages?.() ?? [];
           for (const message of subscribeMessages) next.send(message);
@@ -649,9 +698,58 @@ export function createReceiveConnection({
           expectedKeys = expectedKeysOf();
           if (ackMode === 'first-data' || subscribeMessages.length > 0) armAckDeadline();
           armStabilityTimer();
-        });
+        };
+        const openWork = () => {
+          // Checked again where the work runs: a socket that was replaced while this announcement
+          // waited is not receiving any more, and subscribing on it would talk to a connection that
+          // is already gone.
+          if (closed || socket !== next || generation !== fromGeneration) return;
+          noteHeard();
+          if (typeof adapter.onConnectionOpen !== 'function') {
+            setState('subscribing');
+            return finishOpen();
+          }
+          preparationPending = true;
+          preparationFrames = [];
+          let prepared;
+          try {
+            prepared = adapter.onConnectionOpen({ connectionId, generation, socket: next });
+          } catch (error) {
+            onDiagnostic({ market, generation, reason: `adapter connection preparation failed: ${error.message}` });
+            replaceSocket('adapter preparation failed');
+            return;
+          }
+          if (prepared && typeof prepared.then === 'function') {
+            return prepared.then(
+              () => {
+                if (closed || socket !== next || generation !== fromGeneration) return;
+                preparationPending = false;
+                finishOpen();
+                const pending = preparationFrames;
+                preparationFrames = [];
+                for (const frame of pending) {
+                  // A replayed frame may itself replace the socket (for example, a Binance depth gap).
+                  // Once that happens, the remainder belongs to the abandoned generation and must not
+                  // be stamped or interpreted by the replacement.
+                  if (closed || socket !== next || generation !== fromGeneration || state === 'stopped' || state === 'refused') return;
+                  handleMessage(frame.raw, frame.atMs, frame.atNs);
+                }
+              },
+              (error) => {
+                if (closed || socket !== next || generation !== fromGeneration) return;
+                onDiagnostic({ market, generation, reason: `adapter connection preparation failed: ${error.message}` });
+                preparationPending = false;
+                preparationFrames = [];
+                replaceSocket('adapter preparation failed');
+              },
+            );
+          }
+          preparationPending = false;
+          finishOpen();
+        };
+        onEvent('open', openWork);
       };
-      next.onmessage = (event) => {
+      const handleSocketMessage = (event) => {
         if (socket !== next) return; // a frame from a socket we have already abandoned
         const payload = event?.data ?? event;
         // The arrival is copied and timed here, where it arrives: what the work does later must not change
@@ -660,6 +758,14 @@ export function createReceiveConnection({
         const atMs = wallClockMs();
         const atNs = monotonicNs();
         const fromGeneration = generation;
+        if (preparationPending) {
+          // REST preparation can be slower than the silence deadline. The frame is still buffered and
+          // must not reach the stream before synchronization, but its arrival proves the socket is alive.
+          noteHeard();
+          adapter.bufferDuringPreparation?.(raw);
+          preparationFrames.push({ raw, atMs, atNs });
+          return;
+        }
         onEvent('message', () => {
           // Checked here again, at the moment the work runs: while this arrival waited its turn the
           // socket may have been replaced, and a frame of an older generation must not be stamped as
@@ -668,6 +774,7 @@ export function createReceiveConnection({
           handleMessage(raw, atMs, atNs);
         });
       };
+      next.onmessage = handleSocketMessage;
       next.onerror = (error) => {
         if (socket !== next) return;
         const fromGeneration = generation;

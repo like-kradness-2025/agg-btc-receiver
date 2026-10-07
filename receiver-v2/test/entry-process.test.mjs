@@ -210,6 +210,17 @@ test('a config that asks for a raw file is refused, and no raw file is written',
   });
 });
 
+test('a config that names bitfinex is accepted only for its board stream', async () => {
+  await withDir(async (dir) => {
+    const { path } = writeConfig(dir, { venue: 'bitfinex', market: 'bitfinex_spot', stream: 'book', symbol: 'tBTCUSD' });
+    const config = loadConfig(path);
+    assert.equal(config.stream, 'book');
+    const adapter = adapterFor(config);
+    assert.equal(adapter.stream, 'book');
+    assert.equal(adapter.boundary, 'sequence');
+  });
+});
+
 test('a startup deadline outside the allowed range is refused before anything is opened', async () => {
   await withDir(async (dir) => {
     for (const bad of [0, -1, 1.5, 3_600_001, '60000']) {
