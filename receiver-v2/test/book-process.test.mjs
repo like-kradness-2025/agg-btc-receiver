@@ -571,7 +571,6 @@ test('the book owns its tables: the store has no organize table and no received_
     }
     for (const foreign of [
       'run_marker',
-      'pending_boundary',
       'suspected_gap',
       'organized_watermark',
       'organize_gap',

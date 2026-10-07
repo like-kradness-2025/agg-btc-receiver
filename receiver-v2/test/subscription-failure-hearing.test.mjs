@@ -182,17 +182,23 @@ function runChild(configPath) {
 test('the process reports its reason before exiting, and start is not establishment', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'subrefine-proc-'));
   try {
+    // A run that cannot start leaves its reason behind. The spool path is a regular file, so ingest
+    // cannot come up; three role stores are named explicitly (§5.8 ruling ⑭). `receiver: started` is
+    // never printed - process start means the startup sequence completed, which is not what happened.
+    const spoolAsFile = join(dir, 'spool-is-a-file');
+    writeFileSync(spoolAsFile, 'not a directory');
     const config = {
       venue: 'kraken',
       market: 'kraken_spot',
       stream: 'trades',
       symbol: 'XBT/USD',
-      database: join(dir, 'state.sqlite'),
-      spoolDir: join(dir, 'spool'),
+      stores: {
+        ingest: join(dir, 'ingest.sqlite'),
+        organize: join(dir, 'organize.sqlite'),
+        book: join(dir, 'book.sqlite'),
+      },
+      spoolDir: spoolAsFile,
       url: UNREACHABLE,
-      // The venue is unreachable, so the run can only end at its deadline; the smallest allowed one keeps
-      // the test fast.
-      startupDeadlineMs: 1000,
     };
     const path = join(dir, 'receiver.config.json');
     writeFileSync(path, JSON.stringify(config, null, 2));
@@ -201,14 +207,14 @@ test('the process reports its reason before exiting, and start is not establishm
     const { code } = await handle.exited;
 
     assert.equal(code, 1, `the run ended non-zero; stderr=${handle.stderr}`);
-    assert.match(handle.stdout, /receiver: started /, 'the process-start line was printed');
+    assert.match(handle.stderr, /receiver:/, 'the failure reason was written before the exit');
+    assert.match(handle.stderr, /could not start/, 'and it names what went wrong');
     assert.equal(
-      /receiver: established/.test(handle.stdout),
+      /receiver: started /.test(handle.stdout),
       false,
-      'but establishment was never claimed for a venue that never answered',
+      'the process-start line is not printed for a run that never reached reception',
     );
-    assert.match(handle.stderr, /receiver: stopping/, 'the failure reason was written before the exit');
-    assert.match(handle.stderr, /startup deadline/i, 'and it names what went wrong');
+    assert.equal(/receiver: established/.test(handle.stdout), false, 'and establishment was never claimed');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

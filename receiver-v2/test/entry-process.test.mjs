@@ -1,16 +1,13 @@
 /**
- * Set 7: the real process entrance, verified as a real process.
+ * Set 7 / stage 5d: the real process entrance, verified as real processes.
  *
- * The unit tests drive `createSupervisor` directly, with spies for the exit code. What they cannot
- * show is that a *process* gives the answers §5.7 asks for: a config it cannot run ends with code 1 and
- * writes no completion, and a signal stops it once, cleanly, with code 0 and a completion written. These
- * tests start `bin/receiver.mjs` as a child process, drive it with signals, and read the run marker back
- * out of the store it was told to use - so the exit code and the run record are observed where an
- * operator would observe them.
+ * The entrance (`bin/receiver.mjs`) is now the supervisor plus three forked role processes (§5.8
+ * ruling ⑭). These tests start it as a child process, drive it with signals, and read the run marker
+ * back out of *organize's* store (organization writes it) and the board's position out of *the book's*
+ * store - so the exit codes and the run record are observed where an operator would observe them.
  *
- * The venue URL is unreachable on purpose: the point is the process's own lifecycle, not a venue. The
- * entry holds the process open while the run is live, so a socket between reconnects cannot make it exit
- * 0 silently; that is what lets a signal be delivered and observed here.
+ * Signals stop the three role processes and close their stores without writing complete. Tests use a
+ * real local WebSocket venue through Node's production WebSocket, then restart from the same stores.
  */
 
 import { test } from 'node:test';
@@ -22,11 +19,16 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
-import { openDurability } from '../src/durability.mjs';
+import { openOrganizeStore } from '../src/organize/store.mjs';
+import { startVenueServer } from '../test-support/ws-venue-server.mjs';
+import { acquireStoreLock } from '../src/supervisor/store-lock.mjs';
+import { loadConfig, adapterFor } from '../src/entry/config.mjs';
 
 const PACKAGE_DIR = fileURLToPath(new URL('..', import.meta.url));
 const ENTRY = fileURLToPath(new URL('../bin/receiver.mjs', import.meta.url));
 const UNREACHABLE = 'ws://127.0.0.1:1/';
+const MARKET = 'kraken_spot';
+const STREAM = 'trades';
 
 async function withDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'entry-process-'));
@@ -40,10 +42,15 @@ async function withDir(fn) {
 function writeConfig(dir, overrides = {}) {
   const config = {
     venue: 'kraken',
-    market: 'kraken_spot',
-    stream: 'trades',
+    market: MARKET,
+    stream: STREAM,
     symbol: 'XBT/USD',
-    database: join(dir, 'state.sqlite'),
+    // Three role databases, one file per role, named explicitly (§5.8 ruling ⑮).
+    stores: {
+      ingest: join(dir, 'ingest.sqlite'),
+      organize: join(dir, 'organize.sqlite'),
+      book: join(dir, 'book.sqlite'),
+    },
     spoolDir: join(dir, 'spool'),
     url: UNREACHABLE,
     ...overrides,
@@ -53,8 +60,8 @@ function writeConfig(dir, overrides = {}) {
   return { path, config };
 }
 
-function startChild(configPath) {
-  const child = spawn(process.execPath, [ENTRY, '--config', configPath], {
+function startChild(configPath, extraArgs = []) {
+  const child = spawn(process.execPath, [ENTRY, '--config', configPath, ...extraArgs], {
     cwd: PACKAGE_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -79,8 +86,8 @@ function startChild(configPath) {
   };
 }
 
-/** Resolve once the child has printed its readiness line; reject if it exits first or never does. */
-function waitForReady(handle, marker = 'receiver: started', timeoutMs = 15_000) {
+/** Resolve once the child has printed a marker line; reject if it exits first or never does. */
+function waitForStdout(handle, marker, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`timed out waiting for "${marker}"; stdout=${handle.stdout}`)), timeoutMs);
     const check = () => {
@@ -92,33 +99,79 @@ function waitForReady(handle, marker = 'receiver: started', timeoutMs = 15_000) 
     handle.child.stdout.on('data', check);
     handle.exited.then(({ code, signal }) => {
       clearTimeout(timer);
-      reject(new Error(`the child exited before readiness (code=${code}, signal=${signal}); stdout=${handle.stdout} stderr=${handle.stderr}`));
+      reject(new Error(`the child exited before "${marker}" (code=${code}, signal=${signal}); stdout=${handle.stdout} stderr=${handle.stderr}`));
     });
     check();
   });
 }
 
-function completionOf(dbPath) {
-  const reader = openDurability({ path: dbPath, runId: 'test-reader' });
-  try {
-    return reader.lastCompleteRun();
-  } finally {
-    reader.close();
+async function until(predicate, { timeoutMs = 20_000, stepMs = 20, label = 'the condition' } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() >= deadline) throw new Error(`timed out (${timeoutMs} ms) waiting for ${label}`);
+    await new Promise((done) => setTimeout(done, stepMs));
   }
 }
 
-test('a config whose store cannot be opened ends the process with code 1 and leaves no completion', async () => {
-  await withDir(async (dir) => {
-    // The database's parent directory does not exist: SQLite cannot open it, so the run cannot begin.
-    const missing = join(dir, 'missing-parent');
-    const { path, config } = writeConfig(dir, { database: join(missing, 'state.sqlite') });
-    const handle = startChild(path);
-    const { code } = await handle.exited;
+function waitForExitOrTimeout(handle, timeoutMs, label) {
+  let timer;
+  return Promise.race([
+    handle.exited,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
 
-    assert.equal(code, 1, `the process ended non-zero; stderr=${handle.stderr}`);
-    assert.equal(existsSync(config.database), false, 'the store was never created, so no completion can exist');
-  });
-});
+/** Read the organize store's marker for one run. */
+function markerState(organizePath, runId) {
+  const store = openOrganizeStore({ path: organizePath, runId: `${runId}-reader` });
+  try {
+    return store.runMarkerState(runId);
+  } finally {
+    store.close();
+  }
+}
+
+/** The book's applied position for this board, read from the book's own store. */
+function bookApplied(bookPath) {
+  if (!existsSync(bookPath)) return null;
+  const db = new DatabaseSync(bookPath);
+  try {
+    const row = db
+      .prepare('SELECT up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?')
+      .get(MARKET, STREAM);
+    return row ? row.up_to_receive_seq ?? null : null;
+  } finally {
+    db.close();
+  }
+}
+
+/** A live venue: the child processes connect to it through Node's global WebSocket. */
+async function runWithVenue(dir, fn) {
+  const venue = await startVenueServer();
+  const { path, config } = writeConfig(dir, { url: `ws://127.0.0.1:${venue.port}/` });
+  const handle = startChild(path);
+  try {
+    return await fn({ venue, handle, config, configPath: path });
+  } finally {
+    try {
+      handle.child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+    venue.close();
+  }
+}
+
+/** Establish the subscription and drive `count` frames into the book, proven through the book store. */
+async function serve(venue, config, handle, count) {
+  await until(() => venue.connected, { label: 'the venue socket to be opened' });
+  await waitForStdout(handle, 'receiver: established', 20_000);
+  for (let seq = 1; seq <= count; seq += 1) venue.sendFrame(seq);
+  await until(() => bookApplied(config.stores.book) === count, { label: 'the board to serve every frame' });
+}
 
 test('a config that cannot be read ends the process with code 1', async () => {
   await withDir(async (dir) => {
@@ -129,10 +182,23 @@ test('a config that cannot be read ends the process with code 1', async () => {
   });
 });
 
+test('the command line accepts only --config and its path', async () => {
+  await withDir(async (dir) => {
+    const { path, config } = writeConfig(dir, { startupDeadlineMs: 1_000 });
+    const handle = startChild(path, ['--verbose']);
+    const { code } = await handle.exited;
+
+    assert.equal(code, 1);
+    assert.match(handle.stderr, /usage: receiver\.mjs --config/);
+    assert.doesNotMatch(handle.stdout, /receiver: started/);
+    for (const rolePath of Object.values(config.stores)) {
+      assert.equal(existsSync(rolePath), false, 'arguments are rejected before opening stores');
+    }
+  });
+});
+
 test('a config that asks for a raw file is refused, and no raw file is written', async () => {
   await withDir(async (dir) => {
-    // There is no raw writer in the entrance any more. A `"raw"` key is not silently ignored - it is
-    // refused before anything is opened, so a deployment cannot believe a raw file was saved.
     const rawPath = join(dir, 'raw.log');
     const { path } = writeConfig(dir, { raw: rawPath });
     const handle = startChild(path);
@@ -144,62 +210,6 @@ test('a config that asks for a raw file is refused, and no raw file is written',
   });
 });
 
-test('a startup the structure refuses ends the process with code 1 and writes no completion', async () => {
-  await withDir(async (dir) => {
-    // The spool path is a regular file, so the spool cannot be created. The store *is* opened first and
-    // left behind by the failed construction, so the completion can be checked on a real store.
-    const spoolAsFile = join(dir, 'spool-is-a-file');
-    writeFileSync(spoolAsFile, 'not a directory');
-    const { path, config } = writeConfig(dir, { spoolDir: spoolAsFile });
-
-    const handle = startChild(path);
-    const { code } = await handle.exited;
-
-    assert.equal(code, 1, `the process ended non-zero; stderr=${handle.stderr}`);
-    assert.equal(existsSync(config.database), true, 'the store was opened');
-    assert.equal(completionOf(config.database), null, 'a run that never started writes no completion');
-  });
-});
-
-test('a config that names the disabled bitfinex venue is refused, and no store is created', async () => {
-  await withDir(async (dir) => {
-    // C11: the bitfinex adapter must not be operated until it is rewritten to the official spec. A config
-    // that names it is refused outright, the same way a `"raw"` key is - before anything is opened, so a
-    // deployment cannot be told a run was recorded while the board was fed misread frames.
-    const { path, config } = writeConfig(dir, {
-      venue: 'bitfinex',
-      market: 'bitfinex_spot',
-      symbol: 'tBTCUSD',
-    });
-    const handle = startChild(path);
-    const { code } = await handle.exited;
-
-    assert.equal(code, 1, `a disabled venue is a failed run; stderr=${handle.stderr}`);
-    assert.match(handle.stderr, /bitfinex/, 'the refused venue is named');
-    assert.match(handle.stderr, /not supported|must not be operated/, 'and the reason is stated');
-    assert.equal(existsSync(config.database), false, 'nothing was opened, so no store exists');
-  });
-});
-
-test('a configured startup deadline ends a run that never reaches reception, before the default would', async () => {
-  await withDir(async (dir) => {
-    // §5.7: the 60_000 ms default stays changeable by configuration. The venue URL is unreachable, so the
-    // run can only end at its deadline; a short configured deadline proves the value reached the supervisor
-    // (with the default this child would sit for a minute).
-    const { path } = writeConfig(dir, { startupDeadlineMs: 1000 });
-    const startedAt = Date.now();
-    const handle = startChild(path);
-    const { code } = await handle.exited;
-    const elapsed = Date.now() - startedAt;
-
-    assert.equal(code, 1, `the deadline ended the run non-zero; stderr=${handle.stderr}`);
-    assert.ok(
-      elapsed >= 800 && elapsed < 20_000,
-      `the configured 1000 ms deadline was applied, not the 60 s default (elapsed ${elapsed} ms)`,
-    );
-  });
-});
-
 test('a startup deadline outside the allowed range is refused before anything is opened', async () => {
   await withDir(async (dir) => {
     for (const bad of [0, -1, 1.5, 3_600_001, '60000']) {
@@ -208,99 +218,296 @@ test('a startup deadline outside the allowed range is refused before anything is
       const { code } = await handle.exited;
       assert.equal(code, 1, `"${bad}" is a failed run; stderr=${handle.stderr}`);
       assert.match(handle.stderr, /startupDeadlineMs/, `the refused key is named for "${bad}"`);
-      assert.equal(existsSync(config.database), false, `nothing was opened for "${bad}"`);
+      for (const rolePath of Object.values(config.stores)) {
+        assert.equal(existsSync(rolePath), false, `nothing was opened for "${bad}"`);
+      }
     }
   });
 });
 
-test('SIGTERM stops a live receiver once: exit 0 with the completion written', async () => {
+test('a config whose stores cannot be opened ends the process with code 1 and leaves no completion', async () => {
   await withDir(async (dir) => {
-    const { path, config } = writeConfig(dir);
+    // The parent directory of the role databases does not exist: SQLite cannot open them, so the run
+    // cannot begin. Each store is named explicitly, so all three share the missing parent.
+    const missing = join(dir, 'missing-parent');
+    const { path, config } = writeConfig(dir, {
+      stores: {
+        ingest: join(missing, 'ingest.sqlite'),
+        organize: join(missing, 'organize.sqlite'),
+        book: join(missing, 'book.sqlite'),
+      },
+    });
     const handle = startChild(path);
-    const ready = await waitForReady(handle);
-    // The readiness line carries the run's connection id, whose first field is the run id.
-    const connectionId = ready.split('receiver: started ')[1].trim();
-    const runId = connectionId.split(':')[0];
-    assert.ok(runId.length > 0, 'the run named its connection');
+    const { code } = await handle.exited;
 
-    handle.child.kill('SIGTERM');
-    const { code, signal } = await handle.exited;
-
-    assert.equal(signal, null, 'the process ended on its own, not by the signal default action');
-    assert.equal(code, 0, 'a clean stop is exit code 0');
-    const completion = completionOf(config.database);
-    assert.notEqual(completion, null, 'a clean stop writes the completion');
-    assert.equal(completion.runId, runId, 'and the completion names the run that just stopped');
+    assert.equal(code, 1, `the process ended non-zero; stderr=${handle.stderr}`);
+    assert.equal(existsSync(config.stores.organize), false, 'the organize store was never created, so no completion can exist');
   });
 });
 
-test('a second signal does not stop the run twice: still exit 0 with one completion', async () => {
+test('a startup the structure refuses ends the process with code 1 and writes no completion', async () => {
   await withDir(async (dir) => {
-    const { path, config } = writeConfig(dir);
+    // The spool path is a regular file, so ingest cannot be spawned. Organize and the book come up
+    // first (the startup order), so organize's store is opened and left behind by the failed run.
+    const spoolAsFile = join(dir, 'spool-is-a-file');
+    writeFileSync(spoolAsFile, 'not a directory');
+    const { path, config } = writeConfig(dir, { spoolDir: spoolAsFile });
+
     const handle = startChild(path);
-    const ready = await waitForReady(handle);
-    const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+    const { code } = await handle.exited;
 
-    // Two signals back to back. The first owns the shutdown; the second finds it already under way. The
-    // process must leave with 0 and exactly the one completion the first signal's clean stop writes.
-    handle.child.kill('SIGTERM');
-    handle.child.kill('SIGTERM');
-    const { code, signal } = await handle.exited;
-
-    assert.equal(signal, null, 'the process ended on its own');
-    assert.equal(code, 0, 'a clean stop is exit code 0');
-    const completion = completionOf(config.database);
-    assert.notEqual(completion, null, 'the completion was written');
-    assert.equal(completion.runId, runId, 'and it names the run, so it was written once for this run');
+    assert.equal(code, 1, `the process ended non-zero; stderr=${handle.stderr}`);
+    assert.equal(existsSync(config.stores.organize), true, 'organize store was opened');
+    const rows = (() => {
+      const db = new DatabaseSync(config.stores.organize);
+      try {
+        return db.prepare('SELECT COUNT(*) AS n FROM run_marker WHERE state = ?').get('complete').n;
+      } finally {
+        db.close();
+      }
+    })();
+    assert.equal(rows, 0, 'a run that never started writes no completion');
   });
 });
 
-test('SIGINT is the same orderly shutdown as SIGTERM', async () => {
+test('an unreachable venue exits 1 at the configured startup deadline, without claiming establishment or completing', async () => {
   await withDir(async (dir) => {
-    const { path, config } = writeConfig(dir);
+    const { path, config } = writeConfig(dir, { startupDeadlineMs: 1_000 });
+    const startedAt = Date.now();
     const handle = startChild(path);
-    await waitForReady(handle);
+    try {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+      const { code, signal } = await waitForExitOrTimeout(handle, 8_000, 'startup deadline did not end the run');
+      const elapsed = Date.now() - startedAt;
 
-    handle.child.kill('SIGINT');
-    const { code, signal } = await handle.exited;
-
-    assert.equal(signal, null, 'the process ended on its own');
-    assert.equal(code, 0, 'SIGINT stops cleanly too');
-    assert.notEqual(completionOf(config.database), null, 'and writes the completion');
+      assert.equal(signal, null, 'the process ended itself, not by a signal');
+      assert.equal(code, 1, `the startup deadline ends the run non-zero; stderr=${handle.stderr}`);
+      assert.ok(elapsed >= 700 && elapsed < 8_000, `the configured one-second deadline applied (elapsed ${elapsed} ms)`);
+      assert.doesNotMatch(handle.stdout, /receiver: established/, 'an unanswered subscription is not established');
+      assert.match(handle.stderr, /startup deadline/i, 'the process leaves the failure reason');
+      assert.notEqual(markerState(config.stores.organize, runId), 'complete', 'an unestablished run is not complete');
+    } finally {
+      if (handle.child.exitCode === null) handle.child.kill('SIGKILL');
+    }
   });
 });
 
-test('a completion the store refuses turns the stop into exit 1 with no completion', async () => {
+test('a refused venue subscription exits 1 with its reason and no completion', async () => {
   await withDir(async (dir) => {
-    const { path, config } = writeConfig(dir);
+    const venue = await startVenueServer({ subscriptionStatus: 'error' });
+    const { path, config } = writeConfig(dir, {
+      url: `ws://127.0.0.1:${venue.port}/`,
+      startupDeadlineMs: 5_000,
+    });
     const handle = startChild(path);
-    const ready = await waitForReady(handle);
-    const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+    try {
+      const startedAt = Date.now();
+      const first = await Promise.race([
+        waitForStdout(handle, 'receiver: started').then((ready) => ({ ready })),
+        handle.exited.then((exited) => ({ exited })),
+      ]);
+      let runId = null;
+      let outcome;
+      if (first.ready !== undefined) {
+        runId = first.ready.split('receiver: started ')[1].trim().split(':')[0];
+        outcome = await waitForExitOrTimeout(handle, 8_000, 'subscription failure did not end the run');
+      } else {
+        outcome = first.exited;
+      }
+      const elapsed = Date.now() - startedAt;
 
-    // A store that refuses the completion: the marker insert for `state = 'complete'` is rejected, the
-    // same way a full disk or a failing write would refuse it. The signal still drives the clean stop,
-    // so the process reaches close()'s completion write - and that write is exactly what must not be
-    // reported as success. Before the fix the exception was swallowed and the process left with 0 while
-    // the run record still said `running`.
-    const db = new DatabaseSync(config.database);
-    db.exec(
-      "CREATE TRIGGER fail_completion BEFORE INSERT ON run_marker WHEN NEW.state = 'complete' " +
-        "BEGIN SELECT RAISE(FAIL, 'completion IO failure'); END",
-    );
+      assert.equal(outcome.signal, null, 'the process handled the failure rather than dying by signal');
+      assert.equal(outcome.code, 1, `a refused subscription is an abnormal end; stderr=${handle.stderr}`);
+      assert.ok(elapsed < 5_000, `subscription refusal ends before the startup deadline (${elapsed} ms)`);
+      assert.match(handle.stderr, /subscription failed/i, 'the reason reaches stderr');
+      assert.match(handle.stderr, /denied/i, 'the venue refusal detail is preserved');
+      if (runId !== null) assert.notEqual(markerState(config.stores.organize, runId), 'complete', 'a refused stream is not complete');
+    } finally {
+      if (handle.child.exitCode === null) handle.child.kill('SIGKILL');
+      venue.close();
+    }
+  });
+});
+
+test('SIGTERM stops a live receiver once and its stores restart without claiming complete', async () => {
+  await withDir(async (dir) => {
+    await runWithVenue(dir, async ({ venue, handle, config, configPath }) => {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const connectionId = ready.split('receiver: started ')[1].trim();
+      const runId = connectionId.split(':')[0];
+      assert.ok(runId.length > 0, 'the run named its connection');
+
+      await serve(venue, config, handle, 3);
+
+      handle.child.kill('SIGTERM');
+      const { code, signal } = await waitForExitOrTimeout(handle, 10_000, 'signal shutdown timed out');
+
+      assert.equal(signal, null, 'the process ended on its own, not by the signal default action');
+      assert.equal(code, 0, `a clean stop is exit code 0; stderr=${handle.stderr}`);
+      assertStoppedMarker(config.stores.organize, runId);
+      await assertRestart(configPath, config, venue, runId);
+    });
+  });
+});
+
+test('a second signal does not stop the run twice: still exit 0 without claiming complete', async () => {
+  await withDir(async (dir) => {
+    await runWithVenue(dir, async ({ venue, handle, config }) => {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+      await serve(venue, config, handle, 3);
+
+      handle.child.kill('SIGTERM');
+      handle.child.kill('SIGTERM');
+      const { code, signal } = await waitForExitOrTimeout(handle, 10_000, 'signal shutdown timed out');
+
+      assert.equal(signal, null, 'the process ended on its own');
+      assert.equal(code, 0, `a clean stop is exit code 0; stderr=${handle.stderr}`);
+      assertStoppedMarker(config.stores.organize, runId);
+    });
+  });
+});
+
+test('SIGINT stops cleanly and restarts the same stores without claiming complete', async () => {
+  await withDir(async (dir) => {
+    await runWithVenue(dir, async ({ venue, handle, config, configPath }) => {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+      await serve(venue, config, handle, 3);
+
+      handle.child.kill('SIGINT');
+      const { code, signal } = await waitForExitOrTimeout(handle, 10_000, 'signal shutdown timed out');
+
+      assert.equal(signal, null, 'the process ended on its own');
+      assert.equal(code, 0, `SIGINT stops cleanly too; stderr=${handle.stderr}`);
+      assertStoppedMarker(config.stores.organize, runId);
+      await assertRestart(configPath, config, venue, runId);
+    });
+  });
+});
+
+test('normal stop does not attempt complete writes even when the store forbids them', async () => {
+  await withDir(async (dir) => {
+    await runWithVenue(dir, async ({ venue, handle, config }) => {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+      await serve(venue, config, handle, 3);
+
+      // Complete is forbidden on both write forms. Ordinary shutdown must never reach either.
+      const db = new DatabaseSync(config.stores.organize);
+      // The organize child holds the file under WAL; the DDL has to wait its turn for the write lock,
+      // which its own `busy_timeout = 0` deliberately does not. This second handle waits instead.
+      db.exec('PRAGMA busy_timeout = 5000');
+      db.exec(
+        "CREATE TRIGGER fail_completion BEFORE UPDATE ON run_marker WHEN NEW.state = 'complete' " +
+          "BEGIN SELECT RAISE(FAIL, 'completion IO failure'); END",
+      );
+      db.exec(
+        "CREATE TRIGGER fail_completion_insert BEFORE INSERT ON run_marker WHEN NEW.state = 'complete' " +
+          "BEGIN SELECT RAISE(FAIL, 'completion IO failure'); END",
+      );
+      db.close();
+
+      handle.child.kill('SIGTERM');
+      const { code, signal } = await waitForExitOrTimeout(handle, 10_000, 'signal shutdown timed out');
+
+      assert.equal(signal, null, 'the process still ended on its own, not by the signal default action');
+      assert.equal(code, 0, `ordinary shutdown never writes complete; stderr=${handle.stderr}`);
+      const state = markerState(config.stores.organize, runId);
+      assert.notEqual(state, 'complete', 'no completion is on disk');
+      assert.notEqual(state, null, 'the run was marked live and left behind');
+    });
+  });
+});
+
+
+function assertStoppedMarker(path, runId) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = db.prepare('SELECT * FROM run_marker WHERE run_id = ?').get(runId);
+    assert.equal(row.state, 'running', 'shutdown leaves restart invalidation to startup');
+    assert.equal(row.finalize_request_id, null);
+    assert.equal(row.finalize_request_payload, null);
+    assert.equal(row.finalize_receipt_json, null);
+  } finally {
     db.close();
+  }
+}
 
+
+async function assertRestart(configPath, config, venue, oldRunId) {
+  for (const path of Object.values(config.stores)) {
+    // Sidecar files are reusable; actual SQLite ownership must be gone after confirmed child exit.
+    for (const scope of ['supervisor', 'writer']) {
+      const lock = acquireStoreLock({ path, scope });
+      try {
+        assert.equal(lock.acquired, true, `${scope} ownership was released for ${path}`);
+      } finally {
+        if (lock.acquired) lock.release();
+      }
+    }
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal(db.prepare('PRAGMA quick_check').get().quick_check, 'ok');
+    } finally {
+      db.close();
+    }
+  }
+  const handle = startChild(configPath);
+  try {
+    const ready = await waitForStdout(handle, 'receiver: started');
+    const newRunId = ready.split('receiver: started ')[1].trim().split(':')[0];
+    assert.notEqual(newRunId, oldRunId);
+    const db = new DatabaseSync(config.stores.organize, { readOnly: true });
+    try {
+      assert.equal(db.prepare('SELECT state FROM run_marker WHERE run_id = ?').get(oldRunId).state, 'invalidated');
+    } finally {
+      db.close();
+    }
+    await serve(venue, config, handle, 4);
     handle.child.kill('SIGTERM');
-    const { code, signal } = await handle.exited;
+    const exited = await waitForExitOrTimeout(handle, 10_000, 'the restarted receiver did not stop');
+    assert.deepEqual(exited, { code: 0, signal: null }, handle.stderr);
+    assertStoppedMarker(config.stores.organize, newRunId);
+  } finally {
+    if (handle.child.exitCode === null) handle.child.kill('SIGKILL');
+  }
+}
 
-    assert.equal(signal, null, 'the process still ended on its own, not by the signal default action');
-    assert.equal(code, 1, `a run whose completion could not be written is not a clean end; stderr=${handle.stderr}`);
-    assert.equal(completionOf(config.database), null, 'and no completion is on disk');
+test('a receive-tail IO failure does not turn a local stop into a completeness claim', async () => {
+  await withDir(async (dir) => {
+    await runWithVenue(dir, async ({ venue, handle, config }) => {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+      await serve(venue, config, handle, 3);
+      const db = new DatabaseSync(config.stores.ingest);
+      try {
+        db.exec('PRAGMA busy_timeout = 5000');
+        db.exec("CREATE TRIGGER fail_tail BEFORE UPDATE ON received_tail BEGIN SELECT RAISE(FAIL, 'tail IO failure'); END");
+      } finally {
+        db.close();
+      }
+      venue.sendFrame(4);
+      await until(() => bookApplied(config.stores.book) === 4, { label: 'the frame with a failed tail write to reach the book' });
+      handle.child.kill('SIGTERM');
+      const exited = await waitForExitOrTimeout(handle, 10_000, 'the failed receiver did not stop');
+      assert.deepEqual(exited, { code: 0, signal: null }, handle.stderr);
+      assertStoppedMarker(config.stores.organize, runId);
+    });
+  });
+});
 
-    // The run record is not complete either: the next start must still be able to tell this from a crash.
-    const reader = new DatabaseSync(config.database);
-    const marker = reader.prepare('SELECT state FROM run_marker WHERE run_id = ?').get(runId);
-    reader.close();
-    assert.notEqual(marker, undefined, 'the run was marked live and left behind');
-    assert.notEqual(marker.state, 'complete', 'the run is not marked complete');
+test('an established quiet stream can stop successfully before receiving its first data frame', async () => {
+  await withDir(async (dir) => {
+    await runWithVenue(dir, async ({ handle, config }) => {
+      const ready = await waitForStdout(handle, 'receiver: started');
+      const runId = ready.split('receiver: started ')[1].trim().split(':')[0];
+      await waitForStdout(handle, 'receiver: established');
+      handle.child.kill('SIGTERM');
+      const exited = await waitForExitOrTimeout(handle, 10_000, 'the quiet receiver did not stop');
+      assert.deepEqual(exited, { code: 0, signal: null }, handle.stderr);
+      assertStoppedMarker(config.stores.organize, runId);
+    });
   });
 });

@@ -2,10 +2,18 @@
  * The receiver's configuration: the file the process is started with, and the adapter the venue names.
  *
  * The process is configured from a file and only from a file (§5.7's minimal shape): `--config <JSON>`
- * names the store, the spool, the venue, the market and the stream this run is for. Nothing is read from
+ * names the venue, the market, the stream and where this run's data goes. Nothing is read from
  * the environment and nothing is passed on the command line beyond the path - a deployment describes
  * itself in one place, and a command line that could override a destination is a second source of truth
  * for where the canonical data goes.
+ *
+ * Since the receiver is three role processes (stage 5d, §5.8 ruling ⑭), the canonical data lives in
+ * three databases - one per role, each opened and held by exactly one process (ruling ⑮). The config
+ * therefore names all three explicitly, under `stores: { ingest, organize, book }`. The three paths
+ * are named rather than derived from one base path on purpose: a derived sibling would be a naming
+ * convention this file invented, and a second owner of the canonical data must be a path the
+ * deployment chose, not one this package guessed. The spool belongs to ingest and keeps its own key,
+ * `spoolDir`.
  *
  * There is deliberately no raw destination. The old six-column world had a raw writer
  * (`lib/raw-sqlite-writer.mjs`); this package carries only its reception half, and the entrance has no
@@ -38,7 +46,10 @@ const DISABLED_VENUES = Object.freeze({
     'the bitfinex adapter must not be operated (C11): it is not rewritten to the official spec, so it misreads trade snapshots as book data and the trade id as a price',
 });
 
-const REQUIRED = Object.freeze(['venue', 'market', 'database', 'spoolDir']);
+const REQUIRED = Object.freeze(['venue', 'market', 'spoolDir']);
+
+/** The three roles whose databases this run owns: one file per role, one process per file (ruling ⑮). */
+export const STORE_ROLES = Object.freeze(['ingest', 'organize', 'book']);
 
 /**
  * The bounds a config's `startupDeadlineMs` must sit within. §5.7 fixes 60_000 ms as the default and
@@ -100,6 +111,19 @@ export function loadConfig(configPath) {
     }
   }
   const stream = raw.stream ?? 'trades';
+  // The three role databases. Named explicitly: each is opened and held by exactly one role process
+  // (ruling ⑮), so the deployment - not a naming convention this file invents - says where each goes.
+  if (raw.stores === null || typeof raw.stores !== 'object' || Array.isArray(raw.stores)) {
+    throw new TypeError('the config needs a "stores" object naming the three role databases (ingest, organize, book)');
+  }
+  const stores = {};
+  for (const role of STORE_ROLES) {
+    const rolePath = raw.stores[role];
+    if (typeof rolePath !== 'string' || rolePath.length === 0) {
+      throw new TypeError(`the config needs a non-empty "stores.${role}"`);
+    }
+    stores[role] = rolePath;
+  }
   if (typeof stream !== 'string' || stream.length === 0) {
     throw new TypeError('the config\'s "stream" must be a non-empty string');
   }
@@ -125,15 +149,26 @@ export function loadConfig(configPath) {
     }
     startupDeadlineMs = value;
   }
+  // The supervisor's router socket. Optional: a deployment that does not name one has it derived next to
+  // the spool (see the entrance). A value that is present must be a non-empty string, so a half-written
+  // key fails loudly rather than silently falling back to the derived path.
+  let routerPath;
+  if (Object.prototype.hasOwnProperty.call(raw, 'routerPath')) {
+    if (typeof raw.routerPath !== 'string' || raw.routerPath.length === 0) {
+      throw new TypeError('the config\'s "routerPath" must be a non-empty string when present');
+    }
+    routerPath = raw.routerPath;
+  }
   return Object.freeze({
     venue: raw.venue,
     market: raw.market,
     stream,
-    database: raw.database,
+    stores: Object.freeze(stores),
     spoolDir: raw.spoolDir,
     // Only present when the file names it: absent means the supervisor applies its own default, so the
     // entrance does not turn a missing key into a value the deployment never chose.
     ...(startupDeadlineMs === undefined ? {} : { startupDeadlineMs }),
+    ...(routerPath === undefined ? {} : { routerPath }),
     // The venue-specific extras, only when the file carries them. Kraken needs a symbol; Bitfinex
     // defaults to tBTCUSD. A url is optional and defaults inside the adapter.
     symbol: typeof raw.symbol === 'string' && raw.symbol.length > 0 ? raw.symbol : undefined,

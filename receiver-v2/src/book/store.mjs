@@ -6,7 +6,7 @@
  * `book_gap`, `retired_run`, `connection_identity` and `legacy_owner` - and, from the loss protocol
  * (rulings ④⑤), the invalidation record it must persist together with the missing it declares
  * (`book_invalidation`). Reception owns `received_tail` and the spool; organization owns `run_marker`,
- * `pending_boundary`, `suspected_gap`, `organized_watermark`, `organize_gap`, `delivery_ledger` and the
+ * `suspected_gap`, `organized_watermark`, `organize_gap`, `delivery_ledger` and the
  * raw. None of those belong here, and this store creates none of them.
  *
  * Most of the book's tables are created by `src/book/state.mjs` itself, the first time the book is
@@ -16,7 +16,7 @@
  * ownership boundary is exactly what the file manifests.
  *
  * Why a dedicated store rather than `durability.mjs`: that module is the single-process store and it
- * also carries `received_tail`, `run_marker` and `pending_boundary`, which belong to other roles.
+ * also carries `received_tail` and `run_marker`, which belong to other roles.
  * Reusing it here would make the book create tables it does not own. This module mirrors the parts of
  * `durability.mjs` the book needs to be opened on it: the execution right, the one-handle rule and the
  * transaction discipline.

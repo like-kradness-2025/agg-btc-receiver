@@ -1,14 +1,9 @@
 /**
- * The three records that make a restart honest.
+ * The two records that make a restart honest.
  *
  * Everything here exists to answer one question after a crash: what can this process still claim to
- * have? Three records, each with one job:
+ * have? Each record has one job:
  *
- *  - pending_boundary   written in the *same transaction* as the watermark it belongs to, and removed
- *                       only once the derived work is applied. It is how "the raw was advanced but
- *                       the derived state was not" becomes a recoverable state instead of a silent
- *                       inconsistency. Resolution at startup is fail-closed: either apply it or roll
- *                       the boundary back.
  *  - received_tail      the highest sequence this process can show it received, per connection. It
  *                       is a *lower bound only*: it lags reality by the update interval, so it can
  *                       never prove completeness, and it must never be used as if it could.
@@ -75,16 +70,6 @@ function databaseFileKey(db) {
 }
 
 export const SCHEMA = `
-CREATE TABLE IF NOT EXISTS pending_boundary (
-  market TEXT NOT NULL,
-  stream TEXT NOT NULL,
-  boundary_seq INTEGER NOT NULL,
-  boundary_ts_ms INTEGER NOT NULL,
-  run_id TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  state TEXT NOT NULL DEFAULT 'pending',
-  PRIMARY KEY (market, stream)
-);
 CREATE TABLE IF NOT EXISTS received_tail (
   connection_id TEXT NOT NULL,
   stream TEXT NOT NULL DEFAULT '',
@@ -217,7 +202,10 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
 
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = FULL');
-    db.exec(SCHEMA);
+    inTransaction(() => {
+      db.exec(SCHEMA);
+      db.exec('DROP TABLE IF EXISTS pending_boundary');
+    });
     // An older store's received_tail has no stream in its key; the schema above leaves that old table
     // in place, so it is rebuilt here before anything reads or writes a tail.
     migrateReceivedTail(db);
@@ -373,41 +361,6 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     },
 
     /**
-     * Advance the watermark and its boundary record together. Passing the watermark update in means
-     * the two cannot get out of step: a crash leaves either both or neither.
-     */
-    advanceWithBoundary({ market, stream, boundarySeq, boundaryTsMs, updateWatermark }) {
-      return inTransaction(() => {
-        updateWatermark();
-        db.prepare(
-          `INSERT OR REPLACE INTO pending_boundary
-             (market, stream, boundary_seq, boundary_ts_ms, run_id, created_at_ms, state)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-        ).run(market, stream, boundarySeq, boundaryTsMs, runId, nowMs());
-      });
-    },
-
-    /** The derived work is applied: the boundary is no longer owed. */
-    clearBoundary({ market, stream }) {
-      db.prepare('DELETE FROM pending_boundary WHERE market = ? AND stream = ?').run(market, stream);
-    },
-
-    /** Boundaries still owed at startup. Each one must be applied or rolled back, never ignored. */
-    pendingBoundaries() {
-      return db
-        .prepare('SELECT market, stream, boundary_seq, boundary_ts_ms, run_id, created_at_ms FROM pending_boundary ORDER BY created_at_ms')
-        .all()
-        .map((row) => ({
-          market: row.market,
-          stream: row.stream,
-          boundarySeq: row.boundary_seq,
-          boundaryTsMs: row.boundary_ts_ms,
-          runId: row.run_id,
-          createdAtMs: row.created_at_ms,
-        }));
-    },
-
-    /**
      * Record how far this process can prove it received. A lower bound, deliberately: it is written on
      * the reception side as frames arrive rather than being derived from anything durable, so it can lag
      * the socket by the frame being processed, and nothing may treat it as a completeness claim.
@@ -514,8 +467,6 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   const internal = {
     beginRun: api.beginRun,
     completeRun: api.completeRun,
-    advanceWithBoundary: api.advanceWithBoundary,
-    clearBoundary: api.clearBoundary,
     updateReceivedTail: api.updateReceivedTail,
     recordSuspectedGap: api.recordSuspectedGap,
     close: api.close,

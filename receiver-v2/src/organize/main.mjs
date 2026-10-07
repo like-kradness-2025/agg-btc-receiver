@@ -10,15 +10,11 @@
  *
  * What organize owns (ruling ②) and where each is here:
  *
- *   - `run_marker`          this process's own store (`beginRun` / `completeRun`, ruling ⑧). Startup
- *                           invalidates the previous running marker, and the marker records running
- *                           and complete.
- *   - `pending_boundary`    written in the same transaction as the watermark it belongs to, and
- *                           cleared once the book reports it applied (ruiling ③).
- *   - `suspected_gap`       a range that cannot be proven (a restart's unaccounted interval).
+ *   - `run_marker`          this process's own store (`beginRun` / `prepareFinalize` / `finalize`, ruling ⑧).
+ *                           Startup invalidates the previous running marker; completion carries the
+ *                           immutable supervisor request and its receipt in this same run row.
  *   - `organized_watermark` the contiguous durable ceiling per connection (the organizer module).
- *   - `organize_gap`        holes seen in the received order (the organizer module).
- *   - `delivery_ledger`     what is durable and owed to the board (the ledger module).
+ *   - `delivery_ledger`     the exact confirmed frames still owed to the book (the delivery module).
  *   - the raw               an optional `writeRaw` hook; only its `true` makes a frame durable. When
  *                           it is absent the raw stage is skipped (`rawSkipped`) exactly as the
  *                           organizer and the entrance already prescribe (ruling ⑥, §5.7).
@@ -39,8 +35,7 @@
  *
  * "All acknowledged" is judged here (rulings ⑨⑩): the sealed final tails of every connection - old
  * generations included - must be reached by a hole-less durable ceiling, with no unprocessed spool. A
- * normal completion is written only then; an unknown tail, a raw hole or an unprocessed spool all
- * withhold it.
+ * Explicit legacy finalization is gated by this judgement. Ordinary stop never invokes it.
  */
 
 import net from 'node:net';
@@ -50,7 +45,7 @@ import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
 import { makeEnvelope } from '../envelope.mjs';
 import { internalsOf } from '../internal/wiring.mjs';
 import { openOrganizer } from './watermark.mjs';
-import { openDeliveryLedger, INTENT } from '../supervisor/delivery.mjs';
+import { openDeliveryLedger, INTENT, OWED } from '../supervisor/delivery.mjs';
 import {
   INVALIDATION_CONFIRMED,
   INVALIDATION_REQUESTED,
@@ -94,6 +89,28 @@ export function judgeAllAcked({ tails, ceilings, spoolEmpty = false, holes = [] 
   if (spoolEmpty !== true) unmet.push({ reason: 'the spool is not known to be empty' });
   for (const hole of holes) unmet.push({ reason: 'a hole remains in the durable ceiling', ...hole });
   return { allAcked: unmet.length === 0, reason: unmet.length === 0 ? 'every tail was reached' : unmet[0].reason, unmet };
+}
+
+function canonicalTailIdentity(tails) {
+  if (!Array.isArray(tails)) return null;
+  const normalized = [];
+  for (const tail of tails) {
+    if (
+      tail === null ||
+      typeof tail !== 'object' ||
+      Array.isArray(tail) ||
+      typeof tail.connectionId !== 'string' ||
+      tail.connectionId.length === 0 ||
+      !Number.isInteger(tail.lastReceivedSeq) ||
+      tail.lastReceivedSeq < 0
+    ) {
+      return null;
+    }
+    normalized.push({ connectionId: tail.connectionId, lastReceivedSeq: tail.lastReceivedSeq });
+  }
+  normalized.sort((left, right) => (left.connectionId < right.connectionId ? -1 : left.connectionId > right.connectionId ? 1 : 0));
+  if (new Set(normalized.map((tail) => tail.connectionId)).size !== normalized.length) return null;
+  return JSON.stringify(normalized);
 }
 
 /**
@@ -160,6 +177,10 @@ export function createOrganizeProcess({
   let acceptedRunId = null;
   let acceptedGeneration = null;
   let sealedTails = null;
+  // The prepared finalize is one immutable barrier. A later, different seal cannot reuse the mutable
+  // all-ACK result for its own tails to authorize this older request.
+  let preparedBarrier = null;
+  let preparedBarrierInvalid = false;
   let allAcked = false;
   let allAckedReason = 'no tail has been sealed yet';
   // The book's recorded applied boundary, handed to organize by the supervisor at startup (b). It is
@@ -200,56 +221,23 @@ export function createOrganizeProcess({
     return { ok: true };
   }
 
-  /**
-   * The pending boundary, written in the organizer's own transaction (ruling ③).
-   *
-   * It records the durable ceiling the derived work still owes - the highest contiguous position the
-   * watermark now holds for this board. It is read back inside the same transaction that advanced the
-   * watermark, so the boundary and the watermark it belongs to cannot be separated by a crash. A
-   * ceiling of NULL is the durable record saying nothing is contiguous yet, so no boundary is written.
-   */
-  function writePendingBoundary(frame) {
-    if (acceptedConnectionId === null) return;
-    const row = wiring.db
-      .prepare(
-        `SELECT up_to_receive_seq FROM organized_watermark
-          WHERE connection_id = ? AND market = ? AND stream = ?`,
-      )
-      .get(acceptedConnectionId, market, stream);
-    const ceiling = row?.up_to_receive_seq;
-    if (ceiling === null || ceiling === undefined) return;
-    wiring.db
-      .prepare(
-        `INSERT OR REPLACE INTO pending_boundary
-           (market, stream, boundary_seq, boundary_ts_ms, run_id, created_at_ms, state)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-      )
-      .run(market, stream, ceiling, frame.recv_ts_ms ?? nowMs(), frame.run_id ?? runId, nowMs());
-  }
 
-  function pendingBoundaries() {
-    return wiring.db
-      .prepare(
-        `SELECT market, stream, boundary_seq, boundary_ts_ms, run_id, created_at_ms, state
-           FROM pending_boundary WHERE market = ? AND stream = ? ORDER BY created_at_ms`,
-      )
-      .all(market, stream)
-      .map((row) => ({
-        market: row.market,
-        stream: row.stream,
-        boundarySeq: row.boundary_seq,
-        boundaryTsMs: row.boundary_ts_ms,
-        runId: row.run_id,
-        createdAtMs: row.created_at_ms,
-        state: row.state,
-      }));
+
+  /**
+   * A row remains here until the book's applied_ack releases it. The watermark names the contiguous
+   * durable ceiling; the ledger names the exact frames beyond the book's confirmed state. Together they
+   * are sufficient to resume after any crash without a duplicate scalar boundary record.
+   */
+  function recoveryStatus() {
+    const owedCount = ledger.pending({ state: OWED }).length;
+    return { resolved: owedCount === 0, owedCount };
   }
 
   /**
    * One received frame, from ingest. Durability first and the acknowledgement last: the intent is
    * written before the raw is touched, the raw is written (fsync) before the transaction, and the
-   * transaction writes the watermark, the ledger confirmation and the pending boundary together. Only
-   * after it commits is the `durable_ack` sent (rulings ③⑦).
+   * transaction writes the watermark and ledger confirmation together. Only after it commits is the
+   * `durable_ack` sent (rulings ③⑦).
    */
   function organizeFrame(envelope) {
     if (closed) return { accepted: false, reason: 'this organize process is closed' };
@@ -262,9 +250,8 @@ export function createOrganizeProcess({
         ledgerInternal.record(frame, hasRawWriter ? OWED_REASON_RAW : OWED_REASON_STORE, INTENT);
       },
       onDurable: (frame) => {
-        // The same transaction as the watermark: confirm the ledger row and write the pending boundary.
+        // The same transaction as the watermark: confirm the ledger row.
         ledgerInternal.confirm(frame);
-        writePendingBoundary(frame);
       },
     });
     if (note.accepted === false) return note;
@@ -381,6 +368,10 @@ export function createOrganizeProcess({
   function handleTailSealed(message) {
     const tails = message.payload?.tails;
     const spoolEmpty = message.payload?.spool_empty;
+    const sealedIdentity = canonicalTailIdentity(tails);
+    if (preparedBarrier !== null && sealedIdentity !== preparedBarrier.tailIdentity) {
+      preparedBarrierInvalid = true;
+    }
     sealedTails = Array.isArray(tails) ? tails : null;
     const verdict = evaluateAllAcked({ tails, spoolEmpty });
     allAcked = verdict.allAcked;
@@ -430,21 +421,14 @@ export function createOrganizeProcess({
   }
 
   /**
-   * The book reports that it applied an acknowledged boundary. The pending boundary is no longer owed,
-   * so it is cleared; and what the book has reached is released from the ledger, bounded by the raw's
-   * own contiguous ceiling (a frame the raw holds above its position is the ledger's only record).
+   * The book reports that it applied a boundary. Release only ledger entries the raw also holds contiguously;
+   * an entry above that position remains the sole durable record of its frame.
    */
   function handleAppliedAck(message) {
     const connectionId = message.connection_id ?? acceptedConnectionId;
     const applied = message.payload?.up_to_seq;
     if (!Number.isInteger(applied)) return { applied: false, reason: 'an applied acknowledgement needs a ceiling' };
     const result = wiring.inTransaction(() => {
-      const cleared = wiring.db
-        .prepare(
-          `DELETE FROM pending_boundary
-            WHERE market = ? AND stream = ? AND boundary_seq <= ?`,
-        )
-        .run(market, stream, applied).changes;
       const row = wiring.db
         .prepare(
           `SELECT up_to_receive_seq, first_seq FROM organized_watermark
@@ -459,7 +443,7 @@ export function createOrganizeProcess({
           upToSeq: Math.min(applied, row.up_to_receive_seq),
         }).released;
       }
-      return { cleared, released };
+      return { released };
     });
     return { applied: true, ...result };
   }
@@ -709,46 +693,91 @@ export function createOrganizeProcess({
    * marker exists to prevent (rulings ⑨⑩). The book's unapplied frames stay in the ledger; a normal
    * completion does not claim the board is complete.
    */
-  function finalize() {
-    if (allAcked) {
-      organizeStore.completeRun();
-      return { completed: true, reason: allAckedReason };
+  function prepareFinalize(request) {
+    const sealedIdentity = canonicalTailIdentity(sealedTails);
+    const requestedIdentity = canonicalTailIdentity(request?.tails);
+    if (preparedBarrierInvalid) {
+      return { prepared: false, refused: true, reason: 'the prepared finalize barrier no longer matches organize’s sealed tails' };
     }
-    return { completed: false, reason: allAckedReason };
+    if (sealedIdentity === null || requestedIdentity === null || sealedIdentity !== requestedIdentity) {
+      return {
+        prepared: false,
+        refused: true,
+        reason: 'the finalize request does not identify organize’s sealed final tails',
+      };
+    }
+    const result = wiring.prepareFinalize(request);
+    if (!result.prepared) return result;
+    const identity = {
+      requestId: request.finalizeRequestId,
+      barrierId: request.barrierId,
+      tailIdentity: requestedIdentity,
+    };
+    if (preparedBarrier === null) {
+      preparedBarrier = Object.freeze(identity);
+    } else if (
+      preparedBarrier.requestId !== identity.requestId ||
+      preparedBarrier.barrierId !== identity.barrierId ||
+      preparedBarrier.tailIdentity !== identity.tailIdentity
+    ) {
+      preparedBarrierInvalid = true;
+      return { prepared: false, refused: true, reason: 'this run already has a different prepared finalize barrier' };
+    }
+    return result;
   }
 
+  /** A proof-backed clean end is possible only for the exact prepared barrier and its own all-ACK result. */
+  function finalize(request) {
+    if (request === null || request === undefined) {
+      return { completed: false, refused: true, reason: 'a prepared finalize request is required' };
+    }
+    const alreadyComplete = organizeStore.runMarkerState(runId) === 'complete';
+    if (alreadyComplete) {
+      const result = wiring.completeRun(request);
+      if (result.completed) return { ...result, reason: 'every tail was reached' };
+      return result;
+    }
+    if (preparedBarrierInvalid || preparedBarrier === null) {
+      return { completed: false, refused: true, reason: 'the prepared finalize barrier is no longer valid' };
+    }
+    const requestedIdentity = canonicalTailIdentity(request?.tails);
+    if (
+      request.finalizeRequestId !== preparedBarrier.requestId ||
+      request.barrierId !== preparedBarrier.barrierId ||
+      requestedIdentity !== preparedBarrier.tailIdentity
+    ) {
+      return { completed: false, refused: true, reason: 'the finalize request does not match the prepared barrier' };
+    }
+    if (canonicalTailIdentity(sealedTails) !== preparedBarrier.tailIdentity) {
+      preparedBarrierInvalid = true;
+      return { completed: false, refused: true, reason: 'the prepared finalize barrier no longer matches organize’s sealed tails' };
+    }
+    if (!allAcked) {
+      return { completed: false, reason: allAckedReason };
+    }
+    const result = wiring.completeRun(request);
+    if (result.completed) return { ...result, reason: 'every tail was reached' };
+    return result;
+  }
+
+  /** Stop accepting frames. Pending durable work is retained for startup; no finalize is called. */
   function stop(reason = 'a stop was requested') {
     if (closed) return { stopped: false, reason: 'this organize process is closed' };
     stopped = true;
     stopReadinessReporting();
-    const completion = finalize();
     try {
       onStop({ market, reason });
     } catch {
       // a stop notification is best-effort; the state is the fact
     }
-    return { stopped: true, ...completion };
+    const intents = ledger.pending({ state: INTENT }).length;
+    return { stopped: true, abnormal: intents > 0, ...(intents > 0 ? { reason: 'undurable processing intents remain' } : {}) };
   }
 
-  /**
-   * Stop accepting frames without yet writing the completion. This is the processing stop the
-   * supervisor uses: organize must keep its completion capability until the book's stop result is
-   * confirmed, so the run is not called a normal end on "all acknowledged" alone (rulings ⑨⑩).
-   */
-  function requestStop(reason = 'a stop was requested') {
-    if (closed) return { stopped: false, reason: 'this organize process is closed' };
-    stopped = true;
-    stopReadinessReporting();
-    try {
-      onStop({ market, reason });
-    } catch {
-      // a stop notification is best-effort; the state is the fact
-    }
-    return { stopped: true };
-  }
+  const requestStop = stop;
 
   function handleStop(message) {
-    const completion = stop('a stop was requested over IPC');
+    const result = stop('a stop was requested over IPC');
     if (message && ingestChannel !== null) {
       try {
         ingestChannel.sendControl(
@@ -763,7 +792,7 @@ export function createOrganizeProcess({
         diagnostic(`a stop acknowledgement could not be sent: ${error.message}`);
       }
     }
-    return completion;
+    return result;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -908,6 +937,7 @@ export function createOrganizeProcess({
     beginRun,
     stop,
     requestStop,
+    prepareFinalize,
     finalize,
     deliverOwed,
     resumeFromBoundary,
@@ -918,7 +948,7 @@ export function createOrganizeProcess({
     rederiveInvalidations,
     invalidationRequests,
 
-    pendingBoundaries,
+    recoveryStatus,
     evaluateAllAcked,
     judge: (tails, options) => judgeAllAcked({ tails, ...options }),
     ledgerEntries: ({ state = null } = {}) => ledger.pending({ state }),
@@ -951,11 +981,7 @@ export function createOrganizeProcess({
       stopped = true;
       closed = true;
       if (openedStoreHere) {
-        try {
-          organizeStore.close();
-        } catch {
-          // a store that will not close is not this close's failure to report
-        }
+        organizeStore.close();
       }
     },
 

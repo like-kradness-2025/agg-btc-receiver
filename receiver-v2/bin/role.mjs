@@ -17,7 +17,7 @@
  *
  * The child then speaks two channels. Its *business* channel is the supervisor's router socket (the
  * same IPC the in-process roles use). Its *control* channel is the fork's built-in IPC, over which
- * the supervisor calls the handful of role operations the wiring needs (start/stop/sealTails/
+ * the supervisor calls the handful of role operations the wiring needs (start/stop/
  * drainSpool/beginRun/... ) and reads a cached state snapshot. Business traffic never travels the
  * fork channel, and no business payload is interpreted here.
  *
@@ -32,16 +32,16 @@ import { openIngestProcess } from '../src/ingest/main.mjs';
 import { openOrganizeProcess } from '../src/organize/main.mjs';
 import { openBookProcess } from '../src/book/main.mjs';
 import { adapterFor } from '../src/entry/config.mjs';
+import { acquireStoreLock } from '../src/supervisor/store-lock.mjs';
 
 /** The operations the supervisor may call on each role, exactly the ones `run.mjs` uses. */
 export const ROLE_METHODS = Object.freeze({
-  ingest: Object.freeze(['start', 'stop', 'sealTails', 'drainSpool', 'receivedTails', 'close']),
+  ingest: Object.freeze(['start', 'stop', 'drainSpool', 'receivedTails', 'close']),
   organize: Object.freeze([
     'beginRun',
     'resumeFromBoundary',
     'deliverOwed',
-    'requestStop',
-    'finalize',
+    'recoveryStatus',
     'stop',
     'close',
   ]),
@@ -51,8 +51,8 @@ export const ROLE_METHODS = Object.freeze({
 /** The properties `run.mjs` reads synchronously; the child pushes a snapshot the parent caches. */
 export const ROLE_PROPS = Object.freeze({
   ingest: Object.freeze(['connectionId', 'state', 'generation', 'subscriptionState', 'spool']),
-  organize: Object.freeze(['allAcked', 'serving']),
-  book: Object.freeze(['appliedBoundary']),
+  organize: Object.freeze(['serving']),
+  book: Object.freeze(['appliedBoundary', 'isRunning']),
 });
 
 /** The state snapshot the parent keeps. Plain data only: it is structured-cloned across the IPC. */
@@ -71,9 +71,9 @@ function snapshotOf(role, proc) {
     };
   }
   if (role === 'organize') {
-    return { allAcked: proc.allAcked === true, serving: proc.serving === true };
+    return { serving: proc.serving === true };
   }
-  return { appliedBoundary: proc.appliedBoundary ?? null };
+  return { appliedBoundary: proc.appliedBoundary ?? null, isRunning: proc.isRunning === true };
 }
 
 /** Resolve the venue adapter for the ingest child: a module override, or the built-in one. */
@@ -132,6 +132,7 @@ async function buildRole(spec, send) {
       stream,
       adapter,
       venue: spec.venue,
+      takeoverFor: () => spec.takeover === true,
       runId,
       roleInstance,
       webSocketImpl,
@@ -197,7 +198,15 @@ async function main(argv) {
   };
 
   let proc;
+  let writerLock;
   try {
+    writerLock = acquireStoreLock({
+      path: spec.storePath,
+      role,
+      instance: spec.roleInstance,
+      scope: 'writer',
+    });
+    if (!writerLock.acquired) throw new Error(writerLock.reason);
     proc = await buildRole(spec, send);
   } catch (error) {
     send({ kind: 'fatal', role, reason: error.message });
@@ -218,10 +227,21 @@ async function main(argv) {
     closing = true;
     clearInterval(stateTimer);
     stateTimer = null;
+    let storeClosed = false;
     try {
       proc.close();
+      storeClosed = true;
     } catch {
-      /* the store may already be gone */
+      code = 1;
+      /* if store close is uncertain, keep the writer lock until process.exit closes every handle */
+    }
+    if (storeClosed && writerLock !== null) {
+      try {
+        writerLock.release();
+        writerLock = null;
+      } catch {
+        /* process.exit below is the final OS-level release */
+      }
     }
     process.exit(code);
   };
@@ -234,7 +254,7 @@ async function main(argv) {
         proc.close();
       } catch (error) {
         send({ kind: 'result', id: msg.id, ok: false, error: error.message });
-        shutdown(0);
+        shutdown(1);
         return;
       }
       send({ kind: 'result', id: msg.id, ok: true, value: null });

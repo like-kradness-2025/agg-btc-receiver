@@ -90,7 +90,7 @@ test('readiness: a role that reports not-ready is not ready, whatever else holds
   assert.ok(snap.reasons.some((r) => r.role === 'ingest' && r.reason === 'reported-not-ready'));
 });
 
-test('store exclusion: a live owner is refused, a stale one is recovered, release needs confirmation', () => {
+test('store exclusion: a live owner is refused, release needs confirmation, and a released store can be claimed again', () => {
   const dir = mkdtempSync(join(tmpdir(), 'exclusion-'));
   try {
     const dbPath = join(dir, 'state.sqlite');
@@ -115,12 +115,11 @@ test('store exclusion: a live owner is refused, a stale one is recovered, releas
     const released = exclusion.release({ path: dbPath, instance: 'organize-1', confirmedTerminated: true });
     assert.equal(released.released, true);
 
-    // A stale claim (owner pid dead) is taken over rather than refused.
-    const dead = createStoreExclusion({ isProcessAlive: () => false });
-    dead.claim({ path: dbPath, role: 'book', instance: 'book-old', pid: 999_999 });
-    const takeover = dead.claim({ path: dbPath, role: 'book', instance: 'book-new', pid: 1 });
-    assert.equal(takeover.claimed, true);
-    assert.equal(takeover.tookOverStale, true, 'a crash is recoverable');
+    // The previous lease is gone after confirmed release, so another instance can acquire it.
+    const nextOwner = exclusion.claim({ path: dbPath, role: 'organize', instance: 'organize-3', pid: 4242 });
+    assert.equal(nextOwner.claimed, true);
+    assert.equal(nextOwner.tookOverStale, false, 'crash release is the lock manager\'s atomic OS/SQLite behavior, not a stale-file guess');
+    assert.equal(exclusion.release({ path: dbPath, instance: 'organize-3', confirmedTerminated: true }).released, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

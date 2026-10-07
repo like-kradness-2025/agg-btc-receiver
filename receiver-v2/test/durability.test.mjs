@@ -85,82 +85,22 @@ test('starting a new run invalidates the previous marker before anything else', 
   });
 });
 
-test('the watermark and its boundary record are written together or not at all', async () => {
+test('the obsolete pending-boundary API is absent from the legacy test-only store', async () => {
   await withStore(async (dbPath) => {
     const store = openDurability({ path: dbPath, runId: 'run-1' });
-    store.beginRun();
-    let watermark = 0;
-    store.advanceWithBoundary({
-      market: 'kraken_spot',
-      stream: 'trades',
-      boundarySeq: 42,
-      boundaryTsMs: 1_792_000_000_042,
-      updateWatermark: () => {
-        // The real pattern: the caller's own view advances only after the transaction committed.
-      },
-    });
-    watermark = 42;
-    assert.equal(watermark, 42);
-    const pending = store.pendingBoundaries();
-    assert.equal(pending.length, 1);
-    assert.equal(pending[0].boundarySeq, 42);
-
-    // A failure inside the transaction must leave the store as it was.
-    assert.throws(() =>
-      store.advanceWithBoundary({
-        market: 'kraken_spot',
-        stream: 'trades',
-        boundarySeq: 99,
-        boundaryTsMs: 1_792_000_000_099,
-        updateWatermark: () => {
-          throw new Error('derived work failed');
-        },
-      }),
+    const db = internalsOf(store).db;
+    assert.equal(typeof store.advanceWithBoundary, 'undefined');
+    assert.equal(typeof store.clearBoundary, 'undefined');
+    assert.equal(typeof store.pendingBoundaries, 'undefined');
+    assert.equal(
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_boundary'").get(),
+      undefined,
+      'the redundant table is not recreated',
     );
-    assert.equal(watermark, 42, 'the caller only advances its own view after the transaction commits');
-    assert.equal(store.pendingBoundaries()[0].boundarySeq, 42, 'and the old boundary is still the one owed');
     store.close();
   });
 });
 
-test('once the derived work is applied the boundary stops being owed', async () => {
-  await withStore(async (dbPath) => {
-    const store = openDurability({ path: dbPath, runId: 'run-1' });
-    store.beginRun();
-    store.advanceWithBoundary({
-      market: 'kraken_spot',
-      stream: 'trades',
-      boundarySeq: 7,
-      boundaryTsMs: 1_792_000_000_007,
-      updateWatermark: () => {},
-    });
-    store.clearBoundary({ market: 'kraken_spot', stream: 'trades' });
-    assert.deepEqual(store.pendingBoundaries(), [], 'nothing is owed any more');
-    store.close();
-  });
-});
-
-test('an unfinished boundary is visible to the next run', async () => {
-  await withStore(async (dbPath) => {
-    const first = openDurability({ path: dbPath, runId: 'run-1' });
-    first.beginRun();
-    first.advanceWithBoundary({
-      market: 'binance_perp',
-      stream: 'depth',
-      boundarySeq: 500,
-      boundaryTsMs: 1_792_000_000_500,
-      updateWatermark: () => {},
-    });
-    first.close(); // dies before applying it
-
-    const second = openDurability({ path: dbPath, runId: 'run-2' });
-    const owed = second.pendingBoundaries();
-    assert.equal(owed.length, 1, 'the next run has to resolve it, not discover it later');
-    assert.equal(owed[0].market, 'binance_perp');
-    assert.equal(owed[0].runId, 'run-1', 'and it knows which generation left it');
-    second.close();
-  });
-});
 
 test('the received tail is what this process can prove, and it is per connection', async () => {
   await withStore(async (dbPath) => {

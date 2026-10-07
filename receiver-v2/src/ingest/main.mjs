@@ -33,6 +33,12 @@ import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
 import { attachChanges, deriveChanges } from '../changes.mjs';
 import { connect } from '../ipc.mjs';
 
+function assertInlineReceiveExecutor(options) {
+  if (options?.onEvent !== undefined) {
+    throw new TypeError('the ingest process does not accept a deferred receive-event executor');
+  }
+}
+
 /**
  * Build the ingest process around an already-open organize channel.
  *
@@ -76,6 +82,7 @@ export function createIngestProcess({
   if (!adapter) throw new TypeError('the ingest process needs a venue adapter');
   if (!runId) throw new TypeError('the ingest process needs a run id');
   if (!venue) throw new TypeError('the ingest process needs a venue');
+  assertInlineReceiveExecutor(receiveOptions);
   const instance = roleInstance ?? `ingest-${runId}`;
 
   const openedStoreHere = ingestStore === null;
@@ -89,7 +96,11 @@ export function createIngestProcess({
   // on right now, so the spool is the rung it goes to. A channel that is not up is the same answer.
   let organizeCapacity = 'ok';
   let stopped = false;
+  let quiescing = false;
   let closed = false;
+  let tailWriteFailure = null;
+  let receptionCloseFailure = null;
+  let unretainedFrameFailure = false;
   // The generations reception is waiting for an acceptance on, keyed by generation. Only these may be
   // settled by an `accepted`; anything else is a stale instance's answer (C2).
   const pendingAdmissions = new Map();
@@ -142,7 +153,12 @@ export function createIngestProcess({
         lastRecvMonoNs: envelope.recv_mono_ns,
       });
     } catch (error) {
-      onDiagnostic({ market, reason: `the receive tail could not be written: ${error.message}` });
+      if (tailWriteFailure === null) tailWriteFailure = error;
+      try {
+        onDiagnostic({ market, reason: `the receive tail could not be written: ${error.message}` });
+      } catch {
+        // a diagnostic must not prevent this accepted frame from being handed on or spooled
+      }
     }
   }
 
@@ -155,6 +171,7 @@ export function createIngestProcess({
   function deriveAndSend(envelope) {
     const derived = deriveChanges(adapter, envelope);
     if (!derived.ok) {
+      unretainedFrameFailure = true;
       onDiagnostic({ market, reason: `the level changes were refused: ${derived.reason}` });
       onGap({ market, reason: derived.reason, seq: envelope.receive_seq });
       return { accepted: false, reason: derived.reason };
@@ -176,7 +193,11 @@ export function createIngestProcess({
       try {
         ok = organizeChannelRef.sendEnvelope(envelope);
       } catch (error) {
-        onDiagnostic({ market, reason: `the organize link refused a frame: ${error.message}` });
+        try {
+          onDiagnostic({ market, reason: `the organize link refused a frame: ${error.message}` });
+        } catch {
+          // a diagnostic must not interrupt fallback retention of this accepted frame
+        }
         ok = false;
       }
       if (ok) {
@@ -189,13 +210,44 @@ export function createIngestProcess({
 
   /** Append one frame to the spool. False from the spool is a stop signal, not a reason to drop it. */
   function spoolFrame(envelope) {
-    if (spool !== null && spool.append(envelope) && !spool.failed) {
+    let retained = false;
+    try {
+      retained = spool !== null && spool.append(envelope) && !spool.failed;
+    } catch (error) {
+      unretainedFrameFailure = true;
+      throw error;
+    }
+    if (retained) {
       spooledFrames += 1;
       return { accepted: true, spooled: true };
     }
+    unretainedFrameFailure = true;
     stopReception('nothing could hold the frame');
     onGap({ market, reason: 'the organize link could not take the frame and the spool could not hold it', seq: envelope.receive_seq });
     return { accepted: false, reason: 'nothing could hold the frame' };
+  }
+
+  function fenceReception() {
+    if (quiescing) return false;
+    quiescing = true;
+    stopped = true;
+    stopReadinessReporting();
+    try {
+      connection.stop();
+    } catch (error) {
+      receptionCloseFailure = error;
+      try {
+        onDiagnostic({ market, reason: `reception could not be closed: ${error.message}` });
+      } catch {
+        // the fence below is the fact that matters
+      }
+    }
+    return true;
+  }
+
+  async function quiesce() {
+    fenceReception();
+    return { quiesced: true };
   }
 
   /**
@@ -205,17 +257,7 @@ export function createIngestProcess({
    */
   function stopReception(reason) {
     if (stopped || closed) return;
-    stopped = true;
-    stopReadinessReporting();
-    try {
-      connection.stop();
-    } catch (error) {
-      try {
-        onDiagnostic({ market, reason: `reception could not be closed: ${error.message}` });
-      } catch {
-        // the stop below is the fact that matters
-      }
-    }
+    fenceReception();
     onStop({ market, reason });
   }
 
@@ -241,7 +283,7 @@ export function createIngestProcess({
    * is returned false, so `connection.mjs` opens no socket until `settle` hears `accepted`.
    */
   function handleGeneration(info) {
-    if (closed) return false;
+    if (closed || quiescing) return false;
     const message = acceptMessage(info);
     pendingAdmissions.set(info.generation, {
       requestId: message.request_id,
@@ -509,33 +551,46 @@ export function createIngestProcess({
     try {
       return organizeChannelRef.sendControl(message);
     } catch (error) {
-      onDiagnostic({ market, reason: `a control message could not be sent: ${error.message}` });
+      try {
+        onDiagnostic({ market, reason: `a control message could not be sent: ${error.message}` });
+      } catch {
+        // the candidate remains local evidence, not a control-channel acknowledgement
+      }
       return false;
     }
   }
 
+  /** Return a local tail snapshot after intake has been fenced. */
+  function finalTailCandidate() {
+    if (!quiescing || tailWriteFailure !== null || unretainedFrameFailure) return null;
+    if (spool !== null && (spool.bytes !== 0 || spool.failed !== null)) return null;
+    const tails = Object.freeze(
+      store
+        .receivedTails()
+        .filter((row) => row.market === market && (row.stream === stream || row.stream === ''))
+        .map((row) => Object.freeze({ connectionId: row.connectionId, lastReceivedSeq: row.lastReceivedSeq })),
+    );
+    return Object.freeze({ tails, spoolEmpty: true });
+  }
+
   /**
-   * The final tails, sealed on the reception side (ruling ⑨⑩). After reception has stopped this is the
-   * list organize judges "all acknowledged" against: every connection this process wrote a tail for,
-   * with the last sequence it received, plus whether the spool is empty. The tail is a reception fact
-   * only - it does not claim durability or application - and organize is the one that decides.
+   * Fence intake, then return the local final-tail candidate if every local receipt is trustworthy.
+   * Sending this candidate is only a request; neither a successful nor refused IPC enqueue is an ACK.
    */
-  function sealTails() {
-    const tails = store
-      .receivedTails()
-      .filter((row) => row.market === market && (row.stream === stream || row.stream === ''))
-      .map((row) => ({ connectionId: row.connectionId, lastReceivedSeq: row.lastReceivedSeq }));
-    const spoolEmpty = spool === null ? true : spool.bytes === 0;
+  async function sealTails() {
+    await quiesce();
+    const candidate = finalTailCandidate();
+    if (candidate === null) return null;
     sendControlBestEffort(
       makeMessage({
         version: IPC_VERSION,
         type: 'tail_sealed',
         role_instance: instance,
         run_id: runId,
-        payload: { tails, spool_empty: spoolEmpty },
+        payload: { tails: candidate.tails, spool_empty: true },
       }),
     );
-    return { tails, spoolEmpty };
+    return candidate;
   }
 
   /**
@@ -636,31 +691,39 @@ export function createIngestProcess({
 
     start() {
       if (closed) return { started: false, reason: 'this ingest process is closed' };
-      if (stopped) return { started: false, reason: 'this ingest process has stopped' };
+      if (quiescing || stopped) return { started: false, reason: 'this ingest process has stopped' };
       connection.start();
       return { started: true };
     },
 
-    /** A clean stop: reception ends and the spool is closed. */
-    stop() {
-      if (closed) return;
-      stopReadinessReporting();
-      connection.stop();
+    /**
+     * Fence new socket events and reconnects without closing the spool. The production fork executes
+     * accepted receive callbacks synchronously; the async boundary lets a reentrant caller await the
+     * remainder of the current JavaScript callback before inspecting its tail.
+     */
+    quiesce,
+
+    /** Fence new reception after accepted synchronous callbacks, then close the resumable spool. */
+    async stop() {
+      if (closed) return { stopped: false, reason: 'this ingest process is closed' };
+      await quiesce();
       spool?.close();
+      const failure = receptionCloseFailure ?? tailWriteFailure ?? spool?.failed;
+      const abnormal = failure != null || unretainedFrameFailure;
+      return {
+        stopped: receptionCloseFailure === null,
+        abnormal,
+        ...(abnormal ? { reason: failure?.message ?? 'a received frame could not be retained' } : {}),
+      };
     },
 
     /** The termination of the process: reception, the spool, and the store it opened itself. */
     close() {
       if (closed) return;
-      stopReadinessReporting();
-      connection.stop();
+      fenceReception();
       spool?.close();
       if (openedStoreHere) {
-        try {
-          store.close();
-        } catch {
-          // a store that will not close is not this close's failure to report
-        }
+        store.close();
       }
       closed = true;
     },
@@ -734,6 +797,7 @@ export function createIngestProcess({
  * live link and the first generation's `accept` can go out immediately.
  */
 export async function openIngestProcess(options) {
+  assertInlineReceiveExecutor(options);
   const { organizeSocketPath = null, channelOptions = {}, ...rest } = options;
   let process = null;
   const channel = organizeSocketPath

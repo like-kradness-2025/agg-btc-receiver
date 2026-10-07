@@ -24,11 +24,9 @@
  *   - `book_invalidation`    the loss protocol's record: the request, its range, its monotonic revision
  *                            and the fact that serving stopped - persisted with the missing record.
  *
- * What the book deliberately does not own: `run_marker`, `pending_boundary`, `suspected_gap`,
- * `organized_watermark`, `organize_gap`, `delivery_ledger` and the raw (organize), and `received_tail`
- * and the spool (ingest). There is no run marker here and no receive tail; the book is told a boundary
- * was applied by sending an `applied_ack`, and it never re-derives durability from anything it does not
- * hold.
+ * What the book deliberately does not own: `run_marker`, `suspected_gap`, `organized_watermark`, `organize_gap`,
+ * `delivery_ledger` and the raw (organize), and `received_tail` and the spool (ingest). The book only reports
+ * its applied boundary with `applied_ack`; it never re-derives durability from anything it does not hold.
  *
  * The three things this entrance fixes:
  *   1. the accept is authorized here (ruling ⑫): the owner, the generation ordering, an explicit
@@ -548,11 +546,7 @@ export function createBookProcess({
         }
       }
       if (openedStoreHere) {
-        try {
-          internalsOf(bookStore).close();
-        } catch {
-          // a store that will not close is not this close's failure to report
-        }
+        internalsOf(bookStore).close();
       }
     },
   };

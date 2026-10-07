@@ -26,6 +26,10 @@ import { fileURLToPath } from 'node:url';
 import { createRunSupervisor, RUN_ROLES } from '../src/supervisor/run.mjs';
 import { createForkSpawner } from '../src/supervisor/process-spawner.mjs';
 import { openOrganizeStore } from '../src/organize/store.mjs';
+import { createOrganizeProcess } from '../src/organize/main.mjs';
+import { createBookProcess } from '../src/book/main.mjs';
+import { makeEnvelope } from '../src/envelope.mjs';
+import { IPC_VERSION, makeMessage } from '../src/ipc-message.mjs';
 
 const KRAKEN_ADAPTER = fileURLToPath(new URL('../test-support/kraken-venue-adapter.mjs', import.meta.url));
 const FAKE_WEBSOCKET = fileURLToPath(new URL('../test-support/fake-websocket.mjs', import.meta.url));
@@ -107,7 +111,6 @@ async function withRun(fn) {
     bookStorePath: join(dir, 'book.sqlite'),
     spoolDir: join(dir, 'spool'),
     startupDeadlineMs: 30_000,
-    stopDeadlineMs: 5_000,
     readinessIntervalMs: 50,
     onStep: (event) => steps.push(event.step),
     onChildExit: (info) => exits.push(info),
@@ -143,7 +146,7 @@ async function serve(supervisor, venue, count) {
   });
 }
 
-test('three roles run as real OS processes: frames reach the board and a clean stop completes the run', async () => {
+test('three roles run as real OS processes: frames reach the board and a clean stop leaves no completion', async () => {
   await withRun(async ({ supervisor, steps, venue }) => {
     const started = await supervisor.start();
     assert.equal(started.started, true, `the run started: ${started.reason ?? ''}`);
@@ -173,23 +176,152 @@ test('three roles run as real OS processes: frames reach the board and a clean s
 
     const result = await supervisor.stop();
     assert.deepEqual(result.processingOrder, ['ingest', 'organize', 'book']);
-    assert.equal(result.allAcked, true, 'organize judged every sealed tail reached');
+    assert.equal(result.stopped, true);
+    assert.equal('allAcked' in result, false, 'shutdown makes no final-tail judgement');
+    assert.equal('completion' in result, false, 'shutdown makes no completeness claim');
     assert.equal(result.book.stopped, true, 'the board stop result was confirmed');
-    assert.equal(result.completion.completed, true, 'the completion was written only then');
     assert.equal(result.abnormal, false, 'a clean stop is not an abnormal end');
 
     const organizeStorePath = supervisor.stats.roles.organize.storePath;
     const closed = await supervisor.close();
     assert.deepEqual(closed.terminationOrder, ['book', 'organize', 'ingest'], 'processes terminate in their own order');
-    assert.equal(closed.completed, true);
+    assert.equal(closed.shutdownSucceeded, true);
+    for (const pid of pids) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'every role exited');
+    assert.equal('completed' in closed, false);
+    assert.equal(supervisor.exclusion.heldCount, 0, 'all store leases were released');
 
     const store = openOrganizeStore({ path: organizeStorePath, runId: `${RUN}-reader` });
     try {
-      assert.equal(store.runMarkerState(RUN), 'complete', 'the run was marked complete');
+      assert.equal(store.runMarkerState(RUN), 'invalidated', 'opening the store invalidates the stopped running marker');
+      store.beginRun();
+      assert.equal(store.runMarkerState(`${RUN}-reader`), 'running', 'the store can begin a new run');
     } finally {
       store.close();
     }
   });
+});
+
+test('startup refuses to admit a new connection while an old owed ledger frame is unresolved', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'through-recovery-gate-'));
+  const venue = await fakeVenue();
+  const organizeStorePath = join(dir, 'organize.sqlite');
+  const bookStorePath = join(dir, 'book.sqlite');
+  const connectionId = `${RUN}:${VENUE}:${MARKET}:1`;
+  const seedChannel = { sendControl: () => true, sendEnvelope: () => true, close() {} };
+  let supervisor = null;
+  const steps = [];
+  try {
+    const oldBook = createBookProcess({
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      storePath: bookStorePath,
+      roleInstance: 'book-seed',
+    });
+    const accepted = oldBook.handleControl(
+      makeMessage({
+        version: IPC_VERSION,
+        type: 'accept',
+        role_instance: 'ingest-seed',
+        request_id: 'seed-accept',
+        run_id: RUN,
+        market: MARKET,
+        stream: STREAM,
+        connection_id: connectionId,
+        generation: 1,
+        payload: { first_seq: 1, takeover: false },
+      }),
+      seedChannel,
+    );
+    assert.equal(accepted.accepted, true, 'the previous connection is accepted in the persistent book store');
+    oldBook.close();
+
+    const oldOrganizer = createOrganizeProcess({
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      storePath: organizeStorePath,
+      roleInstance: 'organize-seed',
+      rawWriter: () => true,
+    });
+    oldOrganizer.handleControl(
+      makeMessage({
+        version: IPC_VERSION,
+        type: 'accepted',
+        role_instance: 'book-seed',
+        request_id: 'seed-accept',
+        run_id: RUN,
+        market: MARKET,
+        stream: STREAM,
+        connection_id: connectionId,
+        generation: 1,
+        payload: { accepted: true, first_seq: 1, takeover: false },
+      }),
+      seedChannel,
+    );
+    oldOrganizer.handleEnvelope(
+      makeEnvelope({
+        market: MARKET,
+        stream: STREAM,
+        connectionId,
+        runId: RUN,
+        venue: VENUE,
+        generation: 1,
+        receiveSeq: 1,
+        recvTsMs: 1_001,
+        recvMonoNs: 1,
+        raw: 'unapplied-frame',
+        meta: { first_seq: 1, changes_format: 'unsupported', changes: { replace: false, changes: [] } },
+      }),
+      seedChannel,
+    );
+    assert.equal(oldOrganizer.recoveryStatus().owedCount, 1, 'the organizer has one committed frame still owed to the board');
+    oldOrganizer.close();
+
+    supervisor = createRunSupervisor({
+      market: MARKET,
+      stream: STREAM,
+      venue: VENUE,
+      runId: RUN,
+      routerListenPath: join(dir, 'router.sock'),
+      ingestStorePath: join(dir, 'ingest.sqlite'),
+      organizeStorePath,
+      bookStorePath,
+      spoolDir: join(dir, 'spool'),
+      startupDeadlineMs: 3_000,
+      onStep: (event) => steps.push(event.step),
+      spawner: createForkSpawner({
+        adapterSpec: { url: `ws://127.0.0.1:${venue.port}`, symbol: PAIR },
+        adapterModule: KRAKEN_ADAPTER,
+        websocketModule: FAKE_WEBSOCKET,
+        readinessIntervalMs: 50,
+      }),
+    });
+
+    const started = await supervisor.start();
+    assert.equal(started.started, false, `an unapplied old frame fails startup closed: ${started.reason}`);
+    assert.equal(steps.includes('e:accept'), false, 'the new generation was never requested before recovery');
+    assert.equal(venue.connected, false, 'the new venue socket was never opened');
+
+    const closed = await supervisor.close();
+    assert.notEqual(closed.completed, true, 'the unresolved recovery wrote no clean completion');
+    const reader = openOrganizeStore({ path: organizeStorePath, runId: `${RUN}-reader` });
+    try {
+      assert.notEqual(reader.runMarkerState(RUN), 'complete');
+    } finally {
+      reader.close();
+    }
+  } finally {
+    if (supervisor !== null) {
+      try {
+        await supervisor.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    venue.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('killing the book child alone keeps reception and organization running, restarts the book, and does not move the receive generation', async () => {

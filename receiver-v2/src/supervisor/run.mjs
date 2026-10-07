@@ -23,17 +23,11 @@
  *   (e) issue the connection. The accept is ingest's; the book authorizes; organize adopts; and only
  *       the adoption opens the socket. The book's success alone opens nothing.
  *
- * Stop order - the two orders are separate (ruling, §5.8):
- *
- *   processing stop: reception -> organization -> board. Reception seals its final tails first, so
- *   organize can judge "all acknowledged"; organize is then asked to stop accepting frames but is NOT
- *   yet allowed to write the completion; the board is stopped and its result is confirmed.
- *
- *   process termination: the children are closed in a distinct order, and each store is released only
- *   after that child's termination is confirmed.
- *
- * A run is a normal end only when BOTH hold: organize judged all acknowledged AND the board's stop
- * result was confirmed. "All ACK" alone is never a normal end (rulings ⑨⑩).
+ * Stop order: processing stops reception -> organization -> board. Accepted receive callbacks are
+ * synchronous in the forked role, so its stop RPC runs after the current callback. No final-tail
+ * proof or completion marker is part of ordinary shutdown; durable pending work resumes at startup.
+ * Children then close board -> organization -> reception, releasing stores after confirmed exit.
+ * Stop/close failures remain abnormal even if later termination succeeds.
  *
  * Child failure is by condition (ruling ⑬): the book alone is restarted, without renewing the receive
  * generation; organize failure keeps reception going within the spool's capacity, stops reception and
@@ -49,8 +43,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
+
+import { acquireStoreLock } from './store-lock.mjs';
 
 import { openRouter } from './router.mjs';
 import { openIngestProcess } from '../ingest/main.mjs';
@@ -59,7 +54,7 @@ import { openBookProcess } from '../book/main.mjs';
 
 export const RUN_ROLES = Object.freeze(['ingest', 'organize', 'book']);
 
-/** The processing stop order: stop what consumes first, write the record last, the board before it. */
+/** Stop intake before its downstream consumers. */
 export const PROCESSING_STOP_ORDER = Object.freeze(['ingest', 'organize', 'book']);
 
 /** The process termination order: the board is let go first, reception last (it owns the socket). */
@@ -67,11 +62,11 @@ export const TERMINATION_ORDER = Object.freeze(['book', 'organize', 'ingest']);
 
 const ROUTE_OPTIONS = Object.freeze({ batchFrames: 1 });
 
-async function until(predicate, { timeoutMs = 10_000, stepMs = 5, label = 'the condition' } = {}) {
-  const deadline = Date.now() + timeoutMs;
+async function until(predicate, { timeoutMs = 10_000, stepMs = 5, label = 'the condition', nowMs = () => Date.now() } = {}) {
+  const deadline = nowMs() + timeoutMs;
   for (;;) {
     if (predicate()) return true;
-    if (Date.now() >= deadline) {
+    if (nowMs() >= deadline) {
       throw new Error(`timed out (${timeoutMs} ms) waiting for ${label}`);
     }
     await new Promise((done) => setTimeout(done, stepMs));
@@ -95,80 +90,70 @@ export function defaultProcessAlive(pid, { self = process.pid } = {}) {
 }
 
 /**
- * A database-unit claim, held in a sidecar file next to the database. `OPEN_STORES` guards one process;
- * this guards the file, which is the unit the ruling names. A claim is refused while the recorded owner
- * is still alive; a stale claim (owner gone) is taken over, which is what makes a crash recoverable.
- * Release requires the old owner's termination to be confirmed - a live owner is never displaced by a
- * claim or a release, so a database cannot acquire a second writer through this path.
+ * A process-wide lease for one role database, backed by SQLite's atomic `BEGIN IMMEDIATE` lock rather
+ * than a read-then-write owner file. The lock is a sidecar held open by the supervisor while roles start
+ * and run. The role process also holds its own writer-scope lease (see `bin/role.mjs`), so a supervisor
+ * crash cannot admit another writer before a disconnected child has actually exited.
  */
 export function createStoreExclusion({ isProcessAlive = defaultProcessAlive, nowMs = () => Date.now() } = {}) {
-  const lockPathOf = (dbPath) => `${resolve(dbPath)}.owner`;
-  const held = new Map(); // resolved db path -> record
-
-  function readRecord(key) {
-    try {
-      return JSON.parse(readFileSync(`${key}.owner`, 'utf8'));
-    } catch {
-      return null;
-    }
-  }
-
-  function writeRecord(key, record) {
-    writeFileSync(`${key}.owner`, JSON.stringify(record), 'utf8');
-  }
-
-  function clearRecord(key) {
-    try {
-      unlinkSync(`${key}.owner`);
-    } catch {
-      /* already gone */
-    }
-  }
+  const held = new Map(); // resolved store path -> { owner, lease }
 
   return {
     claim({ path, role, instance, pid = process.pid }) {
       if (!path) return { claimed: false, code: 'NO_PATH', reason: 'a store claim needs a path' };
       const key = resolve(path);
-      const existing = readRecord(key);
-      if (existing !== null && isProcessAlive(existing.pid)) {
+      const existing = held.get(key);
+      if (existing) {
         return {
           claimed: false,
           code: 'STORE_ALREADY_OWNED',
-          reason: `${key} is held by ${existing.role}/${existing.instance} (pid ${existing.pid})`,
-          owner: existing,
+          reason: `${key} is held by ${existing.owner.role}/${existing.owner.instance} (pid ${existing.owner.pid})`,
+          owner: existing.owner,
         };
       }
-      const record = { role, instance, pid, claimed_at_ms: nowMs(), file: key };
-      writeRecord(key, record);
-      held.set(key, record);
-      return { claimed: true, path: key, tookOverStale: existing !== null, owner: record };
+      const lease = acquireStoreLock({ path: key, role, instance, scope: 'supervisor' });
+      if (!lease.acquired) {
+        return {
+          claimed: false,
+          code: 'STORE_ALREADY_OWNED',
+          reason: lease.reason,
+        };
+      }
+      const owner = { role, instance, pid, claimed_at_ms: nowMs(), file: lease.path };
+      held.set(key, { owner, lease });
+      return { claimed: true, path: lease.path, tookOverStale: false, owner };
     },
 
     /**
-     * Release a claim. A release is refused unless the old owner's termination is confirmed
-     * (`confirmedTerminated`) or its pid is no longer alive - the whole point is that a database does
-     * not change hands while its old writer may still be writing.
+     * Release only after the child is confirmed gone (or its pid is no longer alive). A timeout or a
+     * SIGKILL request without an observed exit is not confirmation and must leave the SQLite lease held.
      */
     release({ path, instance, confirmedTerminated = false }) {
       const key = resolve(path);
-      const existing = held.get(key) ?? readRecord(key);
-      if (existing === null) return { released: false, reason: 'this store was not claimed' };
-      if (instance !== undefined && existing.instance !== instance) {
+      const record = held.get(key);
+      if (!record) return { released: false, reason: 'this store was not claimed by this supervisor' };
+      if (instance !== undefined && record.owner.instance !== instance) {
         return { released: false, refused: true, reason: 'a different instance owns this store' };
       }
-      if (!confirmedTerminated && isProcessAlive(existing.pid)) {
-        return { released: false, refused: true, reason: `the owner ${existing.instance} is still alive` };
+      if (!confirmedTerminated && isProcessAlive(record.owner.pid)) {
+        return { released: false, refused: true, reason: `the owner ${record.owner.instance} is still alive` };
       }
-      clearRecord(key);
-      held.delete(key);
-      return { released: true, path: key };
+      try {
+        const result = record.lease.release();
+        if (result.released) held.delete(key);
+        return result;
+      } catch (error) {
+        return { released: false, refused: true, reason: `the SQLite owner lock could not be released: ${error.message}` };
+      }
     },
 
     heldBy(path) {
-      return readRecord(resolve(path));
+      return held.get(resolve(path))?.owner ?? null;
     },
 
-    lockPath: (path) => lockPathOf(path),
+    lockPath(path) {
+      return `${resolve(path)}.supervisor-lock.sqlite`;
+    },
 
     get heldCount() {
       return held.size;
@@ -288,7 +273,7 @@ export function decideChildFailure(
  * replace it; the wiring above it does not change.
  */
 async function inProcessSpawner(role, { options }) {
-  if (role === 'ingest') return openIngestProcess(options);
+  if (role === 'ingest') return openIngestProcess({ ...options, takeoverFor: () => options.takeover === true });
   if (role === 'organize') return openOrganizeProcess(options);
   if (role === 'book') return openBookProcess(options);
   throw new TypeError(`no entrance for role ${role}`);
@@ -321,7 +306,12 @@ export function createRunSupervisor(options = {}) {
     // well under `reportDeadlineMs` so a live role is not expired by its own reporting interval.
     readinessIntervalMs = 1_000,
     startupDeadlineMs = 60_000,
-    stopDeadlineMs = 10_000,
+    stopRpcTimeoutMs = 1_000,
+    // The deadline clock is monotonic and injectable, like the receive connection's clock. Timer hooks
+    // keep the whole startup/first-serving boundary testable without changing production timing.
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
+    monotonicMs = () => Number(process.hrtime.bigint()) / 1e6,
     maxRestarts = 3,
     excludeStores = true,
     spawner = inProcessSpawner,
@@ -348,8 +338,133 @@ export function createRunSupervisor(options = {}) {
   let ended = false;
   let closed = false;
   let abnormal = false;
-  let completion = null;
+  let stopPromise = null;
+  let closeResult = null;
   let operationDepth = 0;
+  let startupDeadlineAt = null;
+  let startupDeadlineTimer = null;
+  let startupInProgress = false;
+  let hasServed = false;
+  let fatalReason = null;
+  let fatalExitPromise = null;
+
+  function clearStartupDeadline() {
+    if (startupDeadlineTimer !== null) {
+      clearTimer(startupDeadlineTimer);
+      startupDeadlineTimer = null;
+    }
+  }
+
+  function startupRemainingMs() {
+    if (startupDeadlineAt === null) return startupDeadlineMs;
+    return Math.max(0, startupDeadlineAt - monotonicMs());
+  }
+
+  function startupDeadlineError(label) {
+    return new Error(`${label} did not finish within the startup deadline (${startupDeadlineMs} ms)`);
+  }
+
+  function withStartupDeadline(promise, label) {
+    const remaining = startupRemainingMs();
+    if (remaining <= 0) return Promise.reject(startupDeadlineError(label));
+    let timer = null;
+    return Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => {
+        timer = setTimer(() => reject(startupDeadlineError(label)), remaining);
+        if (typeof timer?.unref === 'function') timer.unref();
+      }),
+    ]).finally(() => {
+      if (timer !== null) clearTimer(timer);
+    });
+  }
+
+  function withStopDeadline(promise, role) {
+    if (!Number.isFinite(stopRpcTimeoutMs) || stopRpcTimeoutMs <= 0) {
+      return Promise.reject(new Error(`the ${role} stop RPC has no valid timeout`));
+    }
+    let timer = null;
+    return Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => {
+        timer = setTimer(
+          () => reject(new Error(`the ${role} stop RPC timed out after ${stopRpcTimeoutMs} ms`)),
+          stopRpcTimeoutMs,
+        );
+        if (typeof timer?.unref === 'function') timer.unref();
+      }),
+    ]).finally(() => {
+      if (timer !== null) clearTimer(timer);
+    });
+  }
+
+  function currentBoardIsServing() {
+    const connectionId = children.ingest?.process.connectionId;
+    const boundary = children.book?.process.appliedBoundary;
+    return (
+      started &&
+      connectionId !== null &&
+      connectionId !== undefined &&
+      boundary?.connectionId === connectionId &&
+      children.book?.process.isRunning === true
+    );
+  }
+
+  function checkStartupDeadline() {
+    if (startupDeadlineTimer !== null) {
+      clearTimer(startupDeadlineTimer);
+      startupDeadlineTimer = null;
+    }
+    if (closed || ended || stopped || hasServed) return;
+    if (currentBoardIsServing()) {
+      hasServed = true;
+      startupDeadlineAt = null;
+      step('startup-served', { connectionId: children.ingest?.process.connectionId ?? null });
+      return;
+    }
+    const remaining = startupRemainingMs();
+    if (remaining <= 0) {
+      requestFatal(`reception was not reached within the startup deadline (${startupDeadlineMs} ms)`);
+      return;
+    }
+    startupDeadlineTimer = setTimer(checkStartupDeadline, Math.min(25, remaining));
+    if (typeof startupDeadlineTimer?.unref === 'function') startupDeadlineTimer.unref();
+  }
+
+  function armServingDeadline() {
+    if (hasServed || closed || ended || stopped) return;
+    checkStartupDeadline();
+  }
+
+  function finishFatalRun() {
+    if (fatalExitPromise !== null || closed) return fatalExitPromise;
+    abnormal = true;
+    clearStartupDeadline();
+    fatalExitPromise = (async () => {
+      try {
+        await terminate();
+      } catch (error) {
+        diagnostic(`the failed run could not terminate every role: ${error.message}`, { kind: 'terminate' });
+      }
+      try {
+        exit(1);
+      } catch {
+        /* the fatal exit is best-effort after all role termination attempts */
+      }
+    })();
+    return fatalExitPromise;
+  }
+
+  function requestFatal(reason) {
+    if (fatalReason === null) {
+      fatalReason = reason;
+      abnormal = true;
+      diagnostic(reason, { kind: 'failure' });
+    }
+    // While the startup sequence is running, its deadline-bounded awaits will return a failed start and
+    // the entrance owns termination. After admission, the run supervisor owns the abnormal end.
+    if (!startupInProgress && started) void finishFatalRun();
+  }
 
   function diagnostic(reason, extra = {}) {
     try {
@@ -398,6 +513,9 @@ export function createRunSupervisor(options = {}) {
           adapter,
           venue,
           runId,
+          // This supervisor owns the stores. start() admits this run only after old spool/ledger
+          // recovery, so its accept may explicitly replace the persisted book owner from a prior run.
+          takeover: true,
           roleInstance: instance,
           webSocketImpl,
           organizeSocketPath: router.path,
@@ -453,6 +571,7 @@ export function createRunSupervisor(options = {}) {
    */
   async function spawnRole(role, suffix = null) {
     const spec = specFor(role, suffix);
+    spec.startupTimeoutMs = startupRemainingMs();
     const dbPath = storePathFor(role);
     if (excludeStores && dbPath) {
       const claim = exclusion.claim({ path: dbPath, role, instance: spec.instance });
@@ -461,7 +580,18 @@ export function createRunSupervisor(options = {}) {
       }
       if (claim.tookOverStale) diagnostic(`recovered a stale store claim for the ${role}`, { kind: 'exclusion' });
     }
-    const process = await spawner(role, spec);
+    let process;
+    try {
+      process = await withStartupDeadline(spawner(role, spec), `the ${role} role to become ready`);
+    } catch (error) {
+      // The fork spawner only declares a timed-out spawn failed after it has confirmed that the child is
+      // gone. Keep the exclusion claim on any unconfirmed failure; releasing it while a writer may still
+      // be alive would admit a second owner.
+      if (excludeStores && dbPath && error?.terminatedConfirmed === true) {
+        exclusion.release({ path: dbPath, instance: spec.instance, confirmedTerminated: true });
+      }
+      throw error;
+    }
     const handle = { role, instance: spec.instance, process, storePath: dbPath };
     children[role] = handle;
     // Stage 5c: a real child process announces its own death (with code and signal) through the
@@ -503,15 +633,16 @@ export function createRunSupervisor(options = {}) {
     releaseRole(role, { confirmedTerminated: true });
   }
 
-  async function waitForRoles(timeoutMs) {
+  async function waitForRoles(timeoutMs = startupRemainingMs()) {
     await until(() => RUN_ROLES.every((role) => router.channels().has(role)), {
       timeoutMs,
+      nowMs: monotonicMs,
       label: 'all three roles to announce themselves to the supervisor',
     });
     for (const role of RUN_ROLES) readiness.setBoundInstance(role, router.instances().get(role));
   }
 
-  async function waitForAdmission(timeoutMs) {
+  async function waitForAdmission(timeoutMs = startupRemainingMs()) {
     // Admission is the round trip, not the moment a connection id appears: ingest names its connection
     // as soon as it is announced (before anyone answered), so the id alone would let the startup race
     // past (e). What proves the socket may open is organize's adoption having come back - reception
@@ -524,21 +655,29 @@ export function createRunSupervisor(options = {}) {
     // the supervisor wait for a deadline to pass and only then catch a later generation.
     await until(
       () => {
+        if (fatalReason !== null) throw new Error(fatalReason);
         const ingest = children.ingest?.process;
         if (!ingest || ingest.connectionId == null) return false;
         if (router.pendingAcceptCount !== 0) return false;
         const state = ingest.state;
         return typeof state === 'string' && state !== '' && state !== 'idle' && state !== 'refused';
       },
-      { timeoutMs, label: 'the connection to be authorized, adopted and admitted' },
+      { timeoutMs, nowMs: monotonicMs, label: 'the connection to be authorized, adopted and admitted' },
     );
   }
 
-  async function waitForAllAcked(timeoutMs) {
-    await until(() => children.organize?.process.allAcked === true, {
-      timeoutMs,
-      label: 'organize to judge every sealed tail reached',
-    });
+  /** Keep the new connection gated until every confirmed ledger row is applied or otherwise resolved. */
+  async function waitForDeliveryRecovery() {
+    for (;;) {
+      const status = await withStartupDeadline(
+        children.organize.process.recoveryStatus(),
+        'the delivery-ledger recovery check',
+      );
+      if (status?.resolved === true) return status;
+      const remaining = startupRemainingMs();
+      if (remaining <= 0) throw startupDeadlineError('delivery-ledger recovery');
+      await new Promise((done) => setTimeout(done, Math.min(25, remaining)));
+    }
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -546,121 +685,138 @@ export function createRunSupervisor(options = {}) {
   // -----------------------------------------------------------------------------------------------
 
   async function start() {
-    return runOperation(async () => {
-      if (ended) return { started: false, reason: 'this run has ended' };
-      if (started) return { started: true, connectionId: children.ingest?.process.connectionId ?? null };
-      try {
-        router = await openRouter({
-          listenPath: routerListenPath,
-          channelOptions: ROUTE_OPTIONS,
-          onDiagnostic: (d) => diagnostic(d?.reason ?? String(d), { kind: 'router' }),
-          // Stage 5c: the roles' readiness reports are observed by the router and fed to the
-          // aggregator here. This closes stage 5b's reservation (the reports were not wired to it).
-          onObserved: (observed) => {
-            if (observed.type === 'readiness') readiness.noteReport(observed.from, observed.message?.payload ?? {});
-          },
-        });
-        step('router', { path: router.path });
+    if (ended) return { started: false, reason: 'this run has ended' };
+    if (started) return { started: true, connectionId: children.ingest?.process.connectionId ?? null };
 
-        await spawnRole('organize');
-        await spawnRole('book');
-        await spawnRole('ingest');
-        await waitForRoles(startupDeadlineMs);
-        step('bound', { instances: RUN_ROLES.map((r) => router.instances().get(r)) });
+    startupInProgress = true;
+    startupDeadlineAt = monotonicMs() + startupDeadlineMs;
+    let result;
+    try {
+      result = await runOperation(async () => {
+        try {
+          router = await withStartupDeadline(
+            openRouter({
+              listenPath: routerListenPath,
+              channelOptions: ROUTE_OPTIONS,
+              onDiagnostic: (d) => diagnostic(d?.reason ?? String(d), { kind: 'router' }),
+              // Role readiness reports feed the run-wide aggregator. Errors are separate facts: an
+              // ingest subscription refusal is a failed start, not merely a readiness observation.
+              onObserved: (observed) => {
+                if (observed.type === 'readiness') {
+                  readiness.noteReport(observed.from, observed.message?.payload ?? {});
+                  if (observed.from === 'book' && observed.message?.payload?.ready === true) {
+                    checkStartupDeadline();
+                  }
+                  return;
+                }
+                if (observed.type === 'error' && observed.from === 'ingest') {
+                  const payload = observed.message?.payload ?? {};
+                  if (payload.role !== 'ingest') return;
+                  const reason = payload.reason ?? 'the venue refused the subscription';
+                  requestFatal(`the ingest subscription failed: ${reason}`);
+                }
+              },
+            }),
+            'the supervisor router to open',
+          );
+          step('router', { path: router.path });
 
-        // (a) mark this run live.
-        await children.organize.process.beginRun();
-        step('a:beginRun', {});
+          await spawnRole('organize');
+          await spawnRole('book');
+          await spawnRole('ingest');
+          await waitForRoles(startupRemainingMs());
+          step('bound', { instances: RUN_ROLES.map((r) => router.instances().get(r)) });
 
-        // (b) hand organize the book's applied boundary - never omitted, even when it is empty.
-        const boundary = children.book.process.appliedBoundary;
-        const recorded = await children.organize.process.resumeFromBoundary(boundary);
-        step('b:boundary', { recorded: recorded.recorded, boundary });
+          // (a) mark this run live.
+          await withStartupDeadline(children.organize.process.beginRun(), 'beginRun');
+          step('a:beginRun', {});
 
-        // (c) the old spool, oldest-first.
-        const drained = await children.ingest.process.drainSpool();
-        step('c:drainSpool', drained);
+          // (b) hand organize the book's applied boundary - never omitted, even when it is empty.
+          const boundary = children.book.process.appliedBoundary;
+          const recorded = await withStartupDeadline(
+            children.organize.process.resumeFromBoundary(boundary),
+            'boundary restore',
+          );
+          step('b:boundary', { recorded: recorded.recorded, boundary });
 
-        // (d) what is durable and owed goes to the board - before (e), the invariant this wiring fixes.
-        const delivered = await children.organize.process.deliverOwed();
-        step('d:deliverOwed', delivered);
+          // (c) the old spool, oldest-first.
+          const drained = await withStartupDeadline(children.ingest.process.drainSpool(), 'old spool drain');
+          step('c:drainSpool', drained);
 
-        // (e) issue the connection; the socket opens only once the book authorized and organize adopted.
-        await children.ingest.process.start();
-        step('e:accept', {});
-        await waitForAdmission(startupDeadlineMs);
-        started = true;
-        step('admitted', { connectionId: children.ingest.process.connectionId });
-        return { started: true, connectionId: children.ingest.process.connectionId };
-      } catch (error) {
-        abnormal = true;
-        diagnostic(`the run could not start: ${error.message}`, { kind: 'startup' });
-        return { started: false, reason: error.message };
+          // (d) what is durable and owed goes to the board - before (e), the invariant this wiring fixes.
+          const delivered = await withStartupDeadline(children.organize.process.deliverOwed(), 'owed delivery');
+          step('d:deliverOwed', delivered);
+          const recovery = await waitForDeliveryRecovery();
+          step('d:deliveryRecoveryResolved', recovery);
+
+          // (e) issue the connection; the socket opens only once the book authorized and organize adopted.
+          await withStartupDeadline(children.ingest.process.start(), 'connection admission');
+          step('e:accept', {});
+          await waitForAdmission(startupRemainingMs());
+          if (fatalReason !== null) throw new Error(fatalReason);
+          started = true;
+          step('admitted', { connectionId: children.ingest.process.connectionId });
+          return { started: true, connectionId: children.ingest.process.connectionId };
+        } catch (error) {
+          abnormal = true;
+          clearStartupDeadline();
+          diagnostic(`the run could not start: ${error.message}`, { kind: 'startup' });
+          return { started: false, reason: error.message };
+        }
+      });
+      if (result?.started === true) armServingDeadline();
+      else {
+        clearStartupDeadline();
+        startupDeadlineAt = null;
       }
-    });
+      return result;
+    } finally {
+      startupInProgress = false;
+      if (fatalReason !== null && started) void finishFatalRun();
+    }
   }
 
   // -----------------------------------------------------------------------------------------------
   // Stop: processing order, then termination order, kept apart.
   // -----------------------------------------------------------------------------------------------
 
-  /**
-   * Stop processing in the order reception -> organization -> board. Organize keeps its completion
-   * capability until the board's stop result is confirmed; the completion is written only when both
-   * "all acknowledged" and that confirmation hold. This is the deliberate refusal to call a run a
-   * normal end on all-ACK alone.
-   */
-  async function stop() {
-    return runOperation(async () => {
-      if (closed) return { stopped: false, reason: 'this run is closed' };
-      if (stopped) return { stopped: true, already: true };
+  /** Stop local processing without asserting that the venue's final state is complete. */
+  function stop() {
+    if (stopPromise !== null) return stopPromise;
+    stopPromise = runOperation(async () => {
+      if (closed) return { stopped: false, abnormal: true, reason: 'this run is closed' };
+      clearStartupDeadline();
+      startupDeadlineAt = null;
       stopped = true;
       const results = { processingOrder: [...PROCESSING_STOP_ORDER] };
-
-      // reception: seal the final tails first, then stop receiving.
-      if (children.ingest) {
-        results.sealed = await children.ingest.process.sealTails();
-        await children.ingest.process.stop();
-        step('stop:ingest', results.sealed);
+      let confirmed = true;
+      for (const role of PROCESSING_STOP_ORDER) {
+        try {
+          const child = children[role];
+          results[role] = child
+            ? await withStopDeadline(child.process.stop('the run is stopping'), role)
+            : { stopped: false, reason: `the ${role} process is absent` };
+        } catch (error) {
+          results[role] = { stopped: false, reason: error.message };
+        }
+        step(`stop:${role}`, results[role]);
+        if (results[role]?.stopped !== true) confirmed = false;
+        if (results[role]?.stopped !== true || results[role]?.abnormal === true) {
+          abnormal = true;
+          diagnostic(`the ${role} stop was not normal: ${results[role]?.reason ?? 'stop not confirmed'}`, { kind: 'stop' });
+        }
       }
-      // organization: judged on the sealed tails; asked to stop accepting, but not to finalize yet.
-      try {
-        await waitForAllAcked(stopDeadlineMs);
-        results.allAcked = true;
-      } catch {
-        results.allAcked = false;
-        diagnostic('the sealed tails were not judged reached before the deadline', { kind: 'stop' });
-      }
-      if (children.organize) {
-        results.organize = await children.organize.process.requestStop('the run is stopping');
-        step('stop:organize', results.organize);
-      }
-      // the board: stopped, and its result confirmed.
-      if (children.book) {
-        results.book = await children.book.process.stop();
-        step('stop:book', results.book);
-      }
-      const bookConfirmed = results.book?.stopped === true;
-      // The completion needs BOTH: the sealed tails reached, and the board's stop confirmed.
-      if (bookConfirmed && results.allAcked && children.organize) {
-        results.completion = await children.organize.process.finalize();
-      } else {
-        results.completion = {
-          completed: false,
-          reason: !bookConfirmed
-            ? 'the board stop was not confirmed, so no completion is written'
-            : 'not every sealed tail was judged reached',
-        };
-      }
-      completion = results.completion;
-      abnormal = results.completion.completed !== true;
-      return { stopped: true, ...results, abnormal };
+      return { stopped: confirmed, ...results, abnormal };
     });
+    return stopPromise;
   }
 
   /** Terminate the child processes in their own order, releasing each store once it is confirmed gone. */
   async function terminate() {
+    clearStartupDeadline();
+    startupDeadlineAt = null;
     const order = [...TERMINATION_ORDER];
+    const unconfirmed = [];
     for (const role of order) {
       const handle = children[role];
       if (!handle) continue;
@@ -668,12 +824,28 @@ export function createRunSupervisor(options = {}) {
       // Null the child first: an intentional close must not read as an abnormal death, and the exit
       // guard is the handle's identity.
       children[role] = null;
+      let closeCompleted = false;
       try {
-        await handle.process.close();
+        const outcome = await handle.process.close();
+        closeCompleted = outcome?.terminated === true || handle.process.exitInfo != null || handle.process.pid == null;
+        const info = outcome?.exitInfo ?? handle.process.exitInfo;
+        if (outcome?.clean === false || (info != null && (info.code !== 0 || info.signal != null))) {
+          abnormal = true;
+          diagnostic(`the ${role} did not close normally`, { kind: 'terminate' });
+        }
       } catch (error) {
+        closeCompleted = handle.process.exitInfo != null;
+        abnormal = true;
         diagnostic(`the ${role} could not be closed cleanly: ${error.message}`, { kind: 'terminate' });
       }
-      releaseRole(role, { confirmedTerminated: true });
+      if (closeCompleted) {
+        releaseRole(role, { confirmedTerminated: true });
+      } else {
+        // A timeout or SIGKILL request is not proof of death. Keep the database exclusion claim held.
+        abnormal = true;
+        unconfirmed.push(role);
+        diagnostic(`the ${role} process termination was not confirmed; its store remains claimed`, { kind: 'terminate' });
+      }
     }
     try {
       router?.close();
@@ -683,24 +855,24 @@ export function createRunSupervisor(options = {}) {
     router = null;
     closed = true;
     ended = true;
-    return { terminationOrder: order };
+    return { terminationOrder: order, unconfirmed };
   }
 
-  /**
-   * The end of the run: a processing stop (unless one was made) followed by the termination order. The
-   * two orders are deliberately distinct; the completion was written by `stop`, never here.
-   */
+  /** Close every role/store after processing stops; success describes shutdown, never completeness. */
   async function close() {
-    if (closed) return { closed: true, completed: false, reason: 'this run was already closed' };
-    if (!stopped) await stop();
+    if (closeResult !== null) return closeResult;
+    if (closed) return { closed: true, shutdownSucceeded: false, abnormal, reason: 'this run was already closed' };
+    const processing = await stop();
     const termination = await terminate();
-    return {
+    closeResult = {
       closed: true,
       terminationOrder: termination.terminationOrder,
+      terminationConfirmed: termination.unconfirmed.length === 0,
+      unconfirmedTermination: termination.unconfirmed,
       abnormal,
-      completed: !abnormal && completion?.completed === true,
-      reason: completion?.reason,
+      shutdownSucceeded: processing.stopped === true && !abnormal && termination.unconfirmed.length === 0,
     };
+    return closeResult;
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -808,9 +980,6 @@ export function createRunSupervisor(options = {}) {
     get abnormal() {
       return abnormal;
     },
-    get completion() {
-      return completion;
-    },
     get stats() {
       return {
         market,
@@ -820,7 +989,6 @@ export function createRunSupervisor(options = {}) {
         ended,
         closed,
         abnormal,
-        completion,
         roles: Object.fromEntries(
           RUN_ROLES.map((role) => [
             role,

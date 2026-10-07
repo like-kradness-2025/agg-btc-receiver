@@ -20,11 +20,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { openIngestProcess } from '../src/ingest/main.mjs';
+import { createIngestProcess, openIngestProcess } from '../src/ingest/main.mjs';
 import { DEFAULT_ACK_DEADLINE_MS } from '../src/ingest/connection.mjs';
 import { startFakeOrganize } from '../test-support/fake-organize.mjs';
 
@@ -110,7 +111,7 @@ async function buildIngest({ dir, organize, label = 'a', ...options }) {
       timer.cleared = true;
     },
     onStop: (stop) => stops.push(stop),
-    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    onDiagnostic: options.onDiagnostic ?? ((diagnostic) => diagnostics.push(diagnostic)),
     onGap: (gap) => gaps.push(gap),
   });
   const fireByDelay = (ms) => {
@@ -373,6 +374,54 @@ test('C4: the null form sends nothing at all - never an empty frame', async () =
   }
 });
 
+test('the open ingest factory rejects a deferred executor before connecting its IPC channel', async () => {
+  await withWorld(async ({ dir, organize }) => {
+    await assert.rejects(
+      openIngestProcess({
+        market: MARKET,
+        stream: STREAM,
+        adapter: dataAdapter,
+        venue: VENUE,
+        runId: 'run-1',
+        webSocketImpl: fakeSockets().impl,
+        organizeSocketPath: organize.server.path,
+        ingestStorePath: join(dir, 'ingest.sqlite'),
+        spoolDir: join(dir, 'spool'),
+        onEvent: (_label, work) => queueMicrotask(work),
+      }),
+      /deferred receive-event executor/,
+    );
+    assert.equal(organize.server.channels.size, 0, 'refusal leaves no unowned IPC channel behind');
+  });
+});
+
+test('the ingest factory rejects deferred receive executors without a drain contract', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ingest-event-executor-'));
+  let process = null;
+  try {
+    assert.throws(
+      () => {
+        process = createIngestProcess({
+          market: MARKET,
+          stream: STREAM,
+          adapter: dataAdapter,
+          venue: VENUE,
+          runId: 'run-1',
+          webSocketImpl: fakeSockets().impl,
+          ingestStorePath: join(dir, 'ingest.sqlite'),
+          spoolDir: join(dir, 'spool'),
+          onEvent: (_label, work) => queueMicrotask(work),
+        });
+      },
+      /deferred receive-event executor/,
+      'the ingest owner cannot fence an executor whose accepted work it cannot drain',
+    );
+  } finally {
+    process?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------------------------------
 // ④ received_tail is written to the ingest's own store
 // ---------------------------------------------------------------------------------------------------
@@ -399,6 +448,332 @@ test('④ the receive tail is written to the ingest store, and survives as a row
     assert.equal(rows.length, 1);
     assert.equal(rows[0].connection_id, h.process.connectionId);
     assert.equal(rows[0].last_received_seq, 3);
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a quiesce begun from an accepted receive callback keeps its tail before the socket fence', async () => {
+  const h = await setup({ label: 'quiesce-race' });
+  let quiescePromise = null;
+  try {
+    const updateReceivedTail = h.process.ingestStore.updateReceivedTail;
+    h.process.ingestStore.updateReceivedTail = (tail) => {
+      // This is the strongest callback/stop interleaving available on the synchronous fork path: the
+      // receive callback has entered, and quiescence begins before its durable tail write completes.
+      quiescePromise = h.process.quiesce();
+      return updateReceivedTail(tail);
+    };
+
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+
+    const received = h.process.ingestStore.readReceivedTail(h.process.connectionId, STREAM);
+    assert.equal(received?.lastReceivedSeq, 1, 'the accepted callback finishes its tail after the fence begins');
+    assert.ok(quiescePromise instanceof Promise, 'quiescence settles after synchronous receive work returns');
+    await quiescePromise;
+    await until(() => h.organize.state.envelopes.length === 1, 'the already-accepted frame reaches organize');
+    assert.equal(h.sockets[0].closed, true, 'the active socket was fenced');
+    assert.equal(h.organize.state.envelopes.length, 1, 'the already-accepted frame is retained by organize');
+    assert.equal(h.organize.state.envelopes[0].receive_seq, 1, 'the retained frame matches the tail');
+    assert.deepEqual(h.process.start(), { started: false, reason: 'this ingest process has stopped' });
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a throwing tail diagnostic cannot discard a frame the organize link can take', async () => {
+  const h = await setup({
+    label: 'tail-diagnostic-failure',
+    onDiagnostic: () => {
+      throw new Error('injected diagnostic failure');
+    },
+  });
+  try {
+    h.process.ingestStore.updateReceivedTail = () => {
+      throw new Error('injected tail write failure');
+    };
+
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    assert.doesNotThrow(() => h.sockets[0].deliver('{"seq":1}'), 'diagnostic failure does not escape receive handling');
+    await until(() => h.organize.state.envelopes.length === 1);
+    assert.equal(h.organize.state.envelopes[0].receive_seq, 1, 'the accepted frame still reaches organize');
+    assert.equal(await h.process.sealTails(), null, 'the failed durable tail still forbids a candidate');
+  } finally {
+    await h.teardown();
+  }
+});
+
+// Exercise the inline receive callback used by the fork, including a seal begun inside diagnostics.
+function channelDiagnosticFailure(spoolMode) {
+  const dir = mkdtempSync(join(tmpdir(), 'ingest-channel-diagnostic-'));
+  const { sockets, impl } = fakeSockets();
+  const controls = [];
+  const diagnostics = [];
+  const envelopes = [];
+  let unavailable = spoolMode === 'unavailable';
+  let refusing = spoolMode === 'refusing';
+  let sealPromise = null;
+  const channel = {
+    sendControl(message) {
+      controls.push(message);
+      return true;
+    },
+    sendEnvelope() {
+      throw new Error('injected channel send failure');
+    },
+  };
+  const process = createIngestProcess({
+    market: MARKET,
+    stream: STREAM,
+    adapter: dataAdapter,
+    venue: VENUE,
+    runId: 'run-1',
+    webSocketImpl: impl,
+    organizeChannel: channel,
+    ingestStorePath: join(dir, 'ingest.sqlite'),
+    spoolDir: spoolMode === 'absent' ? null : join(dir, 'spool'),
+    spoolOptions: {
+      freeSpace: () => refusing ? 0 : Infinity,
+      fsModule: {
+        ...fs,
+        openSync: (...args) => {
+          if (unavailable) throw new Error('injected spool unavailable');
+          return fs.openSync(...args);
+        },
+      },
+    },
+    onDiagnostic(diagnostic) {
+      diagnostics.push(diagnostic);
+      if (diagnostic.reason.startsWith('the organize link refused a frame:')) {
+        sealPromise = process.sealTails();
+      }
+      throw new Error('injected diagnostic failure');
+    },
+  });
+  process.start();
+  const accept = controls.find((message) => message.type === 'accept');
+  process.handleControl({ ...accept, type: 'accepted', payload: { accepted: true } });
+  assert.equal(sockets.length, 1);
+  sockets[0].onopen();
+  return {
+    process, socket: sockets[0], diagnostics, envelopes,
+    get sealPromise() { return sealPromise; },
+    recover() {
+      unavailable = false;
+      refusing = false;
+      channel.sendEnvelope = (envelope) => { envelopes.push(envelope); return true; };
+    },
+    close() {
+      process.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test('a throwing channel diagnostic still spools the frame and permits a candidate after durable ACK', async () => {
+  const h = channelDiagnosticFailure('healthy');
+  try {
+    let deliveryError = null;
+    try { h.socket.deliver('{"seq":1}'); } catch (error) { deliveryError = error; }
+    assert.ok(h.sealPromise instanceof Promise, 'the diagnostic began sealing reentrantly');
+    const candidate = await h.sealPromise;
+    assert.equal(h.process.ingestStore.readReceivedTail(h.process.connectionId, STREAM)?.lastReceivedSeq, 1);
+    assert.equal(h.process.stats.spooledFrames, 1, 'the accepted frame is retained despite both exceptions');
+    const retained = [...h.process.spool.drain()];
+    assert.equal(retained.length, 1);
+    assert.equal(retained[0].receive_seq, 1);
+    assert.equal(retained[0].connection_id, h.process.connectionId);
+    assert.equal(deliveryError, null, 'the diagnostic exception is isolated');
+    assert.equal(candidate, null, 'reentrant sealing sees the outstanding spool obligation');
+    assert.deepEqual(h.diagnostics[0], { market: MARKET, reason: 'the organize link refused a frame: injected channel send failure' });
+
+    h.recover();
+    assert.deepEqual(h.process.drainSpool(), { resent: 1 });
+    assert.equal(h.envelopes[0].receive_seq, 1);
+    assert.equal(await h.process.sealTails(), null, 'resend alone does not release retention');
+    h.process.handleControl({ type: 'durable_ack', connection_id: h.process.connectionId, payload: { up_to_seq: 1 } });
+    assert.equal(h.process.spool.bytes, 0);
+    const afterAck = await h.process.sealTails();
+    assert.equal(afterAck?.spoolEmpty, true, 'successful fallback was not marked as lost');
+    assert.equal(afterAck?.tails[0]?.lastReceivedSeq, 1);
+  } finally {
+    h.close();
+  }
+});
+
+for (const spoolMode of ['absent', 'unavailable', 'refusing']) {
+  test(`a throwing channel diagnostic with ${spoolMode} spool keeps reentrant sealing failure sticky`, async () => {
+    const h = channelDiagnosticFailure(spoolMode);
+    try {
+      let deliveryError = null;
+      try { h.socket.deliver('{"seq":1}'); } catch (error) { deliveryError = error; }
+      assert.ok(h.sealPromise instanceof Promise, 'the diagnostic began sealing reentrantly');
+      const candidate = await h.sealPromise;
+      assert.equal(h.process.ingestStore.readReceivedTail(h.process.connectionId, STREAM)?.lastReceivedSeq, 1);
+      assert.equal(h.process.stats.spooledFrames, 0);
+      assert.equal(h.process.spool?.bytes ?? 0, 0);
+      assert.equal(candidate, null, 'a received but unretained frame must never yield a candidate');
+      assert.deepEqual(h.diagnostics[0], { market: MARKET, reason: 'the organize link refused a frame: injected channel send failure' });
+      if (spoolMode === 'unavailable') {
+        assert.match(deliveryError?.message ?? '', /injected spool unavailable/, 'retention reached the unavailable spool');
+        assert.equal(h.process.spool.failed, null, 'candidate refusal requires sticky ingest failure even without spool.failed');
+      } else {
+        assert.equal(deliveryError, null, 'the diagnostic exception is isolated');
+      }
+      h.recover();
+      assert.equal(await h.process.sealTails(), null, 'recovered channel and spool availability cannot erase an unretained frame');
+    } finally {
+      h.close();
+    }
+  });
+}
+
+test('a receive-tail write failure stays sticky without dropping later handable frames', async () => {
+  const h = await setup({ label: 'tail-failure' });
+  try {
+    const updateReceivedTail = h.process.ingestStore.updateReceivedTail;
+    let failOnce = true;
+    h.process.ingestStore.updateReceivedTail = (tail) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('injected tail write failure');
+      }
+      return updateReceivedTail(tail);
+    };
+
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    h.sockets[0].deliver('{"seq":2}');
+
+    await until(() => h.organize.state.envelopes.length === 2);
+    assert.deepEqual(
+      h.organize.state.envelopes.map((envelope) => envelope.receive_seq),
+      [1, 2],
+      'a failed tail write does not prevent either frame from reaching organize',
+    );
+    assert.equal(
+      h.process.ingestStore.readReceivedTail(h.process.connectionId, STREAM)?.lastReceivedSeq,
+      2,
+      'a later successful tail write does not erase the earlier failure',
+    );
+
+    const candidate = await h.process.sealTails();
+    assert.equal(candidate, null, 'a run with any tail-write failure has no final candidate');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a returned final-tail candidate and all of its tail entries are immutable', async () => {
+  const h = await setup({ label: 'immutable-tail-candidate' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+
+    const candidate = await h.process.sealTails();
+    assert.equal(Object.isFrozen(candidate), true, 'the candidate object is immutable');
+    assert.equal(Object.isFrozen(candidate.tails), true, 'the tail list is immutable');
+    assert.equal(Object.isFrozen(candidate.tails[0]), true, 'each tail identity and position is immutable');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a frame with neither organizer nor spool retention cannot yield a final-tail candidate', async () => {
+  const h = await setup({ label: 'unretained-frame', spoolOptions: { maxBytes: 0 } });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.organizeCapacity === 'full');
+    h.sockets[0].deliver('{"seq":1}');
+
+    await until(() => h.stops.length === 1);
+    assert.equal(h.process.spool.bytes, 0, 'the refused frame left no local spool record');
+    assert.equal(await h.process.sealTails(), null, 'a received-but-unretained frame forbids a final candidate');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a frame whose changes cannot be derived cannot yield a final-tail candidate', async () => {
+  const h = await setup({
+    label: 'unrepresentable-frame',
+    adapter: { ...dataAdapter, changesFor: () => null },
+  });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+
+    await until(() => h.gaps.length === 1);
+    assert.equal(h.organize.state.envelopes.length, 0, 'an un-derived frame was not handed to organize');
+    assert.equal(h.process.spool.bytes, 0, 'an un-derived frame was not held by the spool');
+    assert.equal(await h.process.sealTails(), null, 'an unretained frame forbids a final-tail candidate');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a failed spool write with no counted bytes cannot produce a final-tail candidate', async () => {
+  const fsModule = { ...fs, writeSync: () => { throw new Error('injected spool write failure'); } };
+  const h = await setup({ label: 'failed-spool-candidate', spoolOptions: { fsModule } });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.organizeCapacity === 'full');
+
+    assert.throws(() => h.sockets[0].deliver('{"seq":1}'), /injected spool write failure/);
+    assert.equal(h.process.spool.bytes, 0, 'the failed write counted no bytes');
+    assert.notEqual(h.process.spool.failed, null, 'the spool records that it cannot safely accept data');
+    assert.equal(await h.process.sealTails(), null, 'a failed, empty-looking spool is not an ACK-cleared spool');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a tail candidate waits for a durable ACK to release the local spool obligation', async () => {
+  const h = await setup({ label: 'tail-spool-gate' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    const connectionId = h.process.connectionId;
+
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.organizeCapacity === 'full');
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.process.stats.spooledFrames === 1);
+    assert.ok(h.process.spool.bytes > 0, 'the frame remains a local obligation');
+
+    const whileSpooled = await h.process.sealTails();
+    assert.equal(whileSpooled, null, 'a nonempty spool cannot produce a final tail candidate');
+    assert.ok(h.process.spool.bytes > 0, 'quiescence keeps the spool available for ACK-driven draining');
+
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await until(() => h.organize.state.envelopes.length === 1);
+    assert.ok(h.process.spool.bytes > 0, 'successful resend does not release the record');
+    assert.equal(await h.process.sealTails(), null, 'send success is not durable receipt');
+
+    h.organize.sendDurableAck({ connectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.process.spool.bytes === 0);
+    const afterAck = await h.process.sealTails();
+    assert.equal(afterAck?.spoolEmpty, true, 'the ACK-released, empty spool permits a candidate');
+    assert.equal(afterAck?.tails[0]?.lastReceivedSeq, 1);
   } finally {
     await h.teardown();
   }

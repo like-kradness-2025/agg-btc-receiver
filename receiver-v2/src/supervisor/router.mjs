@@ -28,6 +28,7 @@
  */
 
 import net from 'node:net';
+import { unlinkSync } from 'node:fs';
 
 import { createChannel } from '../ipc.mjs';
 import { IPC_VERSION } from '../ipc-message.mjs';
@@ -294,6 +295,8 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
   }
 
   let closeServer = () => {};
+  let socketPath = null;
+  let closed = false;
   const router = {
     handleControl,
     handleEnvelope,
@@ -311,16 +314,22 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
       return routedCount;
     },
     refusals: () => refusals.slice(),
-    attachServer(server) {
+    attachServer(server, path) {
+      socketPath = path;
       closeServer = () => {
         try {
           server.close();
         } catch {
           /* the server may already be closed */
         }
+        if (socketPath !== null) {
+          try { unlinkSync(socketPath); } catch { /* already absent */ }
+        }
       };
     },
     close() {
+      if (closed) return;
+      closed = true;
       closeServer();
       for (const channel of bindings.keys()) {
         try {
@@ -368,7 +377,7 @@ export async function openRouter({ listenPath, channelOptions = {}, ...hooks } =
       resolve();
     });
   });
-  router.attachServer(server);
+  router.attachServer(server, listenPath);
   router.path = listenPath;
   return router;
 }

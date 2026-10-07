@@ -4,8 +4,8 @@
  * The supervisor starts ingest, organize and the book as three processes behind its own router, wires
  * them, and runs the startup sequence (a)-(e). A fake venue socket feeds frames into real ingest, they
  * travel ingest -> organize -> book over the real IPC transport, and the board serves. Then the run is
- * stopped in the processing order (reception -> organization -> board) with the board's stop confirmed
- * before organize writes its completion, and the run marker is read back out of organize's own store.
+ * stopped reception -> organization -> board without claiming complete. Store reopening invalidates
+ * the running marker using the existing startup rule.
  *
  * Nothing here reaches into product code through a test-only route: the frames arrive at a fake socket,
  * the control messages travel on the stage-1 vocabulary, and the stores write to real files.
@@ -96,7 +96,6 @@ async function withRun(fn) {
     spoolDir: join(dir, 'spool'),
     webSocketImpl: venue.impl,
     startupDeadlineMs: 8000,
-    stopDeadlineMs: 1000,
     onStep: (event) => steps.push(event.step),
   });
   try {
@@ -160,7 +159,7 @@ test('frames flow ingest -> organize -> book and the board serves', async () => 
   });
 });
 
-test('a clean stop keeps the processing order, confirms the board before the completion, and completes the run marker', async () => {
+test('a clean stop keeps the processing order and leaves the run incomplete for restart', async () => {
   await withRun(async ({ supervisor, sockets }) => {
     await supervisor.start();
     const ingest = supervisor.children.ingest.process;
@@ -175,20 +174,25 @@ test('a clean stop keeps the processing order, confirms the board before the com
     const result = await supervisor.stop();
 
     assert.deepEqual(result.processingOrder, ['ingest', 'organize', 'book'], 'processing stops reception first');
-    assert.equal(result.allAcked, true, 'organize judged every sealed tail reached');
+    assert.equal(result.stopped, true);
+    assert.equal('allAcked' in result, false, 'shutdown makes no final-tail judgement');
+    assert.equal('completion' in result, false, 'shutdown makes no completeness claim');
     assert.equal(result.book.stopped, true, 'the board stop result was confirmed');
-    assert.equal(result.completion.completed, true, 'the completion was written only then');
     assert.equal(result.abnormal, false, 'a clean stop is not an abnormal end');
 
     const organizeStorePath = supervisor.stats.roles.organize.storePath;
     const closed = await supervisor.close();
     assert.deepEqual(closed.terminationOrder, ['book', 'organize', 'ingest'], 'processes terminate in their own order');
-    assert.equal(closed.completed, true);
+    assert.equal(closed.shutdownSucceeded, true);
+    assert.equal('completed' in closed, false);
+    assert.equal(supervisor.exclusion.heldCount, 0, 'all store leases were released');
 
     // Organize's own store is free once the process is gone; the run marker is read back from it.
     const store = openOrganizeStore({ path: organizeStorePath, runId: `${RUN}-reader` });
     try {
-      assert.equal(store.runMarkerState(RUN), 'complete', 'the run was marked complete');
+      assert.equal(store.runMarkerState(RUN), 'invalidated', 'opening the store invalidates the stopped running marker');
+      store.beginRun();
+      assert.equal(store.runMarkerState(`${RUN}-reader`), 'running', 'the store can begin a new run');
     } finally {
       store.close();
     }
@@ -211,7 +215,7 @@ test('a book failure restarts only the book, and the receive generation does not
   });
 });
 
-test('all acknowledged alone is not a normal end: without the book stop confirmed, no completion', async () => {
+test('an unconfirmed book stop remains abnormal without a completeness judgement', async () => {
   await withRun(async ({ supervisor, sockets }) => {
     await supervisor.start();
     const ingest = supervisor.children.ingest.process;
@@ -227,8 +231,71 @@ test('all acknowledged alone is not a normal end: without the book stop confirme
     book.stop = () => ({ stopped: false, reason: 'the stop could not be confirmed' });
 
     const result = await supervisor.stop();
-    assert.equal(result.allAcked, true, 'every sealed tail was reached');
-    assert.equal(result.completion.completed, false, 'all-ACK alone wrote no completion');
+    assert.equal(result.stopped, false, 'the processing stop was not confirmed');
+    assert.equal('completion' in result, false);
+    const closed = await supervisor.close();
+    assert.equal(closed.shutdownSucceeded, false, 'termination cannot erase a stop failure');
     assert.equal(result.abnormal, true, 'the run is not a normal end');
+  });
+});
+
+
+test('normal stop never seals tails, waits for all-ACK, or calls finalization, even before any frame', async () => {
+  await withRun(async ({ supervisor, sockets }) => {
+    await supervisor.start();
+    const ingest = supervisor.children.ingest.process;
+    const organize = supervisor.children.organize.process;
+    const forbidden = () => { throw new Error('shutdown used a finalization proof'); };
+    ingest.sealTails = forbidden;
+    organize.prepareFinalize = forbidden;
+    organize.finalize = forbidden;
+    Object.defineProperty(organize, 'allAcked', { get: forbidden });
+    const stopped = await supervisor.stop();
+    assert.equal(stopped.stopped, true);
+    assert.equal(stopped.abnormal, false);
+    assert.equal(sockets[0].closed, true, 'new reception is fenced');
+    assert.equal(organize.runMarkerState(RUN), 'running', 'stop does not write complete');
+    const again = await supervisor.stop();
+    assert.equal(again.stopped, true);
+    const closed = await supervisor.close();
+    assert.equal(closed.shutdownSucceeded, true);
+  });
+});
+
+test('a stop RPC failure still stops the remaining roles and closes every store', async () => {
+  await withRun(async ({ supervisor }) => {
+    await supervisor.start();
+    const organize = supervisor.children.organize.process;
+    const book = supervisor.children.book.process;
+    supervisor.children.ingest.process.stop = () => { throw new Error('stop IO failure'); };
+    const result = await supervisor.stop();
+    assert.equal(result.stopped, false);
+    assert.equal(result.abnormal, true);
+    assert.equal(organize.stats.stopped, true);
+    assert.equal(book.stopped, true);
+    const closed = await supervisor.close();
+    assert.equal(closed.shutdownSucceeded, false);
+    assert.equal(closed.terminationConfirmed, true);
+    assert.equal(supervisor.exclusion.heldCount, 0);
+  });
+});
+
+
+test('store close failures stay abnormal while all remaining roles are terminated', async () => {
+  await withRun(async ({ supervisor }) => {
+    await supervisor.start();
+    const book = supervisor.children.book.process;
+    const storePath = supervisor.stats.roles.book.storePath;
+    const originalClose = book.close;
+    book.close = () => { originalClose(); throw new Error('store close IO failure'); };
+    const closed = await supervisor.close();
+    assert.equal(closed.shutdownSucceeded, false);
+    assert.equal(closed.abnormal, true);
+    assert.deepEqual(closed.unconfirmedTermination, ['book']);
+    assert.equal(supervisor.children.ingest, null);
+    assert.equal(supervisor.children.organize, null);
+    assert.equal(supervisor.exclusion.heldCount, 1, 'uncertain store ownership is retained');
+    // The injected close threw after the real in-process store closed, so cleanup can confirm it.
+    supervisor.exclusion.release({ path: storePath, confirmedTerminated: true });
   });
 });

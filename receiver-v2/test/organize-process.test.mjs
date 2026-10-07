@@ -29,6 +29,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { makeEnvelope } from '../src/envelope.mjs';
 import { IPC_VERSION, makeMessage } from '../src/ipc-message.mjs';
 import { createOrganizeProcess, judgeAllAcked, openOrganizeProcess } from '../src/organize/main.mjs';
+import { openOrganizeStore } from '../src/organize/store.mjs';
 import { startFakeIngest } from '../test-support/fake-ingest.mjs';
 import { startFakeBook } from '../test-support/fake-book.mjs';
 
@@ -139,6 +140,31 @@ async function setup(options = {}) {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// Startup recovery: an accepted startup must not cross the old boundary before its applied ACK clears it.
+// ---------------------------------------------------------------------------------------------------
+
+test('recovery status remains blocked until the book applied ACK releases the owed ledger row', async () => {
+  const h = await setup();
+  try {
+    h.book.sendAccepted({ requestId: `ingest-1:accept:${CID}:1`, connectionId: CID, generation: 1, firstSeq: 1 });
+    await until(() => h.org.acceptedConnectionId === CID);
+
+    h.ingest.sendFrame(envelope(1));
+    await until(() => h.book.state.envelopes.length === 1);
+
+    const pending = h.org.recoveryStatus();
+    assert.equal(pending.resolved, false, 'a sent frame is still owed until the book confirms application');
+    assert.equal(pending.owedCount, 1);
+
+    h.book.sendAppliedAck({ connectionId: CID, generation: 1, upToSeq: 1 });
+    await until(() => h.org.recoveryStatus().resolved === true);
+    assert.deepEqual(h.org.recoveryStatus(), { resolved: true, owedCount: 0 });
+  } finally {
+    await h.teardown();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------
 // ① durability before acknowledgement, and the order fsync -> store -> ACK
 // ---------------------------------------------------------------------------------------------------
 
@@ -166,53 +192,60 @@ test('① a frame is durable (raw, then the store) before its durable_ack is sen
     const entries = h.org.ledgerEntries();
     assert.equal(entries.length, 1);
     assert.equal(entries[0].state, 'owed');
-    assert.equal(h.org.pendingBoundaries()[0].boundarySeq, 1);
+    assert.equal(h.org.ledgerEntries({ state: 'owed' }).length, 1, 'the durable frame is still owed');
   } finally {
     await h.teardown();
   }
 });
 
 // ---------------------------------------------------------------------------------------------------
-// ② watermark + ledger confirm + pending boundary are one transaction
+// ② watermark + ledger confirmation are one transaction
 // ---------------------------------------------------------------------------------------------------
 
-test('② a failure inside the organizer transaction rolls the watermark and the confirmation back together', async () => {
+test('② a commit failure rolls the watermark and ledger confirmation back together', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-atomic-'));
+  const failure = { armed: false };
+  class FailOneCommit extends DatabaseSync {
+    exec(sql) {
+      if (failure.armed && sql.trim().toUpperCase() === 'COMMIT') {
+        failure.armed = false;
+        throw new Error('injected organizer commit failure');
+      }
+      return super.exec(sql);
+    }
+  }
+  let store;
+  let process;
   try {
-    let calls = 0;
-    let throwAt = Infinity;
-    const nowMs = () => {
-      calls += 1;
-      if (calls === throwAt) throw new Error('injected clock failure');
-      return 1_000_000 + calls;
-    };
-    const process = createOrganizeProcess({
+    store = openOrganizeStore({
+      path: join(dir, 'organize.sqlite'),
+      runId: RUN,
+      Database: FailOneCommit,
+      nowMs: () => 1_000_000,
+    });
+    process = createOrganizeProcess({
       market: MARKET,
       stream: STREAM,
       runId: RUN,
-      storePath: join(dir, 'organize.sqlite'),
-      nowMs,
-      rawWriter: () => {
-        // The write succeeds; the clock is armed to fail at the pending boundary write, which runs
-        // after the ledger confirmation inside the same organizer transaction.
-        throwAt = calls + 3;
-        return true;
-      },
+      store,
+      rawWriter: () => true,
+      markRunning: false,
     });
     const channel = memoryChannel();
     process.handleControl(acceptedMessage(), channel);
+    failure.armed = true;
 
-    assert.throws(() => process.handleEnvelope(envelope(1), channel), /injected clock failure/);
+    assert.throws(() => process.handleEnvelope(envelope(1), channel), /injected organizer commit failure/);
 
-    // The transaction rolled the watermark and the confirmation back together; only the intent, written
-    // before the raw was touched, survives - which is the recoverable direction.
+    // The external raw write's pre-record survives, but the transaction's watermark and confirmation do not.
     assert.deepEqual(process.watermarkRows(), [], 'the watermark did not survive the rollback');
-    assert.deepEqual(process.pendingBoundaries(), [], 'the pending boundary did not survive the rollback');
     const entries = process.ledgerEntries();
     assert.equal(entries.length, 1);
-    assert.equal(entries[0].state, 'intent', 'only the pre-write intent remains, and it is recoverable');
-    process.close();
+    assert.equal(entries[0].state, 'intent', 'only the pre-write intent remains for a retry');
+    assert.equal(process.recoveryStatus().owedCount, 0, 'an uncommitted intent is not a pending book delivery');
   } finally {
+    process?.close();
+    store?.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -363,7 +396,17 @@ test('⑤ the run marker records running and invalidated, and complete only afte
     );
     assert.equal(verdict.allAcked, true, 'the sealed tail was reached by the durable ceiling');
     assert.ok(process.allAcked);
-    const completion = process.stop();
+    const stopped = process.requestStop('the organizer stopped before finalization');
+    assert.equal(stopped.stopped, true, 'processing stops before the supervisor prepares completion');
+    const request = {
+      finalizeRequestId: 'run-new:finalize:barrier-1',
+      barrierId: 'barrier-1',
+      tails: [{ connectionId: newCid, lastReceivedSeq: 1 }],
+      bookStop: { requestId: 'book-stop-1', roleInstance: 'book-1', stopped: true },
+    };
+    const prepared = process.prepareFinalize(request);
+    assert.equal(prepared.prepared, true, 'the fixed supervisor request is persisted before completion');
+    const completion = process.finalize(request);
     assert.equal(completion.completed, true, 'a clean end is written only when every tail is reached');
     assert.equal(process.runMarkerState('run-new'), 'complete');
     process.close();
@@ -371,7 +414,8 @@ test('⑤ the run marker records running and invalidated, and complete only afte
     // A stop with no sealed tail is not a normal completion: the tail is unknown, so nothing is written.
     const unknownTail = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: 'run-unknown', storePath: storePath2 });
     const earlyStop = unknownTail.stop();
-    assert.equal(earlyStop.completed, false, 'an unknown tail withholds the completion');
+    assert.equal(earlyStop.stopped, true);
+    assert.equal('completed' in earlyStop, false, 'ordinary stop makes no completeness claim');
     assert.equal(unknownTail.runMarkerState('run-unknown'), 'running', 'no complete marker was written');
     unknownTail.close();
   } finally {
@@ -512,7 +556,7 @@ test('② organize authorizes nothing: a raw accept is refused and no connection
   }
 });
 
-test('organize owns its tables: the store has no received_tail and no spool', async () => {
+test('organize owns its tables and recovers unapplied work from the watermark plus ledger', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-own-'));
   try {
     const storePath = join(dir, 'organize.sqlite');
@@ -525,7 +569,7 @@ test('organize owns its tables: the store has no received_tail and no spool', as
       .map((row) => row.name);
     db.close();
     assert.ok(tables.includes('run_marker'), 'organize owns the run marker');
-    assert.ok(tables.includes('pending_boundary'), 'organize owns the pending boundary');
+    assert.equal(tables.includes('pending_boundary'), false, 'the durable ceiling and owed ledger replace the old boundary table');
     assert.ok(tables.includes('organized_watermark'), 'organize owns the watermark');
     assert.ok(tables.includes('delivery_ledger'), 'organize owns the delivery ledger');
     assert.ok(tables.includes('invalidation_request'), 'organize owns the invalidation request');
