@@ -556,6 +556,42 @@ test('② organize authorizes nothing: a raw accept is refused and no connection
   }
 });
 
+test('a refused frame is tallied by reason, reported once per window, and flushed at close', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-refusals-'));
+  try {
+    const diagnostics = [];
+    const process = createOrganizeProcess({
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      storePath: join(dir, 'organize.sqlite'),
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const channel = memoryChannel();
+    // Nothing has been adopted: every frame is refused for want of an adoption.
+    for (let seq = 1; seq <= 3; seq += 1) {
+      const refused = process.handleEnvelope(envelope(seq), channel);
+      assert.equal(refused.accepted, false);
+    }
+    const summary = process.refusalSummary();
+    assert.equal(summary.total, 3, 'every refused frame is counted');
+    assert.equal(summary.byReason['no connection has been accepted yet'], 3, 'the tally is kept by reason');
+    assert.equal(
+      diagnostics.filter((d) => /the organize refused/.test(String(d.reason))).length,
+      1,
+      'the burst is one report, not one per frame',
+    );
+    process.close();
+    assert.equal(
+      diagnostics.filter((d) => /the organize refused/.test(String(d.reason))).length,
+      2,
+      'what the window left unreported is flushed at close',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the owed set is offered once: a frame above an open hole does not re-send the frames below it', async () => {
   const h = await setup();
   try {

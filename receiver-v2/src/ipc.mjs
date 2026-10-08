@@ -278,7 +278,27 @@ export function createChannel(socket, options = {}) {
 
   socket.on('error', (error) => fail(error));
   socket.on('close', () => {
-    closed = true;
+    // Set 1 (observability): a peer that goes away with frames still in the queue used to lose them
+    // in silence. The queue that was never written is reported; bytes handed to the socket but not
+    // confirmed are named separately, so the two losses are not confused. `fail` and our own close
+    // already own their report - this fills the gap only when neither ran.
+    if (!closed) {
+      const unsentFrames = batch.length;
+      const unsentBytes = bufferedBytes;
+      const unconfirmedBytes = Math.max(0, socket.writableLength ?? 0);
+      closed = true;
+      if (unsentFrames > 0 || unconfirmedBytes > 0) {
+        try {
+          onError(
+            new Error(
+              `the channel closed with ${unsentFrames} unsent frame${unsentFrames === 1 ? '' : 's'} (${unsentBytes} bytes) and ${unconfirmedBytes} bytes written but not confirmed`,
+            ),
+          );
+        } catch {
+          /* a report that throws is not a new fact about the close */
+        }
+      }
+    }
     flushBatch();
   });
 

@@ -204,12 +204,50 @@ export function createOrganizeProcess({
   let framesDurable = 0;
   let framesAlreadyDurable = 0;
 
-  function diagnostic(reason) {
+  function diagnostic(reason, extra = {}) {
     try {
-      onDiagnostic({ market, reason });
+      onDiagnostic({ market, reason, ...extra });
     } catch {
       // a diagnostic is best-effort by contract
     }
+  }
+
+  // Set 1 (observability): every refused frame is counted by reason; a burst is one rate-limited
+  // report, and what the window leaves unreported is flushed as the process closes.
+  const REFUSAL_REPORT_MIN_MS = 1000;
+  const refusalTally = new Map(); // reason -> count
+  let refusedFrames = 0;
+  let refusalBurst = 0;
+  let lastRefusalReason = null;
+  let lastRefusedIdentity = null;
+  let refusalReportedAtMs = 0;
+
+  function refuseFrame(result, envelope) {
+    refusedFrames += 1;
+    refusalBurst += 1;
+    lastRefusalReason = result.reason;
+    lastRefusedIdentity = {
+      connection_id: envelope?.connection_id ?? null,
+      receive_seq: envelope?.receive_seq ?? null,
+    };
+    refusalTally.set(result.reason, (refusalTally.get(result.reason) ?? 0) + 1);
+    const nowMs = Date.now();
+    if (nowMs - refusalReportedAtMs >= REFUSAL_REPORT_MIN_MS) {
+      refusalReportedAtMs = nowMs;
+      reportRefusalBurst('');
+    }
+    return result;
+  }
+
+  /** Report - and reset - whatever the reporting window is holding back. */
+  function reportRefusalBurst(suffix) {
+    if (refusalBurst === 0) return;
+    const count = refusalBurst;
+    refusalBurst = 0;
+    diagnostic(`the organize refused ${count} frame${count === 1 ? '' : 's'}${suffix}: ${lastRefusalReason}`, {
+      refused: count,
+      ...(lastRefusedIdentity ?? {}),
+    });
   }
 
   /** The board's identity check for a frame, before anything is decided about it. */
@@ -248,10 +286,10 @@ export function createOrganizeProcess({
    * `durable_ack` sent (rulings ③⑦).
    */
   function organizeFrame(envelope) {
-    if (closed) return { accepted: false, reason: 'this organize process is closed' };
-    if (stopped) return { accepted: false, reason: 'this organize process has stopped' };
+    if (closed) return refuseFrame({ accepted: false, reason: 'this organize process is closed' }, envelope);
+    if (stopped) return refuseFrame({ accepted: false, reason: 'this organize process has stopped' }, envelope);
     const claim = belongsToBoard(envelope);
-    if (!claim.ok) return { accepted: false, reason: claim.reason, ack: null };
+    if (!claim.ok) return refuseFrame({ accepted: false, reason: claim.reason, ack: null }, envelope);
 
     const note = organizer.note(envelope, {
       onIntent: (frame) => {
@@ -262,7 +300,7 @@ export function createOrganizeProcess({
         ledgerInternal.confirm(frame);
       },
     });
-    if (note.accepted === false) return note;
+    if (note.accepted === false) return refuseFrame(note, envelope);
 
     if (note.durable === true) framesDurable += 1;
     else if (note.alreadyDurable === true) framesAlreadyDurable += 1;
@@ -1048,6 +1086,7 @@ export function createOrganizeProcess({
     invalidationRequests,
 
     recoveryStatus,
+    refusalSummary: () => ({ total: refusedFrames, byReason: Object.fromEntries(refusalTally) }),
     evaluateAllAcked,
     judge: (tails, options) => judgeAllAcked({ tails, ...options }),
     ledgerEntries: ({ state = null } = {}) => ledger.pending({ state }),
@@ -1075,6 +1114,7 @@ export function createOrganizeProcess({
 
     close() {
       if (closed) return;
+      reportRefusalBurst(' more');
       closeServer();
       stopReadinessReporting();
       stopped = true;
@@ -1096,6 +1136,7 @@ export function createOrganizeProcess({
         acceptedGeneration,
         framesDurable,
         framesAlreadyDurable,
+        refusedFrames,
         ledger: ledger.size(),
         allAcked,
         allAckedReason,

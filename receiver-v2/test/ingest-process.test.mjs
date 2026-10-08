@@ -101,6 +101,7 @@ async function buildIngest({ dir, organize, label = 'a', ...options }) {
     ingestStorePath: join(dir, `ingest-${label}.sqlite`),
     spoolDir: options.spoolDir ?? join(dir, `spool-${label}`),
     spoolOptions: options.spoolOptions ?? {},
+    ackStallMs: options.ackStallMs,
     channelOptions: { batchFrames: 1 },
     setTimer: (fn, ms) => {
       const timer = { fn, ms, cleared: false, unref() {} };
@@ -503,6 +504,71 @@ test('a throwing tail diagnostic cannot discard a frame the organize link can ta
     await until(() => h.organize.state.envelopes.length === 1);
     assert.equal(h.organize.state.envelopes[0].receive_seq, 1, 'the accepted frame still reaches organize');
     assert.equal(await h.process.sealTails(), null, 'the failed durable tail still forbids a candidate');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a durable ceiling that stops moving while frames are sent is reported, and an advance clears it', async () => {
+  const h = await setup({ label: 'ack-stall', ackStallMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    h.sockets[0].deliver('{"seq":2}');
+    await until(() => h.diagnostics.some((d) => /durable ceiling has stalled/.test(String(d.reason))));
+    const report = h.diagnostics.find((d) => /durable ceiling has stalled/.test(String(d.reason)));
+    assert.equal(report.framesSinceProgress, 2, 'both sent frames are counted as sent since the last advance');
+
+    // An advance clears the stall: frames sent straight after it are not reported again.
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 2 });
+    await until(() => h.process.stats.lastAckUpToSeq === 2);
+    const before = h.diagnostics.filter((d) => /durable ceiling has stalled/.test(String(d.reason))).length;
+    h.sockets[0].deliver('{"seq":3}');
+    await until(() => h.organize.state.envelopes.length === 3);
+    assert.equal(
+      h.diagnostics.filter((d) => /durable ceiling has stalled/.test(String(d.reason))).length,
+      before,
+      'progress resets the stall clock',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a frame that goes to the spool instead of the organize link is reported once, not per frame', async () => {
+  const h = await setup({ label: 'spool-report' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    await until(() => h.organize.channel !== null);
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.process.stats.spooledFrames === 1);
+    h.sockets[0].deliver('{"seq":2}');
+    await until(() => h.process.stats.spooledFrames === 2);
+    assert.equal(
+      h.diagnostics.filter((d) => /held in the spool/.test(String(d.reason))).length,
+      1,
+      'the report is edge-triggered: one report when the spool first holds frames',
+    );
+
+    // When an acknowledgement empties the spool, the next empty-to-holding transition is a new
+    // episode and is reported again.
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 2, capacity: 'full' });
+    await until(() => h.process.spool.bytes === 0);
+    h.sockets[0].deliver('{"seq":3}');
+    await until(() => h.process.stats.spooledFrames === 3);
+    assert.equal(
+      h.diagnostics.filter((d) => /held in the spool/.test(String(d.reason))).length,
+      2,
+      'a second empty-to-holding transition is reported as a new episode',
+    );
   } finally {
     await h.teardown();
   }

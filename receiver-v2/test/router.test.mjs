@@ -354,3 +354,84 @@ test('① the router refuses an envelope from a role with no frame route (the bo
   assert.equal(outcome.refused, true);
   assert.ok(router.refusals().some((r) => /no route for frames/.test(r.reason)));
 });
+
+test('③ a refusal is counted by reason, reported once per window, and the stored sample is bounded', () => {
+  const diagnostics = [];
+  const router = createRouter({ onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) });
+  const ingest = bindRole(router, memoryRole(), 'ingest', 'ingest-1');
+
+  // No organize is connected: the frame is refused, and the record names the frame it refused.
+  const first = router.handleEnvelope(
+    { market: MARKET, stream: STREAM, connection_id: 'run-1:kraken:kraken_spot:1', receive_seq: 7 },
+    ingest,
+  );
+  assert.equal(first.refused, true);
+  assert.equal(router.refusals()[0].receive_seq, 7, 'the refusal carries the frame identity');
+
+  // The first refusal of a quiet stretch is reported at once; the rest of the second is counted.
+  assert.equal(diagnostics.filter((d) => /the relay refused/.test(String(d.reason))).length, 1);
+  for (let i = 8; i <= 137; i += 1) {
+    router.handleEnvelope(
+      { market: MARKET, stream: STREAM, connection_id: 'run-1:kraken:kraken_spot:1', receive_seq: i },
+      ingest,
+    );
+  }
+  assert.equal(
+    diagnostics.filter((d) => /the relay refused/.test(String(d.reason))).length,
+    1,
+    'a burst is one report per window, not one per refusal',
+  );
+  assert.equal(router.stats.refusals, 131, 'every refusal is counted, reported or not');
+  assert.equal(
+    router.stats.refusalsByReason['no organize is connected to the supervisor'],
+    131,
+    'the tally is kept by reason',
+  );
+  assert.equal(router.refusals().length, 100, 'the stored sample is bounded');
+  assert.equal(router.refusals().at(-1).receive_seq, 137, 'the sample keeps the most recent refusals');
+
+  // What a quiet stretch left unreported is flushed as the router closes.
+  router.close();
+  assert.equal(
+    diagnostics.filter((d) => /the relay refused/.test(String(d.reason))).length,
+    2,
+    'the pending count is flushed at close',
+  );
+});
+
+test('a refusal tally groups by fixed codes, so caller-supplied values cannot grow it', () => {
+  const router = createRouter();
+  const channel = memoryRole();
+  router.attach(channel);
+  for (let i = 0; i < 50; i += 1) {
+    router.handleControl(
+      makeMessage({
+        version: IPC_VERSION,
+        type: 'hello',
+        role_instance: `weird-${i}`,
+        run_id: 'run-1',
+        payload: { role: `intruder-${i}` },
+      }),
+      channel,
+    );
+  }
+  const summary = router.refusalSummary();
+  assert.equal(summary.byReason['a hello announced an unknown role'], 50, 'the tally groups by the fixed code');
+  assert.deepEqual(Object.keys(summary.byReason), ['a hello announced an unknown role'], 'no per-input keys leak into the tally');
+  assert.ok(router.refusals().some((r) => r.role === 'intruder-49'), 'the bounded sample still keeps the value itself');
+});
+
+test('a throwing diagnostic cannot change a refusal', () => {
+  const router = createRouter({
+    onDiagnostic: () => {
+      throw new Error('injected diagnostic failure');
+    },
+  });
+  const ingest = bindRole(router, memoryRole(), 'ingest', 'ingest-1');
+  let outcome;
+  assert.doesNotThrow(() => {
+    outcome = router.handleEnvelope({ connection_id: 'c1', receive_seq: 1 }, ingest);
+  }, 'a diagnostic failure does not escape the refusal');
+  assert.equal(outcome.refused, true);
+  assert.equal(router.stats.refusals, 1);
+});

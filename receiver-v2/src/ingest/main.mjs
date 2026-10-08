@@ -48,6 +48,8 @@ function assertInlineReceiveExecutor(options) {
  * later with `attachOrganize`, which is how a process that started before organize learns where to
  * send the acceptance reception is waiting for.
  */
+const DEFAULT_ACK_STALL_MS = 5000;
+
 export function createIngestProcess({
   market,
   stream = 'trades',
@@ -77,6 +79,9 @@ export function createIngestProcess({
   onStop = () => {},
   onDiagnostic = () => {},
   onGap = () => {},
+  // Set 1 (observability): how long frames may go unacknowledged before a stall is reported. Reports
+  // are silenced to one line per interval; 0 or a non-positive value turns the observation off.
+  ackStallMs = DEFAULT_ACK_STALL_MS,
   ...receiveOptions
 } = {}) {
   if (!adapter) throw new TypeError('the ingest process needs a venue adapter');
@@ -110,6 +115,13 @@ export function createIngestProcess({
   let sentFrames = 0;
   let spooledFrames = 0;
   let resentFrames = 0;
+  // Set 1 (observability): the state behind the stall report and the spool-holding edge report.
+  let ackConnectionId = null;
+  let lastAckUpToSeq = null;
+  let framesSinceAckProgress = 0;
+  let unackedSinceMs = 0;
+  let lastAckStallReportAtMs = 0;
+  let spoolHeldReported = false;
 
   const connection = createReceiveConnection({
     ...receiveOptions,
@@ -202,6 +214,7 @@ export function createIngestProcess({
       }
       if (ok) {
         sentFrames += 1;
+        noteFrameSent();
         return { accepted: true, sent: true };
       }
     }
@@ -211,6 +224,7 @@ export function createIngestProcess({
   /** Append one frame to the spool. False from the spool is a stop signal, not a reason to drop it. */
   function spoolFrame(envelope) {
     let retained = false;
+    const wasEmpty = (spool?.bytes ?? 0) === 0;
     try {
       retained = spool !== null && spool.append(envelope) && !spool.failed;
     } catch (error) {
@@ -219,6 +233,22 @@ export function createIngestProcess({
     }
     if (retained) {
       spooledFrames += 1;
+      // Set 1 (observability): the moment the spool goes from empty to holding frames is reported
+      // once - not once per frame - so a capacity episode is visible without flooding the log.
+      if (wasEmpty && !spoolHeldReported) {
+        spoolHeldReported = true;
+        try {
+          onDiagnostic({
+            market,
+            reason: 'the organize link could not take a frame; it is being held in the spool',
+            spoolBytes: spool.bytes,
+            capacity: organizeCapacity,
+            connectionState: connection.state,
+          });
+        } catch {
+          // a diagnostic is best-effort; it must never interrupt retention of the frame
+        }
+      }
       return { accepted: true, spooled: true };
     }
     unretainedFrameFailure = true;
@@ -397,8 +427,58 @@ export function createIngestProcess({
     if (typeof message.payload?.capacity === 'string') organizeCapacity = message.payload.capacity;
     const upToSeq = message.payload?.up_to_seq;
     const advanced = Number.isInteger(upToSeq) ? advanceSpoolTo(message.connection_id, upToSeq) : false;
+    if ((spool?.bytes ?? 0) === 0) spoolHeldReported = false;
+    if (Number.isInteger(upToSeq)) noteAckProgress(message.connection_id, upToSeq);
     const resent = organizeCapacity === 'ok' ? resendSpool({ connectionId: message.connection_id }) : 0;
     return { advanced, resent, capacity: organizeCapacity };
+  }
+
+  /**
+   * Set 1 (observability): a frame was sent and nothing has acknowledged it for long enough that this
+   * is worth stating. The report is rate-limited to one line per ackStallMs; it observes - it never
+   * triggers a resend (that is a later set's job).
+   */
+  function noteFrameSent() {
+    const nowMs = Date.now();
+    if (framesSinceAckProgress === 0) unackedSinceMs = nowMs;
+    framesSinceAckProgress += 1;
+    if (!Number.isFinite(ackStallMs) || ackStallMs <= 0) return;
+    if (nowMs - unackedSinceMs < ackStallMs) return;
+    if (nowMs - lastAckStallReportAtMs < ackStallMs) return;
+    lastAckStallReportAtMs = nowMs;
+    try {
+      onDiagnostic({
+        market,
+        reason: `the durable ceiling has stalled: ${framesSinceAckProgress} frames have been sent since it last moved`,
+        framesSinceProgress: framesSinceAckProgress,
+        stalledMs: nowMs - unackedSinceMs,
+        upToSeq: lastAckUpToSeq,
+        capacity: organizeCapacity,
+        spoolBytes: spool?.bytes ?? 0,
+      });
+    } catch {
+      // a diagnostic is best-effort; it must never interrupt sending a frame
+    }
+  }
+
+  /**
+   * Set 1 (observability): an acknowledgement that moves the ceiling is progress - it resets the
+   * stall clock. A same-value acknowledgement does not reset it, so a ceiling that stops moving is
+   * reported rather than masked by repetition. The clock is per connection: a new connection's
+   * acknowledgements start a fresh clock instead of inheriting the old one's stall.
+   */
+  function noteAckProgress(connectionId, upToSeq) {
+    if (connectionId !== ackConnectionId) {
+      ackConnectionId = connectionId;
+      lastAckUpToSeq = null;
+      framesSinceAckProgress = 0;
+      unackedSinceMs = 0;
+    }
+    if (lastAckUpToSeq !== null && upToSeq <= lastAckUpToSeq) return;
+    lastAckUpToSeq = upToSeq;
+    framesSinceAckProgress = 0;
+    unackedSinceMs = 0;
+    lastAckStallReportAtMs = 0;
   }
 
   /**
@@ -785,6 +865,9 @@ export function createIngestProcess({
         spooledFrames,
         resentFrames,
         spoolBytes: spool?.bytes ?? 0,
+        framesSinceProgress: framesSinceAckProgress,
+        stalledMs: framesSinceAckProgress > 0 ? Date.now() - unackedSinceMs : 0,
+        lastAckUpToSeq,
         stopped,
       };
     },

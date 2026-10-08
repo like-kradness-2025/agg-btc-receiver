@@ -165,3 +165,63 @@ test('an unknown tag is reported as an error, not treated as data', () => {
   assert.match(String(errors[0].message), /unknown tag/);
   assert.equal(channel.queuedBytes, 0);
 });
+
+test('a close with frames still in the queue is reported, not dropped in silence', () => {
+  const errors = [];
+  const handlers = {};
+  const fakeSocket = {
+    write: () => true,
+    once: () => {},
+    end: () => {},
+    writableLength: 0,
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+  };
+  const channel = createChannel(fakeSocket, { batchFrames: 100, onError: (error) => errors.push(error) });
+  channel.sendEnvelope(envelope(1));
+  assert.equal(channel.queuedBytes > 0, true, 'the frame is queued, not yet written');
+
+  handlers.close();
+  assert.equal(errors.length, 1, 'the lost queue is reported once');
+  assert.match(String(errors[0].message), /1 unsent frame/);
+  handlers.close();
+  assert.equal(errors.length, 1, 'one report per channel, however many closes arrive');
+});
+
+test('a close with nothing queued is not an error', () => {
+  const errors = [];
+  const handlers = {};
+  const fakeSocket = {
+    write: () => true,
+    once: () => {},
+    end: () => {},
+    writableLength: 0,
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+  };
+  const channel = createChannel(fakeSocket, { onError: (error) => errors.push(error) });
+  handlers.close();
+  assert.equal(errors.length, 0);
+});
+
+test('a close after a failure is not reported a second time', () => {
+  const errors = [];
+  const handlers = {};
+  const fakeSocket = {
+    write: () => true,
+    once: () => {},
+    end: () => {},
+    writableLength: 0,
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+  };
+  const channel = createChannel(fakeSocket, { batchFrames: 100, onError: (error) => errors.push(error) });
+  channel.sendEnvelope(envelope(1));
+  handlers.error(new Error('the pipe broke'));
+  handlers.close();
+  assert.equal(errors.length, 1, 'the failure owns the report; the close adds none');
+  assert.match(String(errors[0].message), /the pipe broke/);
+});

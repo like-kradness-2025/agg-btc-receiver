@@ -59,7 +59,17 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
   const bindings = new Map(); // channel -> { role, instance }
   const byRole = new Map(); // role -> channel
   const pendingAccepts = new Map(); // request_id -> { message, generation, connectionId }
+  // Set 1 (observability): every refusal is counted by reason, the stored sample is bounded, and a
+  // burst is reported as one rate-limited diagnostic rather than one line per refusal. What the
+  // window leaves unreported is flushed when the router closes.
+  const REFUSAL_SAMPLE_LIMIT = 100;
+  const REFUSAL_REPORT_MIN_MS = 1000;
   const refusals = [];
+  const refusalTally = new Map(); // reason -> count
+  let refusalTotal = 0;
+  let refusalBurst = 0;
+  let lastRefusalReason = null;
+  let refusalReportedAtMs = 0;
   let routedCount = 0;
 
   function diagnostic(reason, extra = {}) {
@@ -70,15 +80,38 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     }
   }
 
-  function refuse(reason, extra = {}) {
+  function refuse(reason, extra = {}, tally = null) {
     const refusal = { reason, ...extra };
+    refusalTotal += 1;
+    refusalBurst += 1;
+    lastRefusalReason = reason;
+    // The tally groups by a fixed key when the message embeds a caller-supplied value (tally); the
+    // value itself stays in the bounded sample only, so input streams cannot grow the tally's keys.
+    const key = tally ?? reason;
+    refusalTally.set(key, (refusalTally.get(key) ?? 0) + 1);
     refusals.push(refusal);
+    if (refusals.length > REFUSAL_SAMPLE_LIMIT) refusals.shift();
     try {
       onRefusal(refusal);
     } catch {
       /* an observation that throws is not a fact about the refusal */
     }
+    const nowMs = Date.now();
+    if (nowMs - refusalReportedAtMs >= REFUSAL_REPORT_MIN_MS) {
+      refusalReportedAtMs = nowMs;
+      reportRefusalBurst('');
+    }
     return { routed: false, refused: true, reason };
+  }
+
+  /** Report - and reset - whatever the reporting window is holding back. */
+  function reportRefusalBurst(suffix) {
+    if (refusalBurst === 0) return;
+    const count = refusalBurst;
+    refusalBurst = 0;
+    diagnostic(`the relay refused ${count} message${count === 1 ? '' : 's'}${suffix}: ${lastRefusalReason}`, {
+      refused: count,
+    });
   }
 
   function noteRouted(to, kind) {
@@ -153,7 +186,7 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
 
   function forwardEnvelope(destRole, envelope, fromChannel) {
     const target = byRole.get(destRole);
-    if (!target) return refuse(`no ${destRole} is connected to the supervisor`, { kind: 'envelope' });
+    if (!target) return refuse(`no ${destRole} is connected to the supervisor`, frameIdentity(envelope));
     let ok = false;
     try {
       ok = target.sendEnvelope(envelope);
@@ -163,7 +196,7 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     }
     if (ok !== true) {
       signalFull(fromChannel);
-      return refuse(`the ${destRole} relay could not take the frame`, { kind: 'envelope' });
+      return refuse(`the ${destRole} relay could not take the frame`, frameIdentity(envelope));
     }
     noteRouted(destRole, 'envelope');
     return { routed: true, to: destRole };
@@ -232,7 +265,11 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     if (type === 'hello') {
       const role = message.payload?.role;
       if (!KNOWN_ROLES.has(role)) {
-        return refuse(`a hello announced an unknown role ${JSON.stringify(role)}`);
+        return refuse(
+          `a hello announced an unknown role ${JSON.stringify(role)}`,
+          { role },
+          'a hello announced an unknown role',
+        );
       }
       bind(channel, role, message.role_instance);
       return { bound: role, instance: message.role_instance };
@@ -261,18 +298,29 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     }
     const dest = ROLE_ROUTES[senderRole]?.[type];
     if (!dest) {
-      return refuse(`a ${type} from ${senderRole} has no destination`, { type });
+      return refuse(`a ${type} from ${senderRole} has no destination`, { type }, `a ${senderRole} message has no destination`);
     }
     return forwardControl(dest, message, channel);
+  }
+
+  /** The identity of the frame a refusal is about, for the record and the diagnostic. */
+  function frameIdentity(envelope) {
+    return {
+      kind: 'envelope',
+      market: envelope?.market ?? null,
+      stream: envelope?.stream ?? null,
+      connection_id: envelope?.connection_id ?? null,
+      receive_seq: envelope?.receive_seq ?? null,
+    };
   }
 
   function handleEnvelope(envelope, channel) {
     const senderRole = roleOf(channel);
     if (senderRole === null) {
-      return refuse('a frame arrived on a channel that has not announced a role', { kind: 'envelope' });
+      return refuse('a frame arrived on a channel that has not announced a role', frameIdentity(envelope));
     }
     const dest = ENVELOPE_ROUTES[senderRole];
-    if (!dest) return refuse(`a ${senderRole} process has no route for frames`, { kind: 'envelope' });
+    if (!dest) return refuse(`a ${senderRole} process has no route for frames`, frameIdentity(envelope));
     return forwardEnvelope(dest, envelope, channel);
   }
 
@@ -314,6 +362,7 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
       return routedCount;
     },
     refusals: () => refusals.slice(),
+    refusalSummary: () => ({ total: refusalTotal, byReason: Object.fromEntries(refusalTally) }),
     attachServer(server, path) {
       socketPath = path;
       closeServer = () => {
@@ -329,6 +378,7 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     },
     close() {
       if (closed) return;
+      reportRefusalBurst(' more');
       closed = true;
       closeServer();
       for (const channel of bindings.keys()) {
@@ -345,7 +395,8 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
       return {
         roles: [...byRole.keys()].sort(),
         routed: routedCount,
-        refusals: refusals.length,
+        refusals: refusalTotal,
+        refusalsByReason: Object.fromEntries(refusalTally),
         pendingAccepts: pendingAccepts.size,
       };
     },
