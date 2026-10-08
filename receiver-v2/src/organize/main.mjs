@@ -166,6 +166,14 @@ export function createOrganizeProcess({
 
   let ingestChannel = null;
   let bookChannel = null;
+  // What each connection's owed frames have already been offered to the book on the channel that is
+  // up now: connectionId -> the set of offered receive_seqs. Entries are tracked one by one - a
+  // single high-water mark would call a late frame "offered" because a later one preceded it, and
+  // that frame would never reach the book. Cleared when the book channel changes or fails (a new
+  // audience has seen nothing) and on an explicit resend request. `owedSweepNeeded` remembers that
+  // an offer was blocked: the next frame runs a sweep instead of offering only itself.
+  const owedOffered = new Map();
+  let owedSweepNeeded = false;
   const channelRoles = new Map();
   // Behind the supervisor, organize has one channel to the router, so a peer cannot be told apart by
   // the channel it arrived on: the message's own type is the routing fact (the router already decided
@@ -270,8 +278,14 @@ export function createOrganizeProcess({
     }
     // What is durable and owed is handed to the book here (startup (d) covers the recovery case; this
     // covers the ordinary path, so a frame reaches the board without waiting for a resend nobody asked
-    // for). A frame the book cannot take yet stays owed - only its `applied_ack` releases it.
-    deliverOwed();
+    // for). A frame the book cannot take yet stays owed - only its `applied_ack` releases it. The
+    // ordinary path offers just this frame; a sweep runs only after an offer was blocked.
+    if (owedSweepNeeded) {
+      const sweep = deliverOwed();
+      if (!sweep.blocked) owedSweepNeeded = false;
+    } else if (note.durable === true || note.alreadyDurable === true) {
+      deliverEntry(envelope);
+    }
     return note;
   }
 
@@ -428,6 +442,7 @@ export function createOrganizeProcess({
     const connectionId = message.connection_id ?? acceptedConnectionId;
     const applied = message.payload?.up_to_seq;
     if (!Number.isInteger(applied)) return { applied: false, reason: 'an applied acknowledgement needs a ceiling' };
+    let releasedUpTo = null;
     const result = wiring.inTransaction(() => {
       const row = wiring.db
         .prepare(
@@ -437,14 +452,17 @@ export function createOrganizeProcess({
         .get(connectionId, market, stream);
       let released = 0;
       if (row && row.up_to_receive_seq !== null && Number.isInteger(row.first_seq)) {
+        releasedUpTo = Math.min(applied, row.up_to_receive_seq);
         released = ledgerInternal.release({
           connectionId,
           firstSeq: row.first_seq,
-          upToSeq: Math.min(applied, row.up_to_receive_seq),
+          upToSeq: releasedUpTo,
         }).released;
       }
       return { released };
     });
+    // What the board has applied needs no further offer: the memory of it goes with the entries.
+    if (releasedUpTo !== null) pruneOffers(connectionId, releasedUpTo);
     return { applied: true, ...result };
   }
 
@@ -623,40 +641,106 @@ export function createOrganizeProcess({
    * only the book's `applied_ack` does.
    */
   function deliverOwed() {
-    if (bookChannel === null) return { delivered: 0, reason: 'no book is connected to organize' };
+    if (bookChannel === null) return { delivered: 0, blocked: false, reason: 'no book is connected to organize' };
     let delivered = 0;
     for (const entry of ledger.pending({ state: 'owed' })) {
-      let envelope;
-      try {
-        envelope = makeEnvelope({
-          market,
-          stream,
-          connectionId: entry.connectionId,
-          runId: entry.runId ?? null,
-          venue: entry.venue ?? null,
-          generation: entry.generation ?? null,
-          receiveSeq: entry.receiveSeq,
-          recvTsMs: entry.recvTsMs,
-          recvMonoNs: entry.recvMonoNs,
-          raw: entry.raw,
-          meta: entry.meta,
-        });
-      } catch (error) {
-        diagnostic(`an owed frame could not be rebuilt for delivery: ${error.message}`);
-        continue;
-      }
-      let ok = false;
-      try {
-        ok = bookChannel.sendEnvelope(envelope);
-      } catch (error) {
-        diagnostic(`the book link refused an owed frame: ${error.message}`);
-        ok = false;
-      }
-      if (!ok) break; // backpressure: keep the rest owed rather than dropping them
-      delivered += 1;
-      deliveredFrames += 1;
+      const outcome = offerOwedEntry(entry);
+      if (outcome === 'blocked') return { delivered, blocked: true };
+      if (outcome === 'sent') delivered += 1;
     }
-    return { delivered };
+    return { delivered, blocked: false };
+  }
+
+  /** The set of receive_seqs this channel has already been offered for one connection. */
+  function offeredSetFor(connectionId) {
+    let set = owedOffered.get(connectionId);
+    if (set === undefined) {
+      set = new Set();
+      owedOffered.set(connectionId, set);
+    }
+    return set;
+  }
+
+  /** Offer one owed entry to the book. 'blocked' means the link is full and the entry stays owed. */
+  function offerOwedEntry(entry) {
+    const offered = owedOffered.get(entry.connectionId);
+    if (offered !== undefined && offered.has(entry.receiveSeq)) return 'skipped';
+    let envelope;
+    try {
+      envelope = makeEnvelope({
+        market,
+        stream,
+        connectionId: entry.connectionId,
+        runId: entry.runId ?? null,
+        venue: entry.venue ?? null,
+        generation: entry.generation ?? null,
+        receiveSeq: entry.receiveSeq,
+        recvTsMs: entry.recvTsMs,
+        recvMonoNs: entry.recvMonoNs,
+        raw: entry.raw,
+        meta: entry.meta,
+      });
+    } catch (error) {
+      diagnostic(`an owed frame could not be rebuilt for delivery: ${error.message}`);
+      return 'skipped';
+    }
+    let ok = false;
+    try {
+      ok = bookChannel.sendEnvelope(envelope);
+    } catch (error) {
+      diagnostic(`the book link refused an owed frame: ${error.message}`);
+      ok = false;
+    }
+    if (!ok) return 'blocked'; // backpressure: keep the rest owed rather than dropping them
+    offeredSetFor(entry.connectionId).add(entry.receiveSeq);
+    deliveredFrames += 1;
+    return 'sent';
+  }
+
+  /**
+   * Offer the frame that just became durable - one entry, not the whole owed set: with a hole open,
+   * the owed set grows, and a full walk per frame would be paid on every arrival. The ledger is
+   * asked first, so only what it still holds as owed is the book's to receive.
+   */
+  function deliverEntry(envelope) {
+    if (bookChannel === null) return;
+    const offered = owedOffered.get(envelope.connection_id);
+    if (offered !== undefined && offered.has(envelope.receive_seq)) return;
+    const entry = ledger.find(envelope.connection_id, envelope.receive_seq);
+    if (entry === null || entry.state !== 'owed') return;
+    let ok = false;
+    try {
+      ok = bookChannel.sendEnvelope(envelope);
+    } catch (error) {
+      diagnostic(`the book link refused an owed frame: ${error.message}`);
+      ok = false;
+    }
+    if (!ok) {
+      // Not lost, only postponed: the next frame runs a sweep instead of offering just itself.
+      owedSweepNeeded = true;
+      return;
+    }
+    offeredSetFor(envelope.connection_id).add(envelope.receive_seq);
+    deliveredFrames += 1;
+  }
+
+  /**
+   * A new audience has seen nothing: every owed frame may be offered again, and the next frame runs
+   * a sweep rather than trusting an offer memory that no longer describes this channel.
+   */
+  function resetOffers() {
+    owedOffered.clear();
+    owedSweepNeeded = true;
+  }
+
+  /** The board has applied these: their entries are released, and their offer memory goes with them. */
+  function pruneOffers(connectionId, upToSeq) {
+    const set = owedOffered.get(connectionId);
+    if (set === undefined) return;
+    for (const seq of set) {
+      if (seq <= upToSeq) set.delete(seq);
+    }
+    if (set.size === 0) owedOffered.delete(connectionId);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -808,6 +892,9 @@ export function createOrganizeProcess({
     if (role === 'ingest' && ingestChannel !== channel) ingestChannel = channel;
     if (role === 'book' && bookChannel !== channel) {
       bookChannel = channel;
+      // A new book channel is a new audience: what the previous one was offered must be offered
+      // again, because nothing on this channel has seen it.
+      resetOffers();
       // A request can be persisted before the book's channel is up. Announcing it when the channel
       // attaches is what keeps the round trip from being lost to connection ordering (ruling ⑥).
       if (previous !== 'book') announceOutstanding();
@@ -819,6 +906,8 @@ export function createOrganizeProcess({
     routerMode = true;
     ingestChannel = channel;
     bookChannel = channel;
+    // The router channel carries the book's traffic here: a fresh one has seen nothing.
+    resetOffers();
     return true;
   }
 
@@ -850,11 +939,15 @@ export function createOrganizeProcess({
       case 'invalidated':
         setRole(channel, 'book');
         return handleInvalidated(message);
-      case 'resend':
+      case 'resend': {
         setRole(channel, 'book');
-        // Frames owed to the book are re-offered by the delivery path in a later stage; the request is
-        // recorded here so it is not silently dropped.
-        return { resend: true, pending: ledger.size() };
+        // Frames owed to the book are re-offered on request: the offer memory forgets what the
+        // current channel has seen and the delivery path walks the owed set again, arrival order.
+        resetOffers();
+        const sweep = deliverOwed();
+        owedSweepNeeded = sweep.blocked;
+        return { resend: true, pending: ledger.size(), delivered: sweep.delivered };
+      }
       case 'readiness':
         return { readiness: message.payload ?? null };
       case 'error':
@@ -874,6 +967,12 @@ export function createOrganizeProcess({
 
   function handleError(error, channel) {
     diagnostic(`a peer channel failed: ${error?.message ?? error}`);
+    if (channel === bookChannel || channel === undefined || channel === null) {
+      // The frames offered on the failed channel were offered to an audience that no longer exists:
+      // whatever channel comes next is owed the whole set again. Behind the supervisor the error
+      // arrives without a channel - the router's one channel carries the book's traffic there.
+      resetOffers();
+    }
     if (channel === bookChannel) return { bookDown: true };
     return { error: true };
   }

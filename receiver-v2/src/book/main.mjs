@@ -373,6 +373,11 @@ export function createBookProcess({
     if (result.applied === true) {
       framesApplied += 1;
       sendAppliedAck(envelope);
+      // The board has taken the frame, so ask whether its boundary is proved: a board that never
+      // leaves syncing is a board nobody may read from, and in the split no other caller asks - the
+      // in-process structure asks in the same place. A replacement re-anchors the proof, a diff
+      // extends it, and a venue whose every frame is a replacement has nothing else to ride.
+      book.proveBoundary();
     } else {
       framesRefused += 1;
       // A duplicate is still a fact organize needs: the boundary it owes is already on the board, and

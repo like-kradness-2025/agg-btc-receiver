@@ -556,6 +556,290 @@ test('② organize authorizes nothing: a raw accept is refused and no connection
   }
 });
 
+test('the owed set is offered once: a frame above an open hole does not re-send the frames below it', async () => {
+  const h = await setup();
+  try {
+    await until(() => h.org.channels().book !== null && h.org.channels().ingest !== null);
+    h.book.sendAccepted({ requestId: 'ingest-1:accept:1', connectionId: CID, generation: 1, firstSeq: 1 });
+    await until(() => h.org.acceptedConnectionId === CID);
+
+    h.ingest.sendFrame(envelope(1));
+    h.ingest.sendFrame(envelope(2));
+    await until(() => h.book.state.envelopes.length >= 2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(
+      h.book.state.envelopes.map((e) => e.receive_seq),
+      [1, 2],
+      'both durable frames were offered to the book once each',
+    );
+
+    // A hole opens at 3 and stays open while 4, 5 and 6 arrive. Each arrival must add exactly one
+    // offer - its own - not one per owed frame below it: the owed set is not re-sent per frame.
+    h.ingest.sendFrame(envelope(4));
+    h.ingest.sendFrame(envelope(5));
+    h.ingest.sendFrame(envelope(6));
+    await until(() => h.book.state.envelopes.length >= 5);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(
+      h.book.state.envelopes.map((e) => e.receive_seq),
+      [1, 2, 4, 5, 6],
+      'each new frame is offered once; nothing below it is offered again',
+    );
+
+    // The frame that fills the hole arrives late, below everything already offered: it must still
+    // reach the book - a single high-water mark would have called it "offered" and skipped it for
+    // ever, leaving the book's hole open even though organize's own hole is filled.
+    h.ingest.sendFrame(envelope(3));
+    await until(() => h.book.state.envelopes.length >= 6);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(
+      h.book.state.envelopes.map((e) => e.receive_seq),
+      [1, 2, 4, 5, 6, 3],
+      'the late frame that fills the hole is offered too',
+    );
+
+    // An explicit resend re-offers the whole owed set on a fresh memory: the book hears it again.
+    h.book.sendResend({ connectionId: CID });
+    await until(() => h.book.state.envelopes.length >= 12);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(
+      h.book.state.envelopes.slice(6).map((e) => e.receive_seq),
+      [1, 2, 4, 5, 6, 3],
+      'the resend offers the owed set again, in arrival order',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a restart offers the owed set again on the new channel', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-restart-'));
+  try {
+    const storePath = join(dir, 'organize.sqlite');
+    // First life: durable frames with a hole at 3, never acknowledged - they stay owed.
+    const first = await setup({ storePath });
+    try {
+      await until(() => first.org.channels().book !== null);
+      first.book.sendAccepted({ requestId: 'ingest-1:accept:1', connectionId: CID, generation: 1, firstSeq: 1 });
+      await until(() => first.org.acceptedConnectionId === CID);
+      first.ingest.sendFrame(envelope(1));
+      first.ingest.sendFrame(envelope(2));
+      first.ingest.sendFrame(envelope(4));
+      first.ingest.sendFrame(envelope(5));
+      await until(() => first.book.state.envelopes.length >= 4);
+    } finally {
+      await first.teardown();
+    }
+
+    // Second life, same store: the owed ledger survives - hole and all - and the new channel hears
+    // the set again.
+    const second = await setup({ storePath });
+    try {
+      await until(() => second.org.channels().book !== null);
+      second.book.sendAccepted({ requestId: 'ingest-1:accept:1', connectionId: CID, generation: 1, firstSeq: 1 });
+      await until(() => second.org.acceptedConnectionId === CID);
+      await until(() => second.book.state.envelopes.length >= 4);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.deepEqual(
+        second.book.state.envelopes.map((e) => e.receive_seq),
+        [1, 2, 4, 5],
+        'the owed set from the earlier life is offered on the new channel, hole and all',
+      );
+
+      // A replay of the durable-above frames, as the startup path must eventually perform: the watermark
+      // row restores the ceiling, but not the set of frames already waiting above it, so without this
+      // replay the ceiling stalls at the hole-filler. This pins the watermark mechanics given the replay;
+      // OPEN ITEM: the real startup order cannot yet deliver one - adoption happens after the spool
+      // drain (run.mjs (c)->(e)) and normally-sent frames are not in the spool - see the audit notes.
+      second.ingest.sendFrame(envelope(4));
+      second.ingest.sendFrame(envelope(5));
+
+      // The hole fills: the missing frame arrives on the replayed run, and the book applies the lot.
+      second.ingest.sendFrame(envelope(3));
+      await until(() => second.book.state.envelopes.length >= 5);
+      second.book.sendAppliedAck({ connectionId: CID, upToSeq: 5 });
+      await until(() => second.org.ledgerSize() === 0);
+
+      const db = new DatabaseSync(storePath);
+      try {
+        const watermark = db
+          .prepare('SELECT up_to_receive_seq FROM organized_watermark WHERE connection_id = ? AND market = ? AND stream = ?')
+          .get(CID, MARKET, STREAM);
+        assert.equal(watermark.up_to_receive_seq, 5, 'the watermark advanced through the replayed run');
+        const open = db
+          .prepare('SELECT COUNT(*) AS n FROM organize_gap WHERE connection_id = ? AND filled_at_ms IS NULL')
+          .get(CID);
+        assert.equal(open.n, 0, 'and the hole it crossed is closed');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await second.teardown();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a live channel change re-offers the owed set on the new channel', async () => {
+  const h = await setup();
+  try {
+    await until(() => h.org.channels().book !== null && h.org.channels().ingest !== null);
+    h.book.sendAccepted({ requestId: 'ingest-1:accept:1', connectionId: CID, generation: 1, firstSeq: 1 });
+    await until(() => h.org.acceptedConnectionId === CID);
+    h.ingest.sendFrame(envelope(1));
+    h.ingest.sendFrame(envelope(2));
+    await until(() => h.book.state.envelopes.length >= 2);
+
+    // The book's channel is replaced mid-run: the new audience has seen nothing.
+    const before = h.org.channels().book;
+    h.book.close();
+    const book2 = await startFakeBook(h.socketPath, { market: MARKET, stream: STREAM, runId: RUN });
+    try {
+      await until(() => h.org.channels().book !== null && h.org.channels().book !== before);
+      // One more frame runs the sweep the channel change asked for.
+      h.ingest.sendFrame(envelope(3));
+      await until(() => book2.state.envelopes.length >= 3);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.deepEqual(
+        book2.state.envelopes.map((e) => e.receive_seq),
+        [1, 2, 3],
+        'the new channel hears the whole owed set plus the frame that triggered the sweep',
+      );
+    } finally {
+      book2.close();
+    }
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('an offer the link refused is swept again on the next frame', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-blocked-'));
+  try {
+    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const book = memoryChannel();
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      book,
+    );
+    process.handleControl(acceptedMessage({ connectionId: CID }), book);
+    const ingest = memoryChannel();
+
+    let block = false;
+    const inner = book.sendEnvelope.bind(book);
+    book.sendEnvelope = (envelopeOut) => (block ? false : inner(envelopeOut));
+
+    block = true;
+    process.handleEnvelope(envelope(1), ingest);
+    assert.equal(book.envelopes.length, 0, 'the blocked offer delivered nothing');
+
+    block = false;
+    process.handleEnvelope(envelope(2), ingest);
+    assert.deepEqual(
+      book.envelopes.map((e) => e.receive_seq),
+      [1, 2],
+      'the sweep re-offers the blocked frame and the new one, each once',
+    );
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a refused offer on the ordinary path arms a sweep for the next frame', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-blocked2-'));
+  try {
+    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const book = memoryChannel();
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      book,
+    );
+    process.handleControl(acceptedMessage({ connectionId: CID }), book);
+    const ingest = memoryChannel();
+
+    let block = false;
+    const inner = book.sendEnvelope.bind(book);
+    book.sendEnvelope = (envelopeOut) => (block ? false : inner(envelopeOut));
+
+    // The first frame completes the initial sweep: from here the ordinary path is in charge.
+    process.handleEnvelope(envelope(1), ingest);
+    assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1], 'the initial sweep delivered the first frame');
+
+    // The next frame is refused on the ordinary path: it must arm a sweep, not vanish.
+    block = true;
+    process.handleEnvelope(envelope(2), ingest);
+    assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1], 'the refused frame delivered nothing');
+
+    block = false;
+    process.handleEnvelope(envelope(3), ingest);
+    assert.deepEqual(
+      book.envelopes.map((e) => e.receive_seq),
+      [1, 2, 3],
+      'the armed sweep re-offers the refused frame and the new one, each once',
+    );
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a router error without a channel clears the offer memory, and the next frame re-offers', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-router-err-'));
+  try {
+    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const book = memoryChannel();
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      book,
+    );
+    process.handleControl(acceptedMessage({ connectionId: CID }), book);
+    const ingest = memoryChannel();
+
+    process.handleEnvelope(envelope(1), ingest);
+    assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1]);
+
+    // The router reports a failure without naming a channel: the frames it was offered are not its
+    // to keep, so the next frame re-offers the set.
+    process.handleError(new Error('the router failed'), undefined);
+    process.handleEnvelope(envelope(2), ingest);
+    assert.deepEqual(
+      book.envelopes.map((e) => e.receive_seq),
+      [1, 1, 2],
+      'the reset re-offers the whole owed set alongside the new frame',
+    );
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an acknowledged range is not re-offered, and a resend sends only what is still owed', async () => {
+  const h = await setup();
+  try {
+    await until(() => h.org.channels().book !== null && h.org.channels().ingest !== null);
+    h.book.sendAccepted({ requestId: 'ingest-1:accept:1', connectionId: CID, generation: 1, firstSeq: 1 });
+    await until(() => h.org.acceptedConnectionId === CID);
+    for (const seq of [1, 2, 3]) h.ingest.sendFrame(envelope(seq));
+    await until(() => h.book.state.envelopes.length >= 3);
+
+    h.book.sendAppliedAck({ connectionId: CID, upToSeq: 2 });
+    await until(() => h.org.ledgerSize() === 1);
+
+    h.book.sendResend({ connectionId: CID });
+    await until(() => h.book.state.envelopes.length >= 4);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(
+      h.book.state.envelopes.slice(3).map((e) => e.receive_seq),
+      [3],
+      'only the unacknowledged frame is re-offered',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
 test('organize owns its tables and recovers unapplied work from the watermark plus ledger', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-own-'));
   try {

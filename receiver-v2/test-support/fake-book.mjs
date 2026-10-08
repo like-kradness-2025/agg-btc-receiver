@@ -89,6 +89,23 @@ export async function startFakeBook(
         }),
       );
     },
+    /** Ask organize to re-offer every frame it still owes the book. */
+    sendResend({ connectionId, generation = 1, requestId = 'book-1:resend:1' }) {
+      return channel.sendControl(
+        makeMessage({
+          version: IPC_VERSION,
+          type: 'resend',
+          role_instance: roleInstance,
+          request_id: requestId,
+          run_id: runId,
+          market,
+          stream,
+          connection_id: connectionId,
+          generation,
+          payload: {},
+        }),
+      );
+    },
     close() {
       try {
         channel.close();

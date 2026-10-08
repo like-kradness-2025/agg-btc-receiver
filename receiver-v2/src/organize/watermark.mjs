@@ -173,6 +173,18 @@ function openOrganizerWithin(options, wiring) {
   }
 
   function recordGap(from, to) {
+    // One open hole is one record, however many frames arrive over it: a frame landing above an
+    // unfilled hole widens the record to the newest extent instead of adding a row per observation -
+    // the hole stays whole, and every later walk over the open holes stays a walk over the holes
+    // themselves. The old shape - one row per frame - is what grew without bound while a hole
+    // stayed open.
+    const widened = wiring.db
+      .prepare(
+        `UPDATE organize_gap SET missing_to = MAX(missing_to, ?), detected_at_ms = ?
+          WHERE connection_id = ? AND market = ? AND stream = ? AND missing_from = ? AND filled_at_ms IS NULL`,
+      )
+      .run(to, nowMs(), connectionId, market, stream, from);
+    if (widened.changes > 0) return;
     wiring.db
       .prepare(
         `INSERT INTO organize_gap
@@ -184,9 +196,18 @@ function openOrganizerWithin(options, wiring) {
 
   /**
    * Close every hole the ceiling has now passed. A recorded range is a fact about what was missing;
-   * it stops being open when the durable position is at or past its end, whatever filled it.
+   * it stops being open when the durable position is at or past its end, whatever filled it. The
+   * part of a hole the ceiling has passed is history: an open record whose start lies behind the
+   * ceiling moves up to the part still missing, so what it describes stays exactly the hole.
    */
   function closeGapsUpTo(upTo) {
+    wiring.db
+      .prepare(
+        `UPDATE organize_gap SET missing_from = ?
+          WHERE connection_id = ? AND market = ? AND stream = ? AND filled_at_ms IS NULL
+            AND missing_from <= ? AND missing_to > ?`,
+      )
+      .run(upTo + 1, connectionId, market, stream, upTo, upTo);
     wiring.db
       .prepare(
         `UPDATE organize_gap SET filled_at_ms = ?

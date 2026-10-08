@@ -58,6 +58,25 @@ const envelope = (seq, { connectionId = 'conn-1', runId = 'run-1', generation = 
     },
   });
 
+const replaceEnvelope = (seq, { connectionId = 'conn-1', runId = 'run-1', generation = 1, venueSeq = seq } = {}) =>
+  makeEnvelope({
+    market: MARKET,
+    stream: STREAM,
+    connectionId,
+    runId,
+    generation,
+    receiveSeq: seq,
+    recvTsMs: 1_792_000_000_000 + seq,
+    recvMonoNs: 1_000_000_000 + seq,
+    raw: `{"seq":${seq},"venue_seq":${venueSeq}}`,
+    meta: {
+      first_seq: 1,
+      venue_seq: venueSeq,
+      changes_format: CHANGES_FORMAT,
+      changes: { replace: true, levels: [{ side: 'bid', price: 100 + seq, size: seq }] },
+    },
+  });
+
 const sequenceAdapter = (connects) => ({
   boundary: 'sequence',
   connects: connects ?? (({ previous, current, replace }) => replace === true || previous === null || current.meta.venue_seq === previous.meta.venue_seq + 1),
@@ -181,6 +200,28 @@ test('① C6: a frame the connection rule refuses breaks the proof, and the boar
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(h.book.appliedBoundary.upToSeq, 2);
     assert.equal(h.organize.state.appliedAcks.length, 2);
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('① C6: a replacement-only stream serves - the board asks whether its boundary is proved after every applied frame', async () => {
+  const h = await setup({ adapter: sequenceAdapter() });
+  try {
+    await ready(h);
+    h.organize.sendAccept({ connectionId: 'conn-1' });
+    await until(() => h.organize.state.accepted.length === 1);
+
+    // This venue replaces the whole board on every frame: there is no diff to ride the drain-path
+    // proof on. The board must ask after the replacement itself, or it never leaves syncing.
+    h.organize.sendFrame(replaceEnvelope(1));
+    await until(() => h.organize.state.appliedAcks.length === 1);
+    assert.equal(h.book.isRunning, true, 'the replacement re-anchored the proof and the board serves');
+    assert.equal(h.book.proveBoundary().proven, true);
+
+    h.organize.sendFrame(replaceEnvelope(2));
+    await until(() => h.organize.state.appliedAcks.length === 2);
+    assert.equal(h.book.isRunning, true, 'and it stays in service as replacements continue');
   } finally {
     await h.teardown();
   }

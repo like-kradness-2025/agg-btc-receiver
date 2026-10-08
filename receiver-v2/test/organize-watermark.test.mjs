@@ -58,6 +58,65 @@ test('the raw is written before anything is acknowledged', async () => {
   });
 });
 
+test('one open hole is one record, and its record widens with the frames above it', async () => {
+  await withOrganizer(async ({ organizer }) => {
+    organizer.note(envelope(1));
+    organizer.note(envelope(2));
+    organizer.note(envelope(4)); // the hole opens at 3
+    organizer.note(envelope(5));
+    organizer.note(envelope(6));
+    const gaps = organizer.openGaps();
+    assert.equal(gaps.length, 1, 'the hole is one row, not one per frame above it');
+    assert.equal(gaps[0].missingFrom, 3);
+    assert.equal(gaps[0].missingTo, 5, 'the record widens to the newest extent of the hole');
+  });
+});
+
+test('a partly filled hole keeps its record, narrowed to what is still missing', async () => {
+  await withOrganizer(async ({ organizer }) => {
+    organizer.note(envelope(1));
+    organizer.note(envelope(2));
+    organizer.note(envelope(4)); // the hole opens at 3
+    organizer.note(envelope(6)); // and widens to 5
+    organizer.note(envelope(3)); // 3 and 4 are in hand now; 5 is still missing
+    let gaps = organizer.openGaps();
+    assert.equal(gaps.length, 1, 'the hole is still recorded');
+    assert.equal(gaps[0].missingFrom, 5, 'the part behind the ceiling is history');
+    assert.equal(gaps[0].missingTo, 5);
+
+    organizer.note(envelope(5)); // the hole fills
+    gaps = organizer.openGaps();
+    assert.equal(gaps.length, 0, 'a filled hole is closed');
+
+    organizer.note(envelope(8)); // a later hole is a new record
+    gaps = organizer.openGaps();
+    assert.equal(gaps.length, 1);
+    assert.equal(gaps[0].missingFrom, 7);
+  });
+});
+
+test('a hole re-described by a later, smaller observation keeps its widest extent', async () => {
+  await withOrganizer(async ({ organizer }) => {
+    organizer.note(envelope(1));
+    organizer.note(envelope(2));
+    organizer.note(envelope(6)); // the hole opens as [3,5]
+    organizer.note(envelope(4)); // a later observation describes only [3,3]: it must not shrink the record
+    let gaps = organizer.openGaps();
+    assert.equal(gaps.length, 1);
+    assert.equal(gaps[0].missingFrom, 3);
+    assert.equal(gaps[0].missingTo, 5, 'the widest extent is kept');
+
+    organizer.note(envelope(3)); // 3 and 4 are in hand; 5 is still missing
+    gaps = organizer.openGaps();
+    assert.equal(gaps.length, 1, 'the remaining hole is still recorded');
+    assert.equal(gaps[0].missingFrom, 5);
+    assert.equal(gaps[0].missingTo, 5);
+
+    organizer.note(envelope(5));
+    assert.equal(organizer.openGaps().length, 0, 'and it closes when 5 arrives');
+  });
+});
+
 test('data above a hole is kept, and the hole is written down', async () => {
   await withOrganizer(async ({ organizer, written }) => {
     organizer.note(envelope(1));
