@@ -386,19 +386,49 @@ export function createReceiveConnection({
       return;
     }
     if (parsed.kind === 'subscription') {
-      const entry = subscriptions.get(parsed.key) ?? { state: PENDING, atMs: wallClockMs() };
-      subscriptions.set(parsed.key, {
-        state: parsed.ok ? ACKNOWLEDGED : FAILED,
-        atMs: wallClockMs(),
-        detail: parsed.detail ?? '',
-        askedAtMs: entry.askedAtMs ?? entry.atMs,
-      });
+      // A venue answers in its own shape: one key per frame (Bybit, OKX), or - with `full` - one
+      // frame carrying the whole acknowledged set at once (Coinbase's cumulative `subscriptions`
+      // state). Either way every key the frame names is acknowledged by it; a full-state frame
+      // additionally *replaces* the acknowledged set, so a key that was acknowledged before and is
+      // absent from the frame is no longer subscribed and the link fails - a subscription that
+      // vanished is not a subscription.
+      const keys = Array.isArray(parsed.keys) ? parsed.keys : parsed.key !== undefined ? [parsed.key] : [];
+      let vanished = null;
+      if (parsed.full === true) {
+        for (const [key, entry] of subscriptions) {
+          if (entry.state === ACKNOWLEDGED && !keys.includes(key)) {
+            subscriptions.set(key, {
+              state: FAILED,
+              atMs: wallClockMs(),
+              detail: 'missing from the acknowledged set',
+              askedAtMs: entry.askedAtMs ?? entry.atMs,
+            });
+            vanished = vanished ?? key;
+          }
+        }
+      }
+      for (const key of keys) {
+        const entry = subscriptions.get(key) ?? { state: PENDING, atMs: wallClockMs() };
+        // A failed subscription stays failed until the connection is replaced: a venue that
+        // refused once, or dropped a key it had acknowledged, is not talked back into a usable
+        // link by a later frame - replacing the connection is the recovery.
+        if (entry.state === FAILED) continue;
+        subscriptions.set(key, {
+          state: parsed.ok ? ACKNOWLEDGED : FAILED,
+          atMs: wallClockMs(),
+          detail: parsed.detail ?? '',
+          askedAtMs: entry.askedAtMs ?? entry.atMs,
+        });
+      }
       // "We asked" is not "they agreed": only an acknowledged subscription makes the link usable, and
       // with a declared expected set the link is established only when every expected key is acknowledged
       // (C3). A refusal is a failure whatever the set says.
       const wasFailed = subscriptionState === FAILED;
       subscriptionState = computeSubscriptionState();
-      subscriptionFailure = subscriptionState === FAILED ? parsed.detail || 'a subscription was refused' : null;
+      subscriptionFailure =
+        subscriptionState === FAILED
+          ? parsed.detail || (vanished !== null ? `a subscription left the acknowledged set (${vanished})` : 'a subscription was refused')
+          : null;
       if (subscriptionState === ACKNOWLEDGED) clearAckTimer();
       publishSubscriptionState(subscriptionFailure ?? '');
       // A-2: the refusal is a fact the run has to face, and its reason belongs on the diagnostic path -

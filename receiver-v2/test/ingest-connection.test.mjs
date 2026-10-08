@@ -189,6 +189,46 @@ test('the link is only usable once the subscription is acknowledged', () => {
   assert.equal(h.connection.state, 'subscription-failed');
 });
 
+test('a result that names no key acknowledges nothing', () => {
+  // A frame that carries neither `key` nor `keys` must not conjure a key out of nothing: an
+  // undefined key that "agrees" is how a link looks alive with no subscription behind it.
+  const h = harness({
+    parse: (raw) => {
+      const parsed = JSON.parse(raw);
+      if (parsed.keyless) return { kind: 'subscription', ok: true };
+      return { kind: 'data' };
+    },
+  });
+  h.connection.start();
+  h.sockets[0].onopen();
+  h.sockets[0].deliver('{"keyless":true}');
+  assert.equal(h.connection.subscriptionState, 'unsubscribed', 'nothing was acknowledged, because nothing was named');
+});
+
+test('a full-state answer replaces the acknowledged set', () => {
+  const h = harness({
+    expectedSubscriptions: () => ['trades', 'depth'],
+    parse: (raw) => {
+      const parsed = JSON.parse(raw);
+      if (parsed.ack) return { kind: 'subscription', keys: parsed.ack, full: true, ok: true };
+      return { kind: 'data' };
+    },
+  });
+  h.connection.start();
+  h.sockets[0].onopen();
+
+  h.sockets[0].deliver('{"ack":["trades"]}');
+  assert.equal(h.connection.subscriptionState, 'pending', 'one key is not the whole set');
+  h.sockets[0].deliver('{"ack":["trades","depth"]}');
+  assert.equal(h.connection.subscriptionState, 'acknowledged');
+  h.sockets[0].deliver('{"ack":["depth"]}');
+  assert.equal(h.connection.subscriptionState, 'failed', 'a key that left the acknowledged set is not a subscription');
+  assert.ok(h.diagnostics.some((d) => /left the acknowledged set/.test(d.reason)));
+  h.sockets[0].deliver('{"ack":["trades","depth"]}');
+  assert.equal(h.connection.subscriptionState, 'failed',
+    'a later full set does not talk it back: replacing the connection is the recovery');
+});
+
 test('a shutdown announcement replaces the socket instead of waiting for the silence deadline', () => {
   const h = harness({
     parse: (raw) => {

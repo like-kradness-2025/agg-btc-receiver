@@ -29,6 +29,9 @@ import { createBitfinexAdapter } from '../ingest/venues/bitfinex.mjs';
 import { createBinanceSpotAdapter, createBinanceFuturesAdapter, createBinanceCoinMFuturesAdapter } from '../ingest/venues/binance-spot.mjs';
 import { createBybitPerpAdapter, createBybitSpotAdapter } from '../ingest/venues/bybit.mjs';
 import { createOkxPerpAdapter, createOkxSpotAdapter } from '../ingest/venues/okx.mjs';
+import { createCoinbaseAdapter } from '../ingest/venues/coinbase.mjs';
+import { createHyperliquidAdapter } from '../ingest/venues/hyperliquid.mjs';
+import { createBitstampAdapter } from '../ingest/venues/bitstamp.mjs';
 
 /** The venues this package can receive from. Adding a venue is adding its adapter here. */
 const ADAPTERS = Object.freeze({
@@ -44,6 +47,9 @@ const ADAPTERS = Object.freeze({
   bybit_spot: createBybitSpotAdapter,
   okx_perp: createOkxPerpAdapter,
   okx_spot: createOkxSpotAdapter,
+  coinbase_spot: createCoinbaseAdapter,
+  hyperliquid_perp: createHyperliquidAdapter,
+  bitstamp_spot: createBitstampAdapter,
 });
 
 /**
