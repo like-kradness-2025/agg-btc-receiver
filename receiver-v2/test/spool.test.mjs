@@ -31,7 +31,11 @@ async function withSpool(fn, options = {}) {
 test('what goes into the spool comes back out, oldest first and unchanged', async () => {
   await withSpool(async (dir) => {
     const spool = createSpool({ dir });
-    for (let i = 1; i <= 5; i += 1) assert.equal(spool.append(envelope(i)), true);
+    for (let i = 1; i <= 5; i += 1) {
+      const position = spool.append(envelope(i));
+      assert.equal(Number.isInteger(position?.segment), true, 'a written record returns where it ends');
+      assert.equal(Number.isInteger(position?.offset), true, 'with the offset just past it');
+    }
     spool.sync();
     const got = [...spool.drain()].filter((v) => v && typeof v === 'object');
     assert.deepEqual(got.map((e) => e.receive_seq), [1, 2, 3, 4, 5]);
@@ -187,6 +191,46 @@ test('drainRecords gives the position after each record, and advancing there res
   });
 });
 
+test('append returns the position just past the record, exactly as a walk reports it', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir, segmentBytes: 300 });
+    const written = [];
+    for (let i = 1; i <= 12; i += 1) {
+      const position = spool.append(envelope(i));
+      assert.equal(Number.isInteger(position?.segment), true, 'a written record returns its segment');
+      assert.equal(Number.isInteger(position?.offset), true, 'and the offset just past it');
+      written.push(position);
+    }
+    spool.sync();
+    const walked = [...spool.drainRecords()].map((record) => ({ segment: record.segment, offset: record.offset }));
+    assert.deepEqual(walked, written, 'the walk reports the same raw positions the appends returned');
+    spool.close();
+  });
+});
+
+test('a position that was an end when it was read is not an end once the segment has grown', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir });
+    spool.append(envelope(1));
+    spool.sync();
+    const first = [...spool.drainRecords()].at(-1); // the segment's end as of this read
+    spool.append(envelope(2)); // the segment grows after the position was taken
+    spool.advance({ segment: first.segment, offset: first.offset });
+    assert.deepEqual(
+      spool.cursor,
+      { segment: first.segment, offset: first.offset },
+      'an end is only an end at the moment the advance uses it',
+    );
+    assert.equal(spool.segments.length, 1, 'the segment was not released');
+    assert.deepEqual(
+      [...spool.drainRecords()].map((record) => record.envelope.receive_seq),
+      [2],
+      'the record written after the position was taken is still readable',
+    );
+    spool.close();
+  });
+});
+
 test('a fully consumed segment is released, and a record after the drain starts ahead of the cursor', async () => {
   await withSpool(async (dir) => {
     const spool = createSpool({ dir });
@@ -194,16 +238,22 @@ test('a fully consumed segment is released, and a record after the drain starts 
     spool.sync();
     const records = [...spool.drainRecords()];
     const last = records.at(-1);
-    // The last record of a segment whose bytes it exactly fills resumes at the start of the next
-    // segment: that is the position that releases the whole segment when the caller advances.
+    // The position is raw - the end of the last record's bytes - and the advance is where an end
+    // becomes a release: at this moment it is still the end of the segment, so the cursor
+    // normalizes to the start of the next segment and the whole segment is released.
     spool.advance({ segment: last.segment, offset: last.offset });
+    assert.deepEqual(
+      spool.cursor,
+      { segment: last.segment + 1, offset: 0 },
+      'an end advances to the start of the next segment',
+    );
     assert.deepEqual(spool.segments, [], 'the whole consumed segment is released');
     assert.equal(spool.bytes, 0, 'and nothing is counted as held');
     assert.deepEqual([...spool.drainRecords()], [], 'what was confirmed does not come back');
 
     // A record arriving after a complete drain must land where the cursor can still read it: at or
     // after the confirmed position, never inside the released segment behind it.
-    assert.equal(spool.append(envelope(4)), true);
+    assert.notEqual(spool.append(envelope(4)), false, 'the spool still takes records');
     spool.sync();
     assert.deepEqual(
       [...spool.drainRecords()].map((record) => record.envelope.receive_seq),

@@ -201,8 +201,11 @@ export function createSpool(options = {}) {
   /**
    * Append one envelope.
    *
-   * Returns false when the record would take the spool past its bound. False is a stop signal for
-   * the caller - reception pauses and the gap is recorded - never a reason to drop this record.
+   * Returns the raw position just past the record - `{ segment, offset }` - once it is on the disk,
+   * and false when it would take the spool past its bound. False is a stop signal for the caller -
+   * reception pauses and the gap is recorded - never a reason to drop this record. The position is
+   * deliberately raw: whether it coincides with the end of a segment is decided by `advance`, at
+   * the moment of the advance, because the segment can still grow after this call.
    */
   function append(envelope) {
     if (failed) return false; // a torn record was written: appending after it would bury the tear
@@ -244,7 +247,7 @@ export function createSpool(options = {}) {
     bytes += record.length;
     dirty = true;
     scheduleFsync();
-    return true;
+    return { segment: current.index, offset: current.bytes };
   }
 
   /** Read every record from the cursor onwards, oldest segment first. */
@@ -285,8 +288,8 @@ export function createSpool(options = {}) {
   }
 
   /**
-   * Read every record from the cursor onwards, oldest segment first, each with the position to resume
-   * from after it.
+   * Read every record from the cursor onwards, oldest segment first, each with the raw position just
+   * past it.
    *
    * drain() hands out the decoded envelopes and nothing else, which is what a consumer that only reads
    * wants. A consumer that has to *confirm* what it read needs more: the cursor may only be moved to a
@@ -295,11 +298,12 @@ export function createSpool(options = {}) {
    * encoded length rather than guessed at, and a caller may advance with `{ segment, offset }` for the
    * last record it truly consumed.
    *
-   * The position after the last record of a segment whose bytes it exactly fills is the start of the
-   * next segment, not the end of this one: that is the position that releases a whole segment when the
-   * caller advances, and it is the only place the cursor can sit that means "this segment is done".
-   * A segment with anything left over - a torn tail - keeps the position inside itself, so those bytes
-   * are never skipped by an advance that trusted this walk.
+   * The position is raw, with no adjustment for a segment's end: whether a position releases a whole
+   * segment is decided by `advance`, at the moment of the advance. A walk's idea of "the end" is a
+   * snapshot and the segment can grow after it; an advance that trusted the snapshot could release a
+   * segment that has since grown, putting bytes behind the cursor that would never be read. A torn
+   * tail keeps the position inside its segment here - the record it follows is the last complete one -
+   * and only an advance that finds the position at the file's end releases the segment.
    */
   function* drainRecords({ limit = Infinity } = {}) {
     let read = 0;
@@ -327,21 +331,12 @@ export function createSpool(options = {}) {
         unreadable = { segment: segment.index, offset: startOffset, error };
         return;
       }
-      // The end of the segment is reached exactly when every byte from the read point is a complete
-      // record; anything else - a torn tail - must keep the resume position inside this segment.
-      const completeBytes = records.reduce((sum, record) => sum + RECORD_OVERHEAD + record.length, 0);
-      const reachesEnd = completeBytes === buf.length;
       let at = startOffset;
       for (let index = 0; index < records.length; index += 1) {
         if (read >= limit) return;
         const record = records[index];
         at += RECORD_OVERHEAD + record.length;
-        const last = index === records.length - 1;
-        const position =
-          last && reachesEnd
-            ? { segment: segment.index + 1, offset: 0 }
-            : { segment: segment.index, offset: at };
-        yield { envelope: decodeEnvelope(record), ...position };
+        yield { envelope: decodeEnvelope(record), segment: segment.index, offset: at };
         read += 1;
       }
       startOffset = 0;
@@ -353,10 +348,22 @@ export function createSpool(options = {}) {
    *
    * The caller may only pass a contiguous position; segments entirely behind it are deleted, which
    * is what keeps the spool bounded. Deleting more than the caller confirmed would be data loss.
+   *
+   * This is also where a position at a segment's end becomes the start of the next one: an end is
+   * only a release when it is the end *now*. A position read earlier is compared against the
+   * segment as it is at this moment, so a segment that has grown since keeps the cursor inside
+   * itself and the bytes written after the confirmed record stay readable; only a position that is
+   * still the whole segment's end releases it.
    */
-  function advance({ segment, offset }) {
-    if (segment === null || segment === undefined) return;
-    cursor = { segment, offset };
+  function advance(position) {
+    if (!position || position.segment === null || position.segment === undefined) return;
+    const { segment, offset } = position;
+    const entry = segments.find((candidate) => candidate.index === segment);
+    const cursorAt =
+      entry !== undefined && Number.isInteger(offset) && offset === entry.bytes
+        ? { segment: segment + 1, offset: 0 }
+        : { segment, offset };
+    cursor = cursorAt;
     const fd = fsModule.openSync(cursorPath, 'w');
     try {
       fsModule.writeSync(fd, JSON.stringify(cursor));
@@ -365,17 +372,17 @@ export function createSpool(options = {}) {
       fsModule.closeSync(fd);
     }
     const kept = [];
-    for (const entry of segments) {
-      if (entry.index < segment) {
-        bytes -= entry.bytes;
+    for (const segmentEntry of segments) {
+      if (segmentEntry.index < cursorAt.segment) {
+        bytes -= segmentEntry.bytes;
         try {
-          fsModule.unlinkSync(path.join(dir, entry.name));
+          fsModule.unlinkSync(path.join(dir, segmentEntry.name));
         } catch {
           /* already gone */
         }
         continue;
       }
-      kept.push(entry);
+      kept.push(segmentEntry);
     }
     segments = kept;
   }
