@@ -78,6 +78,13 @@ export function createBookProcess({
   // Stage 5c: the periodic readiness report (ruling ⑬). It travels the ordinary control path to the
   // supervisor's router, which observes it. Disabled (0) by default.
   readinessIntervalMs = 0,
+  // Set 6c (group commit): a run of frames is applied and made durable in one transaction when it
+  // reaches frameBatchMax frames or frameBatchMs have passed since its first frame arrived, whichever
+  // comes first. Tests pin the maximum to 1 to keep the frame-by-frame order.
+  frameBatchMs = 20,
+  frameBatchMax = 32,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
 } = {}) {
   if (!market || !stream) throw new TypeError('the book process needs a market and a stream');
   if (!runId) throw new TypeError('the book process needs a run id');
@@ -195,6 +202,10 @@ export function createBookProcess({
   }
 
   function handleAccept(message) {
+    // The pending runs belong to the connection the book was serving; every one of them commits
+    // before the identity can change, so no frame is ever left behind to be refused by the new
+    // connection - and none is applied on behalf of a connection it did not arrive for.
+    flushAllFrameBatches();
     const connectionId = message.connection_id;
     if (typeof connectionId !== 'string' || connectionId.length === 0) {
       replyAccepted(message, { accepted: false, reason: 'an acceptance must name a connection' });
@@ -240,6 +251,9 @@ export function createBookProcess({
    * way and changes nothing.
    */
   function handleInvalidate(message) {
+    // The loss is declared against the board as it stands: the pending runs commit first so the
+    // boundary the declaration is written over is the committed one.
+    flushAllFrameBatches();
     const requestId = message.request_id;
     const connectionId = message.connection_id;
     const existing = invalidationByRequest.get(requestId);
@@ -357,6 +371,113 @@ export function createBookProcess({
     return sent;
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Set 6c: the frame batch (group commit).
+  //
+  // Applying every frame on its own cost one commit per frame, and on a disk whose fsync is
+  // milliseconds that cost is what bounds the applied rate. A run of ordinary frames can be made
+  // durable in one transaction instead: the state module applies them in order through the same
+  // code a single frame goes through, and the one boundary the run reaches acknowledges all of
+  // them, because organize releases on the boundary and not on the frame. The run ends at the
+  // first frame that is not an ordinary applied one - a held frame, a refusal, a replacement - so
+  // a batch never spans a boundary, and the frames after it are queued for the next run.
+  // ---------------------------------------------------------------------------------------------
+  let pendingFrames = [];
+  let frameBatchTimer = null;
+
+  function clearFrameBatchTimer() {
+    if (frameBatchTimer !== null) {
+      clearTimer(frameBatchTimer);
+      frameBatchTimer = null;
+    }
+  }
+
+  /** Make the pending run durable, in order, in one transaction; report through its own effects. */
+  function flushFrameBatch() {
+    clearFrameBatchTimer();
+    if (pendingFrames.length === 0 || closed) return null;
+    const batch = pendingFrames;
+    const outcome = book.applyBatch(batch);
+    if (Array.isArray(outcome.results) !== true) {
+      // A route that does not exist was taken (the guarded name refused); the run stays in the
+      // staging and the failure is loud rather than a run that silently vanishes.
+      throw new Error(outcome.reason ?? 'the batch was not applied');
+    }
+    // The run is applied and durable, and only now does it leave the staging: a commit that failed
+    // keeps its frames, so a retry - the next frame, the next flush point, a stop asked again - is
+    // about those frames and not about an empty batch that would report a clean stop over
+    // unacknowledged work.
+    pendingFrames = pendingFrames.slice(batch.length);
+    let appliedAny = false;
+    let acknowledge = false;
+    for (let i = 0; i < outcome.results.length; i += 1) {
+      const result = outcome.results[i];
+      if (result.applied === true) {
+        framesApplied += 1;
+        appliedAny = true;
+        acknowledge = true;
+        continue;
+      }
+      framesRefused += 1;
+      // A duplicate is still a fact organize needs: the boundary it owes is already on the board,
+      // and the acknowledgement is what lets the pending boundary be cleared.
+      if (result.reason === 'already applied' && book.appliedBoundary.connectionId !== null) {
+        acknowledge = true;
+      }
+    }
+    // The run ended before every frame in it was taken (a held frame, a refusal, a replacement):
+    // those frames are queued for the next run, oldest first.
+    const rest = batch.slice(outcome.results.length);
+    if (rest.length > 0) {
+      pendingFrames = rest;
+      scheduleFrameBatch();
+    }
+    if (acknowledge) sendAppliedAck(batch[outcome.results.length - 1]);
+    if (appliedAny) {
+      // The board has taken the run, so ask whether its boundary is proved: a board that never
+      // leaves syncing is a board nobody may read from, and in the split no other caller asks - the
+      // in-process structure asks in the same place. A replacement re-anchors the proof, a diff
+      // extends it, and a venue whose every frame is a replacement has nothing else to ride.
+      book.proveBoundary();
+    }
+    return outcome;
+  }
+
+  /**
+   * Drain the staging to empty, one run at a time.
+   *
+   * A boundary - an acceptance, an invalidation, a stop, a close - must not leave frames behind:
+   * a run ends at a replacement or a held frame, and the frames after it belong to the same
+   * connection, so switching the connection with them still queued would make them unapplyable
+   * for ever (the new connection refuses them, and no resend can bring the old one back). Each
+   * run keeps its own commit; the loop only makes sure there is no next run left waiting.
+   */
+  function flushAllFrameBatches() {
+    while (pendingFrames.length > 0) {
+      const before = pendingFrames.length;
+      const outcome = flushFrameBatch();
+      if (outcome === null) break;
+      if (pendingFrames.length >= before) break; // no progress: stop rather than spin
+    }
+  }
+
+  function scheduleFrameBatch() {
+    if (closed || frameBatchTimer !== null || frameBatchMs <= 0) return;
+    frameBatchTimer = setTimer(() => {
+      frameBatchTimer = null;
+      try {
+        flushFrameBatch();
+      } catch (error) {
+        // The run stays in the staging, unacknowledged: the next frame, the next flush point or a
+        // stop asked again retries it, and the retry clock is re-armed so a quiet link does not
+        // leave it waiting for a trigger that never comes.
+        diagnostic(`the pending run could not be applied: ${error.message}`);
+        if (pendingFrames.length > 0) scheduleFrameBatch();
+      }
+    }, frameBatchMs);
+    if (typeof frameBatchTimer?.unref === 'function') frameBatchTimer.unref();
+  }
+
   function handleEnvelope(envelope, channel) {
     if (channel !== undefined) setOrganize(channel);
     if (closed) return { applied: false, reason: 'this book process is closed' };
@@ -369,25 +490,20 @@ export function createBookProcess({
       return { applied: false, reason: `the frame's level changes were refused: ${read.reason}` };
     }
     const changes = read.replace ? { replace: true, levels: read.levels } : { replace: false, changes: read.changes };
-    const result = book.apply({ envelope, changes });
-    if (result.applied === true) {
-      framesApplied += 1;
-      sendAppliedAck(envelope);
-      // The board has taken the frame, so ask whether its boundary is proved: a board that never
-      // leaves syncing is a board nobody may read from, and in the split no other caller asks - the
-      // in-process structure asks in the same place. A replacement re-anchors the proof, a diff
-      // extends it, and a venue whose every frame is a replacement has nothing else to ride.
-      book.proveBoundary();
-    } else {
-      framesRefused += 1;
-      // A duplicate is still a fact organize needs: the boundary it owes is already on the board, and
-      // the acknowledgement is what lets the pending boundary be cleared. Only the reasons that mean
-      // "this is ours and it is durable" are acknowledged.
-      if (result.reason === 'already applied' && book.appliedBoundary.connectionId !== null) {
-        sendAppliedAck(envelope);
+    // Group commit: the frame joins the batch, and the batch commits and acknowledges on its own
+    // schedule. A frame that flushed with its batch reports the batch's result for itself; one that
+    // is still waiting is `batched` - the channel reads neither, and organize learns the frame's
+    // fate from the applied acknowledgement alone.
+    pendingFrames.push({ envelope, changes });
+    if (pendingFrames.length >= frameBatchMax) {
+      const outcome = flushFrameBatch();
+      if (outcome !== null && outcome.results.length > 0) {
+        return outcome.results[outcome.results.length - 1];
       }
+      return { applied: true, batched: true, reason: 'queued for the batch commit' };
     }
-    return result;
+    scheduleFrameBatch();
+    return { applied: true, batched: true, reason: 'queued for the batch commit' };
   }
 
   // -------------------------------------------------------------------------------------------
@@ -396,6 +512,10 @@ export function createBookProcess({
 
   function handleStop(message) {
     if (stopped || closed) return { stopped: false, reason: 'this book process has already stopped' };
+    // A stop that leaves a pending run uncommitted is not a clean stop: the frames would be
+    // unacknowledged with nothing left running to acknowledge them. A failed flush throws, and the
+    // stop fails loudly with it.
+    flushAllFrameBatches();
     stopped = true;
     stopReadinessReporting();
     try {
@@ -540,6 +660,15 @@ export function createBookProcess({
 
     close() {
       if (closed) return;
+      clearFrameBatchTimer();
+      try {
+        // Best effort: the frames stay unacknowledged if this fails, and the process is closing
+        // either way - the diagnostic is the only honest report left.
+        flushAllFrameBatches();
+      } catch (error) {
+        diagnostic(`the pending run could not be applied while closing: ${error.message}`);
+      }
+      clearFrameBatchTimer();
       closed = true;
       stopped = true;
       stopReadinessReporting();

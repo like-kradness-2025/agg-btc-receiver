@@ -1225,6 +1225,80 @@ function openBookWithin(options, wiring) {
       return { applied: true, reason: 'applied', alsoApplied, ...(lastDrainBroke ? { proofBroken: true } : {}) };
     },
 
+    /**
+     * Set 6c: a run of frames, made durable in one transaction.
+     *
+     * The frames are applied in order through the same `apply` a single frame goes through - the
+     * checks, the proof, the holes, the origins are that code, not a copy of it - but the transaction
+     * each one would take joins one transaction opened here. A run of ordinary frames therefore costs
+     * one commit instead of one per frame, which is what the fsync on this class of disk charges for.
+     * The run ends at the first frame that is not an ordinary applied one (a held frame, a refusal, a
+     * replacement): that frame is the run's last, and the frames after it start the next run, so a
+     * batch never spans a boundary.
+     *
+     * The in-memory board follows each frame as it is applied, because the proof rule may have to see
+     * the board the frame would produce - so if the batch cannot be committed, the board is put back
+     * from the store (which the rollback leaves exactly as the batch found it) together with the state
+     * around it, and the failure travels to the caller: nothing was made durable, nothing is
+     * acknowledged for those frames, and the retained spool sends them again.
+     */
+    applyBatch(entries) {
+      if (entries.length === 0) return { results: [], batched: 0 };
+      const snapshot = {
+        applied,
+        proof: { ...proof },
+        provenEnvelope,
+        phase,
+        waiting: new Map(waiting),
+        lowestSeenWithoutOrigin,
+        lastDrainBroke,
+      };
+      const results = [];
+      let batched = 0;
+      let open = false;
+      try {
+        wiring.beginBatchTransaction();
+        open = true;
+        for (const { envelope, changes } of entries) {
+          const result = internal.apply({ envelope, changes });
+          results.push(result);
+          batched += 1;
+          // A duplicate is a no-op, not a boundary: a re-sent run of frames the store already has
+          // is answered in one run instead of one frame per clock. Everything else that is not an
+          // ordinary application - a held frame, a refusal, a replacement - ends the run.
+          if ((result.applied !== true && result.reason !== 'already applied') || result.replaced === true) break;
+        }
+        wiring.endBatchTransaction(true);
+        open = false;
+        return { results, batched };
+      } catch (error) {
+        if (open) {
+          try {
+            wiring.endBatchTransaction(false);
+          } catch {
+            // the original failure is the one to report
+          }
+        }
+        applied = snapshot.applied;
+        proof.state = snapshot.proof.state;
+        proof.connectionId = snapshot.proof.connectionId;
+        proof.anchorSeq = snapshot.proof.anchorSeq;
+        proof.upToSeq = snapshot.proof.upToSeq;
+        provenEnvelope = snapshot.provenEnvelope;
+        phase = snapshot.phase;
+        waiting.clear();
+        for (const [key, value] of snapshot.waiting) waiting.set(key, value);
+        lowestSeenWithoutOrigin = snapshot.lowestSeenWithoutOrigin;
+        lastDrainBroke = snapshot.lastDrainBroke;
+        board.restore(
+          wiring.db
+            .prepare('SELECT side, price, size FROM book_level WHERE market = ? AND stream = ?')
+            .all(market, stream),
+        );
+        throw error;
+      }
+    },
+
     /** Holes this book is waiting for. Unfilled ones are what it cannot claim to have. */
     openGaps() {
       return wiring.db
@@ -1290,6 +1364,7 @@ function openBookWithin(options, wiring) {
   const internal = {
     accept: api.accept,
     apply: api.apply,
+    applyBatch: api.applyBatch,
     beginSync: api.beginSync,
     proveBoundary: api.proveBoundary,
     invalidateProof: api.invalidateProof,
@@ -1301,6 +1376,7 @@ function openBookWithin(options, wiring) {
   };
   api.accept = wiring.guard('book.accept', internal.accept);
   api.apply = wiring.guard('book.apply', internal.apply, (refusal) => ({ applied: false, code: refusal.code, reason: refusal.reason }));
+  api.applyBatch = wiring.guard('book.applyBatch', internal.applyBatch, (refusal) => ({ refused: true, code: refusal.code, reason: refusal.reason }));
   api.beginSync = wiring.guard('book.beginSync', internal.beginSync);
   api.proveBoundary = wiring.guard('book.proveBoundary', internal.proveBoundary);
   api.invalidateProof = wiring.guard('book.invalidateProof', internal.invalidateProof, (refusal) => ({ invalidated: false, code: refusal.code, reason: refusal.reason }));

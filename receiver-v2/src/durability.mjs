@@ -172,6 +172,13 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   let registered = false;
   let closed = false;
   const right = { busy: false };
+  // Set 6c: a batch transaction, open across a run of work. Modules that make a run of frames
+  // durable - the book's applyBatch - open one, and every transaction they would otherwise take
+  // joins it instead of nesting (a second BEGIN is an error, so joining is the only shape a run
+  // can commit together in). The commit happens when the batch closes; a failure anywhere rolls
+  // the whole batch back, and the caller is responsible for putting its own in-memory state back
+  // the way the rollback leaves the store.
+  let batchOpen = false;
   // The boards a structure serves from this store, and the claim each one carries. A second structure over
   // the same board in the same store would share its position and outlive the first close, so it is
   // refused; boards that differ are separate pages of one store (the tables are keyed by the board) and
@@ -250,7 +257,42 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
    * handed, so a transaction taken here covers them all. Nothing below takes a transaction of its own, and
    * a second BEGIN is an error rather than a way to nest.
    */
+  function beginBatchTransaction() {
+    if (batchOpen) throw new Error('a batch transaction is already open');
+    db.exec('BEGIN IMMEDIATE');
+    batchOpen = true;
+  }
+
+  function endBatchTransaction(commit = true) {
+    if (!batchOpen) throw new Error('no batch transaction is open');
+    if (commit) {
+      try {
+        db.exec('COMMIT');
+      } catch (error) {
+        // A commit that fails leaves the transaction open: it must be rolled back here, or the
+        // next batch's BEGIN would be refused by the transaction nobody closed. The original
+        // failure is the one to report.
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // the original failure is the one to report
+        }
+        batchOpen = false;
+        throw error;
+      }
+      batchOpen = false;
+      return;
+    }
+    db.exec('ROLLBACK');
+    batchOpen = false;
+  }
+
   function inTransaction(fn) {
+    if (batchOpen) {
+      // This work joins the open batch: it becomes part of the one transaction the batch commits,
+      // and a failure of any of it rolls the whole batch back.
+      return fn();
+    }
     let begun = false;
     try {
       db.exec('BEGIN IMMEDIATE');
@@ -330,6 +372,8 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
   const api = {
     db,
     inTransaction,
+    beginBatchTransaction,
+    endBatchTransaction,
 
     /** Mark this generation as the live one. Called once, before any data is trusted. */
     beginRun() {
@@ -501,6 +545,11 @@ export function openDurability({ path: dbPath, runId, nowMs = () => Date.now(), 
     db,
     guard,
     inTransaction,
+    // Set 6c: the batch transaction a module opens to make a run of its work durable together. The
+    // inner transaction calls join it instead of nesting, and the caller owns putting its in-memory
+    // state back if the batch rolls back.
+    beginBatchTransaction,
+    endBatchTransaction,
     inChange,
     whileChange,
     // The unguarded close: the wiring that holds the right for an operation of its own (a structure's

@@ -30,6 +30,7 @@ import { makeEnvelope } from '../src/envelope.mjs';
 import { IPC_VERSION, makeMessage } from '../src/ipc-message.mjs';
 import { CHANGES_FORMAT } from '../src/changes.mjs';
 import { createBookProcess, openBookProcess } from '../src/book/main.mjs';
+import { openBookStore } from '../src/book/store.mjs';
 import { startFakeOrganizeForBook } from '../test-support/fake-organize-for-book.mjs';
 
 const MARKET = 'kraken_spot';
@@ -144,7 +145,7 @@ async function setup(options = {}) {
     runId: options.runId ?? 'run-1',
     batchFrames: 1,
   });
-  const book = await openBookProcess({
+  const book = await openBookProcess({ frameBatchMs: 0, frameBatchMax: 1, 
     organizeSocketPath: socketPath,
     market: MARKET,
     stream: STREAM,
@@ -294,7 +295,7 @@ test('② a failure while writing the anchor rolls the levels and the two record
       if (calls === throwAt) throw new Error('injected clock failure');
       return 1_000_000 + calls;
     };
-    const process = createBookProcess({
+    const process = createBookProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: 'run-1',
@@ -332,7 +333,7 @@ test('③ a store whose boundary leads its board-side anchor is refused when the
   const dir = mkdtempSync(join(tmpdir(), 'book-record-first-'));
   const storePath = join(dir, 'book.sqlite');
   try {
-    const first = createBookProcess({
+    const first = createBookProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: 'run-1',
@@ -351,7 +352,7 @@ test('③ a store whose boundary leads its board-side anchor is refused when the
     db.close();
 
     assert.throws(
-      () => createBookProcess({ market: MARKET, stream: STREAM, runId: 'run-1', storePath }),
+      () => createBookProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: 'run-1', storePath }),
       (error) => {
         assert.equal(error.code, 'BOARD_ANCHOR_MISMATCH');
         assert.match(String(error.message), /anchor and the applied boundary disagree/);
@@ -436,7 +437,7 @@ test('④ a stored invalidation keeps the board unproven across a restart', asyn
   const dir = mkdtempSync(join(tmpdir(), 'book-inv-restart-'));
   const storePath = join(dir, 'book.sqlite');
   try {
-    const first = createBookProcess({
+    const first = createBookProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: 'run-1',
@@ -453,7 +454,7 @@ test('④ a stored invalidation keeps the board unproven across a restart', asyn
     assert.equal(outcome.invalidated, true);
     first.close();
 
-    const second = createBookProcess({ market: MARKET, stream: STREAM, runId: 'run-1', storePath });
+    const second = createBookProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: 'run-1', storePath });
     assert.equal(second.isRunning, false, 'a stored missing record keeps the board unproven');
     const proof = second.proveBoundary();
     assert.equal(proof.proven, false);
@@ -558,7 +559,7 @@ test('⑥ an applied boundary is announced with applied_ack', async () => {
 test('③ a frame with no level-changes block is refused rather than applied as empty', () => {
   const dir = mkdtempSync(join(tmpdir(), 'book-no-changes-'));
   try {
-    const process = createBookProcess({ market: MARKET, stream: STREAM, runId: 'run-1', storePath: join(dir, 'book.sqlite') });
+    const process = createBookProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: 'run-1', storePath: join(dir, 'book.sqlite') });
     const channel = memoryChannel();
     process.handleControl(acceptMessage(), channel);
 
@@ -588,7 +589,7 @@ test('the book owns its tables: the store has no organize table and no received_
   const dir = mkdtempSync(join(tmpdir(), 'book-own-'));
   try {
     const storePath = join(dir, 'book.sqlite');
-    const process = createBookProcess({ market: MARKET, stream: STREAM, runId: 'run-1', storePath });
+    const process = createBookProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: 'run-1', storePath });
     process.close();
     const db = new DatabaseSync(storePath);
     const tables = db
@@ -623,6 +624,280 @@ test('the book owns its tables: the store has no organize table and no received_
     }
     assert.equal(tables.some((name) => name.includes('spool')), false, 'the spool belongs to ingest');
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Set 6c: the frame batch (group commit). The clock is the tests' own, so a batch is flushed by
+// filling it or by firing the timer it armed.
+// ---------------------------------------------------------------------------------------------------
+function batchHarness({ frameBatchMax = 4, frameBatchMs = 60 } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'book-batch-'));
+  const timers = [];
+  const process = createBookProcess({
+    frameBatchMs,
+    frameBatchMax,
+    market: MARKET,
+    stream: STREAM,
+    runId: 'run-1',
+    storePath: join(dir, 'book.sqlite'),
+    changesFor: (envelopeIn) => [change(envelopeIn.receive_seq)],
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      timer.cleared = true;
+    },
+  });
+  const channel = memoryChannel();
+  process.handleControl(acceptMessage(), channel);
+  return {
+    process,
+    channel,
+    dir,
+    fire: (ms) => {
+      const timer = timers.find((entry) => entry.ms === ms && !entry.cleared);
+      assert.ok(timer, `a timer of ${ms} ms was armed`);
+      timer.cleared = true;
+      timer.fn();
+    },
+    cleanup: () => {
+      try {
+        process.close();
+      } catch {
+        // closing twice is fine
+      }
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+const appliedAcksOf = (channel) => channel.sent.filter((message) => message.type === 'applied_ack');
+
+test('Set 6c: a full batch is applied in one commit, and one applied_ack covers it', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    for (const seq of [1, 2, 3, 4]) h.process.handleEnvelope(envelope(seq), h.channel);
+    const acks = appliedAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'the whole run is acknowledged once, not frame by frame');
+    assert.equal(acks[0].payload.up_to_seq, 4, 'and the one acknowledgement is the boundary the run reached');
+    assert.equal(h.process.appliedBoundary.upToSeq, 4, 'the boundary was committed');
+    assert.equal(h.process.stats.framesApplied, 4, 'every frame of the run is applied');
+    const db = new DatabaseSync(join(h.dir, 'book.sqlite'));
+    const levels = db.prepare('SELECT COUNT(*) AS n FROM book_level WHERE market = ? AND stream = ?').get(MARKET, STREAM).n;
+    db.close();
+    assert.equal(levels, 4, 'and every level of the run is on the board');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6c: the clock flushes a run that is short of the maximum', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    assert.equal(appliedAcksOf(h.channel).length, 0, 'nothing is acknowledged while the run is open');
+    h.fire(60);
+    const acks = appliedAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'the clock flushed the run');
+    assert.equal(acks[0].payload.up_to_seq, 2, 'and acknowledged what it reached');
+    assert.equal(h.process.appliedBoundary.upToSeq, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6c: a run ends at a held frame, and its acknowledgement never crosses the hole', () => {
+  const h = batchHarness({ frameBatchMax: 8, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    h.process.handleEnvelope(envelope(4), h.channel); // 3 is missing: the run ends here
+    h.fire(60);
+    const acks = appliedAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'the run was flushed, and the held frame ended it');
+    assert.equal(acks[0].payload.up_to_seq, 2, 'and its boundary stopped below the hole');
+    assert.equal(h.process.appliedBoundary.upToSeq, 2, 'the board did not move past the hole');
+
+    // The hole fills: the held frame is drained and the boundary reaches it.
+    h.process.handleEnvelope(envelope(3), h.channel);
+    h.fire(60);
+    const after = appliedAcksOf(h.channel);
+    assert.equal(after[after.length - 1].payload.up_to_seq, 4, 'the hole filled and the boundary jumped over it');
+    assert.equal(h.process.appliedBoundary.upToSeq, 4, 'and the board holds the whole range');
+    const db = new DatabaseSync(join(h.dir, 'book.sqlite'));
+    const levels = db.prepare('SELECT COUNT(*) AS n FROM book_level WHERE market = ? AND stream = ?').get(MARKET, STREAM).n;
+    db.close();
+    assert.equal(levels, 4, 'every frame is on the board exactly once');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6c: a pending run commits before a new connection can be accepted', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    h.process.handleControl(acceptMessage({ connectionId: 'conn-2', requestId: 'req-2', runId: 'run-2', takeover: true }), h.channel);
+    assert.equal(h.process.appliedBoundary.connectionId, 'conn-2', 'the new connection was accepted');
+    const db = new DatabaseSync(join(h.dir, 'book.sqlite'));
+    const row = db.prepare('SELECT connection_id, up_to_receive_seq FROM applied_boundary WHERE market = ? AND stream = ?').get(MARKET, STREAM);
+    db.close();
+    assert.equal(row.connection_id, 'conn-2', 'and the boundary belongs to it now');
+    assert.equal(row.up_to_receive_seq, null, 'with no position carried over from the old connection');
+    assert.equal(appliedAcksOf(h.channel).length >= 1, true, 'the old run was acknowledged before the acceptance');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6c: a batch whose commit fails applies nothing and keeps its run for the retry', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'book-batch-fail-'));
+  const storePath = join(dir, 'book.sqlite');
+  const failure = { armed: false };
+  class FailOneCommit extends DatabaseSync {
+    exec(sql) {
+      if (failure.armed && sql.trim().toUpperCase() === 'COMMIT') {
+        failure.armed = false;
+        throw new Error('injected batch commit failure');
+      }
+      return super.exec(sql);
+    }
+  }
+  let process;
+  try {
+    const store = openBookStore({ path: storePath, Database: FailOneCommit, nowMs: () => 1_000 });
+    process = createBookProcess({
+      frameBatchMs: 60,
+      frameBatchMax: 2,
+      market: MARKET,
+      stream: STREAM,
+      runId: 'run-1',
+      store,
+      changesFor: (envelopeIn) => [change(envelopeIn.receive_seq)],
+      setTimer: (fn, ms) => ({ fn, ms, cleared: false, unref() {} }),
+      clearTimer: () => {},
+    });
+    const channel = memoryChannel();
+    process.handleControl(acceptMessage(), channel);
+    process.handleEnvelope(envelope(1), channel);
+
+    failure.armed = true;
+    assert.throws(() => process.handleEnvelope(envelope(2), channel), /injected batch commit failure/);
+    assert.equal(appliedAcksOf(channel).length, 0, 'nothing is acknowledged for a run that never committed');
+    assert.equal(process.appliedBoundary.upToSeq, null, 'and the boundary did not move');
+    assert.equal(process.stats.framesApplied, 0, 'and no frame is counted as applied');
+
+    // The run is still in the staging: the next frame retries it, all three commit together.
+    process.handleEnvelope(envelope(3), channel);
+    const acks = appliedAcksOf(channel);
+    assert.equal(acks.length, 1, 'the retry acknowledged the whole run');
+    assert.equal(acks[0].payload.up_to_seq, 3, 'including the frames whose first commit failed');
+    assert.equal(process.appliedBoundary.upToSeq, 3, 'and the boundary reached every frame');
+    assert.equal(process.stats.framesApplied, 3, 'every frame is applied exactly once');
+  } finally {
+    try {
+      process?.close();
+    } catch {
+      // closing is best effort here
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Set 6c: a boundary drains every run before the connection can change', () => {
+  const h = batchHarness({ frameBatchMax: 8, frameBatchMs: 60 });
+  try {
+    // A replacement ends its run, and the diff after it belongs to the same connection: an
+    // acceptance that switched the connection with the diff still queued would leave it
+    // unapplyable for ever.
+    h.process.handleEnvelope(replaceEnvelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    h.process.handleControl(acceptMessage({ connectionId: 'conn-2', requestId: 'req-2', runId: 'run-2', takeover: true }), h.channel);
+
+    const acks = appliedAcksOf(h.channel);
+    assert.deepEqual(
+      acks.map((message) => message.payload.up_to_seq),
+      [1, 2],
+      'every run was committed and acknowledged before the acceptance',
+    );
+    assert.equal(h.process.stats.framesApplied, 2, 'and both frames are applied, the diff included');
+    assert.equal(h.process.appliedBoundary.connectionId, 'conn-2', 'the acceptance then took effect');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6c: a flush that fails on the clock keeps its run and re-arms the retry', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'book-batch-clock-'));
+  const storePath = join(dir, 'book.sqlite');
+  const failure = { armed: false };
+  class FailOneCommit extends DatabaseSync {
+    exec(sql) {
+      if (failure.armed && sql.trim().toUpperCase() === 'COMMIT') {
+        failure.armed = false;
+        throw new Error('injected batch commit failure');
+      }
+      return super.exec(sql);
+    }
+  }
+  const timers = [];
+  let process;
+  try {
+    const store = openBookStore({ path: storePath, Database: FailOneCommit, nowMs: () => 1_000 });
+    process = createBookProcess({
+      frameBatchMs: 60,
+      frameBatchMax: 4,
+      market: MARKET,
+      stream: STREAM,
+      runId: 'run-1',
+      store,
+      changesFor: (envelopeIn) => [change(envelopeIn.receive_seq)],
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, cleared: false, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        timer.cleared = true;
+      },
+    });
+    const channel = memoryChannel();
+    process.handleControl(acceptMessage(), channel);
+    process.handleEnvelope(envelope(1), channel);
+
+    failure.armed = true;
+    const timer = timers.find((entry) => entry.ms === 60 && !entry.cleared);
+    assert.ok(timer, 'the clock was armed');
+    timer.cleared = true;
+    timer.fn(); // the clock fires into the failing commit; it must not take the process down
+    assert.equal(appliedAcksOf(channel).length, 0, 'nothing is acknowledged for a run that never committed');
+    assert.equal(
+      timers.filter((entry) => entry.ms === 60 && !entry.cleared).length,
+      1,
+      'the retry clock was re-armed',
+    );
+
+    // The failure clears: the retry commits the run.
+    process.handleEnvelope(envelope(2), channel);
+    const retry = timers.find((entry) => entry.ms === 60 && !entry.cleared);
+    assert.ok(retry, 'the retry clock is still armed');
+    retry.cleared = true;
+    retry.fn();
+    const acks = appliedAcksOf(channel);
+    assert.equal(acks.length, 1, 'the retry acknowledged the whole run');
+    assert.equal(acks[0].payload.up_to_seq, 2, 'including the frame whose first commit failed');
+  } finally {
+    try {
+      process?.close();
+    } catch {
+      // closing is best effort here
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });

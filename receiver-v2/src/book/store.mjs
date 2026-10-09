@@ -124,7 +124,46 @@ export function openBookStore({ path: dbPath, nowMs = () => Date.now(), Database
     throw error;
   }
 
+  // Set 6c: a batch transaction, open across a run of work (the same shape as `durability.mjs`).
+  // The book's applyBatch opens one and every transaction its frames would take joins it, so a run
+  // of frames commits together; a failure anywhere rolls the whole batch back.
+  let batchOpen = false;
+
+  function beginBatchTransaction() {
+    if (batchOpen) throw new Error('a batch transaction is already open');
+    db.exec('BEGIN IMMEDIATE');
+    batchOpen = true;
+  }
+
+  function endBatchTransaction(commit = true) {
+    if (!batchOpen) throw new Error('no batch transaction is open');
+    if (commit) {
+      try {
+        db.exec('COMMIT');
+      } catch (error) {
+        // A commit that fails leaves the transaction open: it must be rolled back here, or the
+        // next batch's BEGIN would be refused by the transaction nobody closed. The original
+        // failure is the one to report.
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // the original failure is the one to report
+        }
+        batchOpen = false;
+        throw error;
+      }
+      batchOpen = false;
+      return;
+    }
+    db.exec('ROLLBACK');
+    batchOpen = false;
+  }
+
   function inTransaction(fn) {
+    if (batchOpen) {
+      // This work joins the open batch: it becomes part of the one transaction the batch commits.
+      return fn();
+    }
     let begun = false;
     try {
       db.exec('BEGIN IMMEDIATE');
@@ -208,6 +247,9 @@ export function openBookStore({ path: dbPath, nowMs = () => Date.now(), Database
     db,
     guard,
     inTransaction,
+    // Set 6c: the batch transaction a module opens to make a run of its work durable together.
+    beginBatchTransaction,
+    endBatchTransaction,
     inChange,
     whileChange,
     close: () => {
