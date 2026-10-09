@@ -84,7 +84,7 @@ test('a prepared finalization commits its request proof only after organize reac
   let organizer;
   let db;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -141,7 +141,7 @@ test('a later sealed all-ACK tail cannot authorize an older prepared request', (
   let organizer;
   let db;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -185,7 +185,7 @@ test('retrying a committed finalize request with the same payload returns the id
   const dir = mkdtempSync(join(tmpdir(), 'organize-finalize-retry-'));
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -233,7 +233,7 @@ test('the same finalize request id with a different payload is refused without c
   let organizer;
   let db;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -293,7 +293,7 @@ test('a failed completion COMMIT leaves the run uncompleted and without a receip
   let db;
   try {
     store = openOrganizeStore({ path: storePath, runId: RUN, Database: FailOneCommit, nowMs: () => 1_000 });
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -354,7 +354,7 @@ test('the fresh run-marker probe reads committed WAL proof without changing SQLi
   const storePath = join(dir, 'organize.sqlite');
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -420,7 +420,7 @@ test('the outcome classifier confirms only a matching fresh complete receipt', (
   const storePath = join(dir, 'organize.sqlite');
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -500,7 +500,7 @@ test('a proof-capable schema reports an absent requested run without creating a 
   const storePath = join(dir, 'organize.sqlite');
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -560,7 +560,7 @@ test('a fresh unprepared marker proves no-complete only after the writer fence',
   const storePath = join(dir, 'organize.sqlite');
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -592,7 +592,7 @@ test('NO_COMPLETE_CONFIRMED requires both an explicit writer fence and a fresh p
   const storePath = join(dir, 'organize.sqlite');
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -647,7 +647,7 @@ test('errors, stale reads, legacy markers and mismatched completion proofs remai
   const storePath = join(dir, 'organize.sqlite');
   let organizer;
   try {
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,

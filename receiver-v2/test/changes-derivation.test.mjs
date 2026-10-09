@@ -269,7 +269,7 @@ test('③ the spool holds the derived changes, so a resend sends the same result
 test('③ the delivery ledger holds the frame and its derived changes, so a redelivery reuses the same result', () => {
   const dir = mkdtempSync(join(tmpdir(), 'changes-ledger-'));
   try {
-    const process = createOrganizeProcess({
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,

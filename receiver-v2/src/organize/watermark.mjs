@@ -280,36 +280,36 @@ function openOrganizerWithin(options, wiring) {
    * memory. A frame can also be durable without moving the ceiling - that is a state, not a claim, and it
    * is what tells the caller the frame is durable while the board still has nowhere to put the frame.
    */
-  function planNote(seq) {
-    const held = new Set(durableAboveBaseline);
+  function planNote(seq, state) {
+    const held = new Set(state.durableAboveBaseline);
     const gaps = [];
     const closing = null;
 
-    if (baselineSeq === null) {
+    if (state.baselineSeq === null) {
       // The start of this connection's numbering is still unknown: the raw can be safe, but no ceiling may
       // be claimed for it. The frame waits where it can be released once the start arrives.
       held.add(seq);
       return {
         write: true,
-        ceiling: upToSeq,
-        outOfOrder,
+        ceiling: state.upToSeq,
+        outOfOrder: state.outOfOrder,
         held,
-        lowestHeld: lowestHeldWithoutBaseline === null ? seq : Math.min(lowestHeldWithoutBaseline, seq),
+        lowestHeld: state.lowestHeldWithoutBaseline === null ? seq : Math.min(state.lowestHeldWithoutBaseline, seq),
         gaps,
         closing,
         result: { accepted: true, durable: true, reason: "the connection's start is not known yet", ack: null },
       };
     }
 
-    if (seq < baselineSeq) {
+    if (seq < state.baselineSeq) {
       // Below where this connection's numbering starts: written down like any other frame (the raw is the
       // canonical record, and this frame arrived), but never applicable to the board - so no ceiling moves,
       // no hole is opened below the ceiling, and nothing is acknowledged for it. Saying "already durable"
       // here would keep the frame out of the raw *and* out of the board while both claimed to have it.
       return {
         write: true,
-        ceiling: upToSeq,
-        outOfOrder,
+        ceiling: state.upToSeq,
+        outOfOrder: state.outOfOrder,
         held,
         gaps,
         closing,
@@ -322,22 +322,22 @@ function openOrganizerWithin(options, wiring) {
       };
     }
 
-    if (upToSeq === null) {
-      if (seq > baselineSeq) {
+    if (state.upToSeq === null) {
+      if (seq > state.baselineSeq) {
         // The connection's first sequence never arrived: that hole is a fact worth keeping, and this frame
         // is durable while it waits - which is what tells the caller it may still be routed onward.
-        gaps.push({ from: baselineSeq, to: seq - 1 });
+        gaps.push({ from: state.baselineSeq, to: seq - 1 });
         return {
           write: true,
-          ceiling: upToSeq,
-          outOfOrder: [...new Set([...outOfOrder, seq])].sort((a, b) => a - b),
+          ceiling: state.upToSeq,
+          outOfOrder: [...new Set([...state.outOfOrder, seq])].sort((a, b) => a - b),
           held,
           gaps,
           closing,
           result: { accepted: true, durable: true, reason: 'waiting for the first sequence', ack: null },
         };
       }
-      const advanced = ceilingAfter(seq, outOfOrder);
+      const advanced = ceilingAfter(seq, state.outOfOrder);
       return {
         write: true,
         ceiling: advanced.ceiling,
@@ -354,8 +354,8 @@ function openOrganizerWithin(options, wiring) {
       };
     }
 
-    if (seq === upToSeq + 1) {
-      const advanced = ceilingAfter(seq, outOfOrder);
+    if (seq === state.upToSeq + 1) {
+      const advanced = ceilingAfter(seq, state.outOfOrder);
       return {
         write: true,
         ceiling: advanced.ceiling,
@@ -374,15 +374,15 @@ function openOrganizerWithin(options, wiring) {
 
     // Above the ceiling with something missing in between: remember it, and write the hole down. The frame
     // is durable even though nothing is acknowledged for it, and the acknowledgement never crosses the hole.
-    gaps.push({ from: upToSeq + 1, to: seq - 1 });
+    gaps.push({ from: state.upToSeq + 1, to: seq - 1 });
     return {
       write: true,
-      ceiling: upToSeq,
-      outOfOrder: [...new Set([...outOfOrder, seq])].sort((a, b) => a - b),
+      ceiling: state.upToSeq,
+      outOfOrder: [...new Set([...state.outOfOrder, seq])].sort((a, b) => a - b),
       held,
       gaps,
       closing,
-      result: { accepted: true, durable: true, reason: 'durable', ack: { connectionId, upToSeq, capacity: capacity() } },
+      result: { accepted: true, durable: true, reason: 'durable', ack: { connectionId, upToSeq: state.upToSeq, capacity: capacity() } },
     };
   }
 
@@ -568,7 +568,13 @@ function openOrganizerWithin(options, wiring) {
         };
       }
 
-      const plan = planNote(seq);
+      const plan = planNote(seq, {
+        upToSeq,
+        outOfOrder,
+        baselineSeq,
+        durableAboveBaseline,
+        lowestHeldWithoutBaseline,
+      });
       if (plan.write === false) return plan.result;
 
       // The ceiling, the holes it opens and the holes it closes go in one transaction, and memory follows
@@ -590,6 +596,133 @@ function openOrganizerWithin(options, wiring) {
       durableAboveBaseline.clear();
       for (const held of plan.held) durableAboveBaseline.add(held);
       return rawSkipped ? { ...plan.result, rawSkipped: true } : plan.result;
+    },
+
+    /**
+     * A run of received frames, made durable in one transaction. This is the group-commit form of `note`:
+     * the plans are worked out against a staging copy of the state, every write they ask for goes into a
+     * single transaction, and only after that commit does memory follow - so a batch the store could not
+     * describe leaves this process exactly as it was, and nothing in it is acknowledged. The acknowledgement
+     * that comes back is the contiguous ceiling the batch reached, sent once for the whole run rather than
+     * once per frame; a frame above a hole still contributes its write but no ceiling moves past it.
+     *
+     * The identity checks are the ones `note` makes, and a frame that fails one is refused in place without
+     * being written: a refusal inside a batch must not hold the batch's other frames back, and the caller
+     * sees the same result it would have seen frame by frame.
+     */
+    noteBatch(envelopes, { onIntent = null, onDurable = null } = {}) {
+      if (!rawSkipped) {
+        // This is the no-raw route. With a raw writer the frame's order is intent, raw, transaction,
+        // and none of that can be grouped - a caller that reaches this name with a raw configured has
+        // taken a route that does not exist.
+        return {
+          committed: false,
+          refused: true,
+          reason: 'noteBatch is the no-raw route: frames with a raw writer go through note',
+          results: [],
+          ack: null,
+        };
+      }
+      const results = [];
+      const planned = [];
+      let st = {
+        upToSeq,
+        outOfOrder,
+        baselineSeq,
+        durableAboveBaseline,
+        lowestHeldWithoutBaseline,
+      };
+      const startCeiling = upToSeq;
+      for (const envelope of envelopes) {
+        if (connectionId === null) {
+          results.push({ accepted: false, reason: 'no connection has been accepted yet', ack: null });
+          continue;
+        }
+        if (envelope.connection_id !== connectionId) {
+          results.push({ accepted: false, reason: 'not the accepted connection', ack: null });
+          continue;
+        }
+        if (envelope.market !== market || envelope.stream !== stream) {
+          results.push({ accepted: false, reason: 'this frame belongs to another board', ack: null });
+          continue;
+        }
+        if ((envelope.run_id ?? null) !== identityRunId || (envelope.generation ?? null) !== identityGeneration) {
+          results.push({ accepted: false, reason: 'this frame belongs to another run or generation', ack: null });
+          continue;
+        }
+        const seq = envelope.receive_seq;
+        if (st.upToSeq !== null && seq <= st.upToSeq && (st.baselineSeq === null || seq >= st.baselineSeq)) {
+          results.push({
+            accepted: true,
+            duplicate: true,
+            alreadyDurable: true,
+            reason: 'already durable',
+            ack: null,
+            ...(rawSkipped ? { rawSkipped: true } : {}),
+          });
+          continue;
+        }
+        const plan = planNote(seq, st);
+        if (plan.write === false) {
+          results.push(plan.result);
+          continue;
+        }
+        planned.push({ envelope, plan });
+        st = {
+          upToSeq: plan.ceiling,
+          outOfOrder: plan.outOfOrder,
+          baselineSeq: st.baselineSeq,
+          durableAboveBaseline: plan.held,
+          lowestHeldWithoutBaseline:
+            plan.lowestHeld !== undefined ? plan.lowestHeld : st.lowestHeldWithoutBaseline,
+        };
+        results.push(plan.result);
+      }
+
+      if (planned.length === 0) {
+        // Nothing was written, but a duplicate still earns the acknowledgement it would have been
+        // sent frame by frame: the resend that produced it is answered from the record.
+        const ackable = results.some((result) => result.duplicate === true || result.alreadyDurable === true);
+        const ack =
+          ackable && st.upToSeq !== null ? { connectionId, upToSeq: st.upToSeq, capacity: capacity() } : null;
+        return { committed: true, planned: 0, results, ack };
+      }
+
+      // The ceiling, the holes they open and the holes they close for the whole run go in one transaction,
+      // and memory follows the commit. The intent and the confirmation stay per frame, inside that one
+      // transaction: the order they need is the order they had frame by frame, and a commit groups them
+      // without reordering them.
+      wiring.inTransaction(() => {
+        for (const { envelope, plan } of planned) {
+          if (typeof onIntent === 'function') onIntent(envelope);
+          persist(plan.ceiling);
+          for (const gap of plan.gaps) recordGap(gap.from, gap.to);
+          if (plan.closing !== null) closeGapsUpTo(plan.closing);
+          if (typeof onDurable === 'function') onDurable(envelope);
+        }
+      });
+
+      upToSeq = st.upToSeq;
+      outOfOrder = st.outOfOrder;
+      if (st.lowestHeldWithoutBaseline !== lowestHeldWithoutBaseline) {
+        lowestHeldWithoutBaseline = st.lowestHeldWithoutBaseline;
+      }
+      durableAboveBaseline.clear();
+      for (const held of st.durableAboveBaseline) durableAboveBaseline.add(held);
+
+      // One acknowledgement for the whole batch, covering everything the run did. It is sent when the
+      // ceiling moved (the ordinary case), and also when the run held anything that would have been
+      // acknowledged frame by frame - a duplicate answered from the record, or a frame that stayed
+      // above a hole. A run that only wrote frames nobody may be told about (below the first
+      // sequence, a start still unknown) acknowledges nothing, exactly as it would have frame by frame.
+      const ackable =
+        planned.some(({ plan }) => plan.result.ack !== null) ||
+        results.some((result) => result.duplicate === true || result.alreadyDurable === true);
+      const ack =
+        st.upToSeq !== null && (st.upToSeq !== startCeiling || ackable)
+          ? { connectionId, upToSeq: st.upToSeq, capacity: capacity() }
+          : null;
+      return { committed: true, planned: planned.length, results, ack };
     },
 
     /** Holes seen and not yet filled: the ranges this process cannot claim to have. */
@@ -616,9 +749,11 @@ function openOrganizerWithin(options, wiring) {
   const internal = {
     accept: api.accept,
     note: api.note,
+    noteBatch: api.noteBatch,
   };
   api.accept = wiring.guard('organizer.accept', internal.accept);
   api.note = wiring.guard('organizer.note', internal.note);
+  api.noteBatch = wiring.guard('organizer.noteBatch', internal.noteBatch);
 
   bindInternals(api, internal);
   return api;

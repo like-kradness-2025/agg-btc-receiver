@@ -110,7 +110,7 @@ async function buildBook({ dir, router }) {
 }
 
 async function buildOrganize({ dir, router }) {
-  return openOrganizeProcess({
+  return openOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
     routerSocketPath: router.path,
     market: MARKET,
     stream: STREAM,

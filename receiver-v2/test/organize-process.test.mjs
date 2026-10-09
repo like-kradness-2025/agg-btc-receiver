@@ -106,7 +106,7 @@ async function setup(options = {}) {
   const ackSnapshots = [];
   const missing = [];
   let org;
-  org = await openOrganizeProcess({
+  org = await openOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
     listenPath: socketPath,
     market: MARKET,
     stream: STREAM,
@@ -223,7 +223,7 @@ test('② a commit failure rolls the watermark and ledger confirmation back toge
       Database: FailOneCommit,
       nowMs: () => 1_000_000,
     });
-    process = createOrganizeProcess({
+    process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -288,7 +288,7 @@ test('③ the outstanding request is re-derived after a restart, and the confirm
   const dir = mkdtempSync(join(tmpdir(), 'organize-reopen-'));
   const storePath = join(dir, 'organize.sqlite');
   try {
-    const first = await openOrganizeProcess({
+    const first = await openOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       listenPath: join(dir, 'organize-a.sock'),
       market: MARKET,
       stream: STREAM,
@@ -308,7 +308,7 @@ test('③ the outstanding request is re-derived after a restart, and the confirm
 
     // A restart re-derives what the book never answered - and only that. The confirmed loss is retained
     // and is not asked again; the outstanding request travels once more.
-    const second = await openOrganizeProcess({
+    const second = await openOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       listenPath: join(dir, 'organize-b.sock'),
       market: MARKET,
       stream: STREAM,
@@ -365,11 +365,11 @@ test('⑤ the run marker records running and invalidated, and complete only afte
   const storePath = join(dir, 'organize.sqlite');
   const storePath2 = join(dir, 'organize-2.sqlite');
   try {
-    const oldRun = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: 'run-old', storePath });
+    const oldRun = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: 'run-old', storePath });
     assert.equal(oldRun.runMarkerState('run-old'), 'running', 'opening writes the running marker');
     oldRun.close();
 
-    const process = createOrganizeProcess({
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: 'run-new',
@@ -412,7 +412,7 @@ test('⑤ the run marker records running and invalidated, and complete only afte
     process.close();
 
     // A stop with no sealed tail is not a normal completion: the tail is unknown, so nothing is written.
-    const unknownTail = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: 'run-unknown', storePath: storePath2 });
+    const unknownTail = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: 'run-unknown', storePath: storePath2 });
     const earlyStop = unknownTail.stop();
     assert.equal(earlyStop.stopped, true);
     assert.equal('completed' in earlyStop, false, 'ordinary stop makes no completeness claim');
@@ -524,7 +524,7 @@ test('⑥ all-acknowledged: every sealed tail reached, no spool, no hole - other
 test('② organize authorizes nothing: a raw accept is refused and no connection is adopted', () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-no-accept-'));
   try {
-    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
     const channel = memoryChannel();
     const outcome = process.handleControl(
       makeMessage({
@@ -560,7 +560,7 @@ test('a refused frame is tallied by reason, reported once per window, and flushe
   const dir = mkdtempSync(join(tmpdir(), 'organize-refusals-'));
   try {
     const diagnostics = [];
-    const process = createOrganizeProcess({
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -597,7 +597,7 @@ test('a restart restores the stored acceptance, so its frames can be re-acknowle
   try {
     const storePath = join(dir, 'organize.sqlite');
     // The first life adopts a connection and makes one frame durable.
-    const first = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    const first = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath });
     const firstChannel = memoryChannel();
     first.handleControl(acceptedMessage({}), firstChannel);
     assert.equal(first.acceptedConnectionId, CID, 'the first life adopted the connection');
@@ -605,7 +605,7 @@ test('a restart restores the stored acceptance, so its frames can be re-acknowle
     first.close();
 
     // A new life: the same frame is answered from the restored acceptance instead of refused.
-    const second = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    const second = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath });
     assert.equal(second.acceptedConnectionId, CID, 'the stored acceptance was restored');
     const secondChannel = memoryChannel();
     const again = second.handleEnvelope(envelope(1), secondChannel);
@@ -624,13 +624,13 @@ test('an acceptance with no durable frame yet is restored (the acceptance is wri
     const storePath = join(dir, 'organize.sqlite');
     // The first life adopts a connection and organises nothing before it stops: no watermark row
     // exists, only the written-down acceptance.
-    const first = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    const first = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath });
     first.handleControl(acceptedMessage({}), memoryChannel());
     assert.equal(first.acceptedConnectionId, CID, 'the first life adopted the connection');
     assert.deepEqual(first.watermarkRows(), [], 'no frame was organised yet');
     first.close();
 
-    const second = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    const second = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath });
     assert.equal(second.acceptedConnectionId, CID, 'the acceptance survived without a watermark row');
     const channel = memoryChannel();
     const accepted = second.handleEnvelope(envelope(1), channel);
@@ -802,7 +802,7 @@ test('a live channel change re-offers the owed set on the new channel', async ()
 test('an offer the link refused is swept again on the next frame', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-blocked-'));
   try {
-    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
     const book = memoryChannel();
     process.handleControl(
       makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
@@ -837,7 +837,7 @@ test('an offer the link refused is swept again on the next frame', async () => {
 test('a refused offer on the ordinary path arms a sweep for the next frame', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-blocked2-'));
   try {
-    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
     const book = memoryChannel();
     process.handleControl(
       makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
@@ -893,7 +893,7 @@ test('a pass longer than one chunk keeps the sweep alive for later requests', as
       timer.cleared = true;
       timer.fn();
     };
-    const process = createOrganizeProcess({
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -951,7 +951,7 @@ test('an offer that was lost between the hops is re-offered when the epoch turns
       timer.fn();
     };
     let clock = 1_000_000;
-    const process = createOrganizeProcess({
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -1009,7 +1009,7 @@ test('a new owed frame after an empty pass re-arms the epoch pass', async () => 
       timer.fn();
     };
     let clock = 2_000_000;
-    const process = createOrganizeProcess({
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
@@ -1056,7 +1056,7 @@ test('a new owed frame after an empty pass re-arms the epoch pass', async () => 
 test('a router error without a channel clears the offer memory, and the next frame re-offers', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-router-err-'));
   try {
-    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
     const book = memoryChannel();
     process.handleControl(
       makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
@@ -1114,7 +1114,7 @@ test('organize owns its tables and recovers unapplied work from the watermark pl
   const dir = mkdtempSync(join(tmpdir(), 'organize-own-'));
   try {
     const storePath = join(dir, 'organize.sqlite');
-    const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    const process = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1,  market: MARKET, stream: STREAM, runId: RUN, storePath });
     process.close();
     const db = new DatabaseSync(storePath);
     const tables = db
@@ -1131,5 +1131,265 @@ test('organize owns its tables and recovers unapplied work from the watermark pl
     assert.equal(tables.some((name) => name.includes('spool')), false, 'the spool belongs to ingest, not organize');
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------------------------------------------------------
+// Set 6: the frame batch (group commit). The clock is the tests' own: a batch is flushed either by
+// filling it or by firing the timer it armed, and nothing here waits on a real one.
+// ------------------------------------------------------------------------------------------------
+function batchHarness({ frameBatchMax = 4, frameBatchMs = 60 } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-batch-'));
+  const timers = [];
+  const setTimerFake = (fn, ms) => {
+    const timer = { fn, ms, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer;
+  };
+  const clearTimerFake = (timer) => {
+    timer.cleared = true;
+  };
+  const process = createOrganizeProcess({
+    frameBatchMs,
+    frameBatchMax,
+    market: MARKET,
+    stream: STREAM,
+    runId: RUN,
+    storePath: join(dir, 'organize.sqlite'),
+    setTimer: setTimerFake,
+    clearTimer: clearTimerFake,
+  });
+  const channel = memoryChannel();
+  process.handleControl(acceptedMessage({}), channel);
+  return {
+    process,
+    channel,
+    dir,
+    fire: (ms) => {
+      const timer = timers.find((entry) => entry.ms === ms && !entry.cleared);
+      assert.ok(timer, `a timer of ${ms} ms was armed`);
+      timer.cleared = true;
+      timer.fn();
+    },
+    cleanup: () => {
+      try {
+        process.close();
+      } catch {
+        // closing twice is fine
+      }
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+const durableAcksOf = (channel) => channel.sent.filter((m) => m.type === 'durable_ack');
+
+test('Set 6: a full batch is made durable in one commit, and one acknowledgement covers it', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    for (const seq of [1, 2, 3, 4]) h.process.handleEnvelope(envelope(seq), h.channel);
+    const acks = durableAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'the whole run is acknowledged once, not frame by frame');
+    assert.equal(acks[0].payload.up_to_seq, 4, 'and the one acknowledgement is the ceiling the run reached');
+    assert.deepEqual(
+      h.process.watermarkRows(),
+      [{ connectionId: CID, upToSeq: 4, firstSeq: 1 }],
+      'the ceiling was committed',
+    );
+    assert.equal(h.process.stats.framesDurable, 4, 'every frame of the batch is durable');
+    assert.equal(h.process.recoveryStatus().owedCount, 4, 'and every frame of the batch is owed to the book');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6: the clock flushes a run that is short of the maximum', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    assert.equal(durableAcksOf(h.channel).length, 0, 'nothing is acknowledged while the run is open');
+    h.fire(60);
+    const acks = durableAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'the clock flushed the run');
+    assert.equal(acks[0].payload.up_to_seq, 2, 'and acknowledged what it reached');
+    assert.deepEqual(h.process.watermarkRows(), [{ connectionId: CID, upToSeq: 2, firstSeq: 1 }]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6: a pending run commits before a new connection can be adopted', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    // The next connection is adopted while two frames are still waiting in the run: they belong to
+    // the connection that received them, so they commit first.
+    h.process.handleControl(acceptedMessage({ connectionId: `${RUN}:${VENUE}:${MARKET}:2`, requestId: 'req-2' }), h.channel);
+    assert.deepEqual(
+      h.process.watermarkRows(),
+      [{ connectionId: CID, upToSeq: 2, firstSeq: 1 }],
+      'the waiting frames committed under the connection they arrived for',
+    );
+    assert.equal(durableAcksOf(h.channel).length, 1, 'and they were acknowledged before the adoption');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6: a stop commits the pending run - an uncommitted run is not a clean stop', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(2), h.channel);
+    const stopped = h.process.requestStop('the test asked');
+    assert.equal(stopped.stopped, true);
+    assert.equal(stopped.abnormal, false, 'nothing undurable remains');
+    assert.deepEqual(h.process.watermarkRows(), [{ connectionId: CID, upToSeq: 2, firstSeq: 1 }]);
+    assert.equal(durableAcksOf(h.channel).length, 1, 'the frames were acknowledged before the stop');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6: an acknowledgement never crosses a hole inside a batch', () => {
+  const h = batchHarness({ frameBatchMax: 2, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(3), h.channel); // fills the batch; 2 is missing
+    let acks = durableAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'the batch flushed');
+    assert.equal(acks[0].payload.up_to_seq, 1, 'and its ceiling stopped below the hole');
+    assert.equal(h.process.stats.framesDurable, 2, 'the frame above the hole is durable anyway');
+    h.process.handleEnvelope(envelope(2), h.channel);
+    h.fire(60);
+    acks = durableAcksOf(h.channel);
+    assert.equal(acks[acks.length - 1].payload.up_to_seq, 3, 'the hole filled, the ceiling jumped over it');
+    assert.deepEqual(h.process.watermarkRows(), [{ connectionId: CID, upToSeq: 3, firstSeq: 1 }]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6: a batch whose commit fails acknowledges nothing and keeps its run for the retry', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-batch-fail-'));
+  const storePath = join(dir, 'organize.sqlite');
+  const failure = { armed: false };
+  class FailOneCommit extends DatabaseSync {
+    exec(sql) {
+      if (failure.armed && sql.trim().toUpperCase() === 'COMMIT') {
+        failure.armed = false;
+        throw new Error('injected batch commit failure');
+      }
+      return super.exec(sql);
+    }
+  }
+  const timers = [];
+  let process;
+  try {
+    const store = openOrganizeStore({ path: storePath, runId: RUN, Database: FailOneCommit, nowMs: () => 1_000 });
+    process = createOrganizeProcess({
+      frameBatchMs: 60,
+      frameBatchMax: 2,
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      store,
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, cleared: false, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        timer.cleared = true;
+      },
+    });
+    const channel = memoryChannel();
+    const bookChannel = memoryChannel();
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      bookChannel,
+    );
+    process.handleControl(acceptedMessage({}), channel);
+    process.handleEnvelope(envelope(1), channel);
+
+    // The second frame fills the batch; its commit fails and the failure is loud.
+    failure.armed = true;
+    assert.throws(() => process.handleEnvelope(envelope(2), channel), /injected batch commit failure/);
+    assert.equal(durableAcksOf(channel).length, 0, 'nothing is acknowledged for a run that never committed');
+    assert.deepEqual(process.watermarkRows(), [], 'and nothing is written down');
+    assert.equal(bookChannel.envelopes.length, 0, 'and nothing reached the book');
+
+    // The run is still in the staging: the next frame retries it, all three commit together, and
+    // each frame reaches the book exactly once.
+    process.handleEnvelope(envelope(3), channel);
+    const acks = durableAcksOf(channel);
+    assert.equal(acks.length, 1, 'the retry acknowledged the whole run');
+    assert.equal(acks[0].payload.up_to_seq, 3, 'including the frames whose first commit failed');
+    assert.deepEqual(
+      process.watermarkRows(),
+      [{ connectionId: CID, upToSeq: 3, firstSeq: 1 }],
+      'the ceiling reached every frame',
+    );
+    // A fresh book channel re-offers through the scheduled sweep; firing the armed clocks is the
+    // test's way of letting it run.
+    for (let round = 0; round < 5; round += 1) {
+      const armed = timers.filter((timer) => !timer.cleared);
+      if (armed.length === 0) break;
+      for (const timer of armed) {
+        timer.cleared = true;
+        timer.fn();
+      }
+    }
+    assert.deepEqual(
+      bookChannel.envelopes.map((e) => e.receive_seq),
+      [1, 2, 3],
+      'every frame was offered to the book exactly once, in order',
+    );
+  } finally {
+    try {
+      process?.close();
+    } catch {
+      // closing is best effort here
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Set 6: a run of duplicates answers the resend with the ceiling it already holds', () => {
+  const h = batchHarness({ frameBatchMax: 2, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    h.process.handleEnvelope(envelope(1), h.channel); // the same frame again, inside one run
+    const acks = durableAcksOf(h.channel);
+    assert.equal(acks.length, 1, 'one acknowledgement covers the run');
+    assert.equal(acks[0].payload.up_to_seq, 1, 'and it is the ceiling the record already holds');
+    assert.equal(h.process.stats.framesDurable, 1, 'the frame was written once');
+    assert.equal(h.process.stats.framesAlreadyDurable, 1, 'and answered as already durable once');
+    assert.deepEqual(h.process.watermarkRows(), [{ connectionId: CID, upToSeq: 1, firstSeq: 1 }]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Set 6: the recovery judgement counts the pending run before it answers', () => {
+  const h = batchHarness({ frameBatchMax: 4, frameBatchMs: 60 });
+  try {
+    h.process.handleEnvelope(envelope(1), h.channel);
+    // The supervisor gates the next generation on this judgement. A frame still in the batch is a
+    // frame nobody has applied: answering "resolved" here would let the gate open over undelivered
+    // old-generation frames, which the book then refuses for ever.
+    const status = h.process.recoveryStatus();
+    assert.equal(status.resolved, false, 'the pending run is not recovered');
+    assert.equal(status.owedCount, 1, 'and it is counted as owed');
+    assert.deepEqual(
+      h.process.watermarkRows(),
+      [{ connectionId: CID, upToSeq: 1, firstSeq: 1 }],
+      'the judgement was made on the committed record',
+    );
+    assert.equal(durableAcksOf(h.channel).length, 1, 'and the run was acknowledged on the way');
+  } finally {
+    h.cleanup();
   }
 });

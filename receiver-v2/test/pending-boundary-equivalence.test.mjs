@@ -112,7 +112,7 @@ function makeWorld(dir, { failCommit = { armed: false } } = {}) {
       Database,
       nowMs: () => 10_000,
     });
-    organizer = createOrganizeProcess({
+    organizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId,

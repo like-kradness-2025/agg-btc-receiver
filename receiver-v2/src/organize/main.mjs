@@ -142,6 +142,11 @@ export function createOrganizeProcess({
   // The clocks the scheduled sweep runs on; tests pass their own, production gets the real ones.
   setTimer = setTimeout,
   clearTimer = clearTimeout,
+  // Set 6 (group commit): a batch is made durable when it reaches frameBatchMax frames or when
+  // frameBatchMs have passed since its first frame arrived, whichever comes first. Tests pin the
+  // maximum to 1 to keep the frame-by-frame order.
+  frameBatchMs = 20,
+  frameBatchMax = 32,
 } = {}) {
   if (!market || !stream) throw new TypeError('the organize process needs a market and a stream');
   if (!runId) throw new TypeError('the organize process needs a run id');
@@ -278,8 +283,115 @@ export function createOrganizeProcess({
    * are sufficient to resume after any crash without a duplicate scalar boundary record.
    */
   function recoveryStatus() {
+    // The pending run is part of what recovery has to account for: the supervisor gates the next
+    // generation on this judgement, and a frame still sitting in the batch is a frame nobody has
+    // applied yet. A run that only showed up in memory would let the gate open while old-generation
+    // frames are still undelivered - and once the book has accepted the new generation those frames
+    // are refused for ever. The flush is what makes the count the truth; a flush that fails throws,
+    // and the judgement is withheld rather than given on an incomplete record.
+    flushFrameBatch();
     const owedCount = ledger.pending({ state: OWED }).length;
     return { resolved: owedCount === 0, owedCount };
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Set 6: the frame batch (group commit).
+  //
+  // Making every frame durable on its own cost one fsync per frame, and on a disk whose fsync is
+  // milliseconds that cost is what bounds the organised rate. Nothing about the guarantees needs
+  // that granularity: a run of frames can be made durable in one transaction, and the one ceiling
+  // that transaction reaches acknowledges all of them, because the ingest releases on the ceiling
+  // and not on the frame. The order inside the batch is the arrival order, and memory follows the
+  // commit, so a batch the store could not write leaves this process exactly as it was and nothing
+  // in it is acknowledged - the retained spool sends it again.
+  //
+  // The raw path keeps its frame-by-frame order (an intent before the raw is touched cannot be
+  // grouped with frames that were not), so batching applies to the store's own record alone.
+  // ---------------------------------------------------------------------------------------------
+  let pendingFrames = [];
+  let frameBatchTimer = null;
+
+  function clearFrameBatchTimer() {
+    if (frameBatchTimer !== null) {
+      clearTimer(frameBatchTimer);
+      frameBatchTimer = null;
+    }
+  }
+
+  /** Make the pending run durable, in order, in one transaction; report through its own effects. */
+  function flushFrameBatch() {
+    clearFrameBatchTimer();
+    if (pendingFrames.length === 0) return null;
+    const batch = pendingFrames;
+    const outcome = organizer.noteBatch(batch, {
+      onIntent: (frame) => {
+        ledgerInternal.record(frame, hasRawWriter ? OWED_REASON_RAW : OWED_REASON_STORE, INTENT);
+      },
+      onDurable: (frame) => {
+        // The same transaction as the watermark: confirm the ledger row.
+        ledgerInternal.confirm(frame);
+      },
+    });
+    if (outcome.committed !== true) {
+      // A route that does not exist was taken; the run stays in the staging and the failure is loud.
+      throw new Error(outcome.reason ?? 'the batch was not committed');
+    }
+    // The run is committed, and only now does it leave the staging: a commit that failed keeps its
+    // frames, so a retry - the next frame, the next flush point, a stop asked again - is about those
+    // frames and not about an empty batch that would report a clean stop over unacknowledged work.
+    pendingFrames = pendingFrames.slice(batch.length);
+    let deliveredAny = false;
+    let ackEnvelope = null;
+    for (let i = 0; i < batch.length; i += 1) {
+      const note = outcome.results[i];
+      const envelope = batch[i];
+      if (note.accepted === false) {
+        refuseFrame(note, envelope);
+        continue;
+      }
+      ackEnvelope = envelope;
+      if (note.durable === true) framesDurable += 1;
+      else if (note.alreadyDurable === true) framesAlreadyDurable += 1;
+      if (note.durable === true || note.alreadyDurable === true) {
+        // A frame the book cannot take yet stays owed - only its `applied_ack` releases it. A sweep
+        // already wanted covers this frame too, in arrival order, so nothing is offered here.
+        if (!owedSweepNeeded) {
+          deliverEntry(envelope);
+          deliveredAny = true;
+        }
+      }
+    }
+    if (outcome.ack && ackEnvelope !== null) {
+      sendDurableAck(outcome.ack, ackEnvelope);
+      try {
+        onAck(outcome.ack);
+      } catch {
+        // an observation that throws is not a fact about the frame
+      }
+    }
+    if (owedSweepNeeded) requestSweep();
+    if (deliveredAny) armEpochSweep();
+    return outcome;
+  }
+
+  /** Add a frame to the pending batch; flush it when the batch is full, arm the clock otherwise. */
+  function enqueueFrame(envelope) {
+    pendingFrames.push(envelope);
+    if (pendingFrames.length >= frameBatchMax) return flushFrameBatch();
+    if (frameBatchTimer === null && frameBatchMs > 0) {
+      frameBatchTimer = setTimer(() => {
+        frameBatchTimer = null;
+        try {
+          flushFrameBatch();
+        } catch (error) {
+          // The run stays in the staging, unacknowledged: the next frame, the next flush point or a
+          // stop asked again retries it, and the spool resends it if this life never manages to.
+          diagnostic(`the pending run could not be committed: ${error.message}`);
+        }
+      }, frameBatchMs);
+      if (typeof frameBatchTimer?.unref === 'function') frameBatchTimer.unref();
+    }
+    return null;
   }
 
   /**
@@ -288,12 +400,7 @@ export function createOrganizeProcess({
    * transaction writes the watermark and ledger confirmation together. Only after it commits is the
    * `durable_ack` sent (rulings ③⑦).
    */
-  function organizeFrame(envelope) {
-    if (closed) return refuseFrame({ accepted: false, reason: 'this organize process is closed' }, envelope);
-    if (stopped) return refuseFrame({ accepted: false, reason: 'this organize process has stopped' }, envelope);
-    const claim = belongsToBoard(envelope);
-    if (!claim.ok) return refuseFrame({ accepted: false, reason: claim.reason, ack: null }, envelope);
-
+  function noteFrame(envelope) {
     const note = organizer.note(envelope, {
       onIntent: (frame) => {
         ledgerInternal.record(frame, hasRawWriter ? OWED_REASON_RAW : OWED_REASON_STORE, INTENT);
@@ -332,6 +439,27 @@ export function createOrganizeProcess({
       armEpochSweep();
     }
     return note;
+  }
+
+  /**
+   * One received frame, from ingest. The raw path runs it frame by frame (`noteFrame`); without a raw
+   * the frame joins the batch instead, and its durability is reported through the batch's commit.
+   */
+  function organizeFrame(envelope) {
+    if (closed) return refuseFrame({ accepted: false, reason: 'this organize process is closed' }, envelope);
+    if (stopped) return refuseFrame({ accepted: false, reason: 'this organize process has stopped' }, envelope);
+    const claim = belongsToBoard(envelope);
+    if (!claim.ok) return refuseFrame({ accepted: false, reason: claim.reason, ack: null }, envelope);
+
+    if (hasRawWriter) return noteFrame(envelope);
+
+    // Group commit: the frame joins the batch, and the batch commits and acknowledges on its own
+    // schedule. A frame that flushed with its batch reports the batch's result for itself; one that
+    // is still waiting is `batched` - the channel reads neither, and the ingest learns the frame's
+    // fate from the durable acknowledgement alone.
+    const flushed = enqueueFrame(envelope);
+    if (flushed !== null) return flushed.results[flushed.results.length - 1];
+    return { accepted: true, batched: true, reason: 'queued for the batch commit', ack: null };
   }
 
   /**
@@ -487,6 +615,9 @@ export function createOrganizeProcess({
    * adoption's completion.
    */
   function adoptConnection(message) {
+    // The pending run belongs to the connection this process was organizing under; it commits before
+    // the identity can change, so no frame is ever judged against a connection it did not arrive for.
+    flushFrameBatch();
     if (message.payload?.accepted === false) {
       // The book refused; organize adopts nothing and the refusal travels on to ingest.
       return replyAccepted(message, false, message.payload?.reason ?? 'the book refused the connection');
@@ -531,6 +662,8 @@ export function createOrganizeProcess({
 
   /** The sealed final tails: the fact the all-acknowledged judgement runs on. */
   function handleTailSealed(message) {
+    // The all-acknowledged judgement reads the committed record, so the pending run commits first.
+    flushFrameBatch();
     const tails = message.payload?.tails;
     const spoolEmpty = message.payload?.spool_empty;
     const sealedIdentity = canonicalTailIdentity(tails);
@@ -1155,6 +1288,10 @@ export function createOrganizeProcess({
   /** Stop accepting frames. Pending durable work is retained for startup; no finalize is called. */
   function stop(reason = 'a stop was requested') {
     if (closed) return { stopped: false, reason: 'this organize process is closed' };
+    // A stop that leaves the pending run uncommitted is not a clean stop: the frames would be
+    // unacknowledged with nothing left running to acknowledge them. A failed flush throws, and the
+    // stop fails loudly with it.
+    flushFrameBatch();
     stopped = true;
     stopReadinessReporting();
     try {
@@ -1393,6 +1530,13 @@ export function createOrganizeProcess({
 
     close() {
       if (closed) return;
+      try {
+        // Best effort: the frames stay unacknowledged if this fails, and the process is closing
+        // either way - the diagnostic is the only honest report left.
+        flushFrameBatch();
+      } catch (error) {
+        diagnostic(`the pending run could not be committed while closing: ${error.message}`);
+      }
       reportRefusalBurst(' more');
       closeServer();
       stopReadinessReporting();

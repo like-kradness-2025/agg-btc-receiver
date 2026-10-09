@@ -236,7 +236,7 @@ test('startup refuses to admit a new connection while an old owed ledger frame i
     assert.equal(accepted.accepted, true, 'the previous connection is accepted in the persistent book store');
     oldBook.close();
 
-    const oldOrganizer = createOrganizeProcess({
+    const oldOrganizer = createOrganizeProcess({ frameBatchMs: 0, frameBatchMax: 1, 
       market: MARKET,
       stream: STREAM,
       runId: RUN,
