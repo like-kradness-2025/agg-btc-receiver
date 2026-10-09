@@ -592,6 +592,55 @@ test('a refused frame is tallied by reason, reported once per window, and flushe
   }
 });
 
+test('a restart restores the stored acceptance, so its frames can be re-acknowledged instead of refused', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-restore-'));
+  try {
+    const storePath = join(dir, 'organize.sqlite');
+    // The first life adopts a connection and makes one frame durable.
+    const first = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    const firstChannel = memoryChannel();
+    first.handleControl(acceptedMessage({}), firstChannel);
+    assert.equal(first.acceptedConnectionId, CID, 'the first life adopted the connection');
+    assert.equal(first.handleEnvelope(envelope(1), firstChannel).accepted, true);
+    first.close();
+
+    // A new life: the same frame is answered from the restored acceptance instead of refused.
+    const second = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    assert.equal(second.acceptedConnectionId, CID, 'the stored acceptance was restored');
+    const secondChannel = memoryChannel();
+    const again = second.handleEnvelope(envelope(1), secondChannel);
+    assert.equal(again.accepted, true, 'the frame is authorized by the restored acceptance');
+    assert.equal(again.alreadyDurable === true, true, 'and answered as already durable');
+    assert.equal(secondChannel.sent.some((m) => m.type === 'durable_ack'), true, 'so it is acknowledged again');
+    second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an acceptance with no durable frame yet is restored (the acceptance is written down when made)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-accept-first-'));
+  try {
+    const storePath = join(dir, 'organize.sqlite');
+    // The first life adopts a connection and organises nothing before it stops: no watermark row
+    // exists, only the written-down acceptance.
+    const first = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    first.handleControl(acceptedMessage({}), memoryChannel());
+    assert.equal(first.acceptedConnectionId, CID, 'the first life adopted the connection');
+    assert.deepEqual(first.watermarkRows(), [], 'no frame was organised yet');
+    first.close();
+
+    const second = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath });
+    assert.equal(second.acceptedConnectionId, CID, 'the acceptance survived without a watermark row');
+    const channel = memoryChannel();
+    const accepted = second.handleEnvelope(envelope(1), channel);
+    assert.equal(accepted.accepted, true, 'and frames of the adopted connection are authorised');
+    second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the owed set is offered once: a frame above an open hole does not re-send the frames below it', async () => {
   const h = await setup();
   try {

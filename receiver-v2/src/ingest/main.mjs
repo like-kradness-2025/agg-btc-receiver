@@ -28,6 +28,7 @@
 
 import { createReceiveConnection } from './connection.mjs';
 import { createSpool } from '../spool.mjs';
+import { ackIdentityOf, rebuildAckFifo } from '../ack-fifo.mjs';
 import { openIngestStore } from './store.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
 import { attachChanges, deriveChanges } from '../changes.mjs';
@@ -82,6 +83,10 @@ export function createIngestProcess({
   // Set 1 (observability): how long frames may go unacknowledged before a stall is reported. Reports
   // are silenced to one line per interval; 0 or a non-positive value turns the observation off.
   ackStallMs = DEFAULT_ACK_STALL_MS,
+  // Set 3: the timers of the progress deadline and the resend scheduler. Injected so a test can drive
+  // them, exactly like the connection's timers; production gets the real ones.
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
   ...receiveOptions
 } = {}) {
   if (!adapter) throw new TypeError('the ingest process needs a venue adapter');
@@ -95,6 +100,10 @@ export function createIngestProcess({
   if (store === null) throw new TypeError('the ingest process needs an ingest store (a path or an open store)');
 
   const spool = spoolDir ? createSpool({ dir: spoolDir, ...spoolOptions }) : null;
+  // Set 3: the release order of everything the spool holds, rebuilt once from the walk. The cursor
+  // only ever moves past a record that itself is acknowledged (see ack-fifo.mjs); a spool-less
+  // configuration has nothing to release.
+  const fifo = spool === null ? null : rebuildAckFifo(spool.drainRecords());
 
   let organizeChannelRef = organizeChannel;
   // What organize last told us about its capacity. Anything but 'ok' means the frame cannot be handed
@@ -119,12 +128,24 @@ export function createIngestProcess({
   let ackConnectionId = null;
   let lastAckUpToSeq = null;
   let framesSinceAckProgress = 0;
-  let unackedSinceMs = 0;
-  let lastAckStallReportAtMs = 0;
-  let spoolHeldReported = false;
+  let linkHeldReported = false;
+  // Set 3: the single resend scheduler and the progress deadline. A hand-over waits for the previous
+  // connection's retention to empty before its acceptance is announced (deferredAdmission), and the
+  // deadline is what turns "no acknowledgement is coming" into a resend instead of a wait.
+  let progressTimer = null;
+  let progressClockMs = 0;
+  let stalledStrikes = 0;
+  let resendTimer = null;
+  let resendRunning = false;
+  let resendQueued = false;
+  let resendWalk = null;
+  let resendPending = null;
+  let deferredAdmission = null;
 
   const connection = createReceiveConnection({
     ...receiveOptions,
+    setTimer,
+    clearTimer,
     adapter,
     market,
     runId,
@@ -194,49 +215,28 @@ export function createIngestProcess({
   /** The frames this process hands on are the ones with a derived, validated changes block. */
 
   /**
-   * Hand one frame to organize if the link is up and has capacity; otherwise spool it. False back from
-   * the channel means the same thing it means in `ipc.mjs`: the queue is over its bound and the frame
-   * must be kept elsewhere, never dropped.
+   * Hand one frame to organize. Set 3: retention comes first - the frame is written to the spool and
+   * registered with the release FIFO before it is offered to the link, so a frame the link refuses,
+   * or one that never gets the chance to be sent, is still something this process holds and can send
+   * again. A frame the spool cannot hold stops reception (the ladder's third rung) and is never
+   * handed on - a frame the process cannot keep is one it must not pretend to have delivered.
+   * False back from the channel means the same thing it means in `ipc.mjs`: the queue is over its
+   * bound and the frame must be kept elsewhere, never dropped.
    */
   function sendOrSpool(envelope) {
     if (closed) return { accepted: false, reason: 'this ingest process is closed' };
-    if (organizeChannelRef !== null && organizeCapacity === 'ok') {
-      let ok = false;
-      try {
-        ok = organizeChannelRef.sendEnvelope(envelope);
-      } catch (error) {
-        try {
-          onDiagnostic({ market, reason: `the organize link refused a frame: ${error.message}` });
-        } catch {
-          // a diagnostic must not interrupt fallback retention of this accepted frame
-        }
-        ok = false;
-      }
-      if (ok) {
-        sentFrames += 1;
-        noteFrameSent();
-        return { accepted: true, sent: true };
-      }
-    }
-    return spoolFrame(envelope);
-  }
-
-  /** Append one frame to the spool. False from the spool is a stop signal, not a reason to drop it. */
-  function spoolFrame(envelope) {
-    let retained = false;
-    const wasEmpty = (spool?.bytes ?? 0) === 0;
-    try {
-      retained = spool !== null && spool.append(envelope) && !spool.failed;
-    } catch (error) {
-      unretainedFrameFailure = true;
-      throw error;
-    }
-    if (retained) {
+    if (spool !== null) {
+      const retained = spoolFrame(envelope);
+      if (retained.accepted === false) return retained;
+      if (trySend(envelope)) return { accepted: true, sent: true };
+      // Held because the link would not take it: counted, and the episode is reported once - not
+      // once per frame - so a capacity episode is visible without flooding the log. The retention
+      // is also put under the progress deadline here: a first send that failed while the link is
+      // nominally ready must age into a report and a retry rather than wait for another event.
       spooledFrames += 1;
-      // Set 1 (observability): the moment the spool goes from empty to holding frames is reported
-      // once - not once per frame - so a capacity episode is visible without flooding the log.
-      if (wasEmpty && !spoolHeldReported) {
-        spoolHeldReported = true;
+      armProgressDeadlineIfIdle();
+      if (!linkHeldReported) {
+        linkHeldReported = true;
         try {
           onDiagnostic({
             market,
@@ -251,9 +251,57 @@ export function createIngestProcess({
       }
       return { accepted: true, spooled: true };
     }
+    // No spool configured: there is nothing to retain, so the link is the only rung before the stop.
+    if (trySend(envelope)) return { accepted: true, sent: true };
+    return spoolFrame(envelope);
+  }
+
+  /** Offer one frame to the organize link. False means the link would not take it, never "sent". */
+  function trySend(envelope) {
+    if (organizeChannelRef === null || organizeCapacity !== 'ok') return false;
+    let ok = false;
+    try {
+      ok = organizeChannelRef.sendEnvelope(envelope);
+    } catch (error) {
+      try {
+        onDiagnostic({ market, reason: `the organize link refused a frame: ${error.message}` });
+      } catch {
+        // a diagnostic must not interrupt retention of this accepted frame
+      }
+      ok = false;
+    }
+    if (!ok) return false;
+    sentFrames += 1;
+    linkHeldReported = false;
+    noteFrameSent();
+    return true;
+  }
+
+  /**
+   * Append one frame to the spool and register its end position for release. False from the spool is
+   * a stop signal, not a reason to drop it: the ladder's third rung stops reception and records the
+   * gap.
+   */
+  function spoolFrame(envelope) {
+    let position = false;
+    try {
+      position = spool !== null ? spool.append(envelope) : false;
+    } catch (error) {
+      // A spool that throws has nothing more to offer - a torn record stops it taking anything -
+      // so the ladder's third rung is taken here exactly as it is on a refusal; the failure still
+      // surfaces to the caller.
+      unretainedFrameFailure = true;
+      stopReception('nothing could hold the frame');
+      onGap({ market, reason: `the spool could not hold the frame: ${error.message}`, seq: envelope.receive_seq });
+      throw error;
+    }
+    if (position !== false && position !== null) {
+      fifo.record({ identity: ackIdentityOf(envelope), seq: envelope.receive_seq, position });
+      return { accepted: true, spooled: true };
+    }
     unretainedFrameFailure = true;
     stopReception('nothing could hold the frame');
-    onGap({ market, reason: 'the organize link could not take the frame and the spool could not hold it', seq: envelope.receive_seq });
+    onGap({ market, reason: 'the spool could not hold the frame and it was not handed on', seq: envelope.receive_seq });
     return { accepted: false, reason: 'nothing could hold the frame' };
   }
 
@@ -262,6 +310,9 @@ export function createIngestProcess({
     quiescing = true;
     stopped = true;
     stopReadinessReporting();
+    // The drain timers deliberately keep their lives through quiescence: sealing fences new
+    // reception, and what is retained still owes an acknowledgement-driven drain (and a stalled
+    // acknowledgement is still detected). They guard on `closed` themselves.
     try {
       connection.stop();
     } catch (error) {
@@ -316,13 +367,38 @@ export function createIngestProcess({
     if (closed || quiescing) return false;
     const message = acceptMessage(info);
     pendingAdmissions.set(info.generation, {
+      generation: info.generation,
       requestId: message.request_id,
       connectionId: info.connectionId,
       info,
       message,
     });
-    announceAccept(message);
+    // Set 3: a hand-over is serialized. Until every frame of the previous connection is
+    // acknowledged, the next generation is not announced at all - the venue socket stays closed and
+    // no frame of the new generation can be stamped before the old one is fully resolved. The
+    // frames still unacknowledged are offered again now, so the wait is usually over in one round
+    // trip; the acceptance goes out the moment the release FIFO empties (tryDeferredAdmission).
+    deferredAdmission = { generation: info.generation, message };
+    if (fifo !== null && fifo.size > 0) {
+      scheduleResend();
+      return undefined;
+    }
+    tryDeferredAdmission();
     return undefined;
+  }
+
+  /**
+   * Announce a hand-over that was waiting for the previous connection's retention to empty. Called
+   * whenever the release FIFO drains (an acknowledgement) and whenever the link is attached - the
+   * two moments the wait can end. The announcement is kept until it is actually sent: a link that
+   * is not there yet is a reason to wait, not a reason to lose the acceptance.
+   */
+  function tryDeferredAdmission() {
+    if (deferredAdmission === null) return false;
+    if (fifo !== null && fifo.size > 0) return false;
+    const sent = announceAccept(deferredAdmission.message);
+    if (sent === true) deferredAdmission = null;
+    return sent === true;
   }
 
   function announceAccept(message) {
@@ -418,130 +494,240 @@ export function createIngestProcess({
   }
 
   /**
-   * Organize is durable up to a contiguous ceiling. The spool may only move past what that ceiling
-   * covers, oldest first, and only a contiguous run may be released - moving over a record that was
-   * not consumed would delete it. What is left after the move is offered again when the peer has
-   * capacity, so a frame that could not be handed on does not wait for a resend nobody asked for.
+   * Organize is durable up to a contiguous ceiling, and the spool may only be released as far as
+   * that ceiling covers - in physical order, from the FIFO's head, never past a record that is not
+   * itself acknowledged. Set 3: the acknowledgement itself never triggers a resend; it may only
+   * open capacity to one (the scheduler's 'capacity-returned' trigger).
    */
   function handleDurableAck(message) {
+    const before = organizeCapacity;
     if (typeof message.payload?.capacity === 'string') organizeCapacity = message.payload.capacity;
     const upToSeq = message.payload?.up_to_seq;
-    const advanced = Number.isInteger(upToSeq) ? advanceSpoolTo(message.connection_id, upToSeq) : false;
-    if ((spool?.bytes ?? 0) === 0) spoolHeldReported = false;
-    if (Number.isInteger(upToSeq)) noteAckProgress(message.connection_id, upToSeq);
-    const resent = organizeCapacity === 'ok' ? resendSpool({ connectionId: message.connection_id }) : 0;
-    return { advanced, resent, capacity: organizeCapacity };
+    let advanced = false;
+    if (fifo !== null && Number.isInteger(upToSeq)) {
+      const released = fifo.noteAck({ identity: ackIdentityOf(message), upToSeq });
+      if (released.position !== null) {
+        spool.advance(released.position);
+        resendWalk = null; // the walk describes released positions; the next one starts at the cursor
+        resendPending = null;
+        noteAckProgress(message.connection_id, upToSeq);
+        advanced = true;
+      }
+    }
+    if (organizeCapacity === 'ok' && before !== 'ok') scheduleResend('capacity-returned');
+    // A hand-over waits here: the next generation is announced the moment nothing of the previous
+    // one is left unacknowledged.
+    tryDeferredAdmission();
+    return { advanced, capacity: organizeCapacity };
   }
 
   /**
-   * Set 1 (observability): a frame was sent and nothing has acknowledged it for long enough that this
-   * is worth stating. The report is rate-limited to one line per ackStallMs; it observes - it never
-   * triggers a resend (that is a later set's job).
+   * Set 1/3 (observability + recovery): a sent frame starts the progress clock once, and the
+   * deadline is armed once. The deadline firing while frames remain unacknowledged is what reports
+   * the stall and asks for a resend; an acknowledgement that moves the ceiling clears it. A
+   * same-value acknowledgement or a readiness report does not reset the clock, so a ceiling that
+   * stopped moving is what triggers the deadline - not mere quiet.
    */
+  const STALL_STOPS_AFTER = 6;
+
   function noteFrameSent() {
-    const nowMs = Date.now();
-    if (framesSinceAckProgress === 0) unackedSinceMs = nowMs;
     framesSinceAckProgress += 1;
+    armProgressDeadlineIfIdle();
+  }
+
+  /**
+   * Arm the progress deadline once while there is unacknowledged retention and the link can take
+   * frames. The clock starts when the wait starts and restarts on every release; a same-value
+   * acknowledgement, a readiness report or a resend does not reset it, so a ceiling that stopped
+   * moving - not mere quiet - is what fires it. Only the process closing ends it.
+   */
+  function armProgressDeadlineIfIdle() {
+    if (progressTimer !== null) return;
     if (!Number.isFinite(ackStallMs) || ackStallMs <= 0) return;
-    if (nowMs - unackedSinceMs < ackStallMs) return;
-    if (nowMs - lastAckStallReportAtMs < ackStallMs) return;
-    lastAckStallReportAtMs = nowMs;
+    if (closed) return;
+    if (fifo === null || fifo.size === 0) return;
+    if (organizeCapacity !== 'ok') return;
+    progressClockMs = Date.now();
+    progressTimer = setTimer(() => {
+      progressTimer = null;
+      onProgressDeadline();
+    }, ackStallMs);
+    if (typeof progressTimer?.unref === 'function') progressTimer.unref();
+  }
+
+  function onProgressDeadline() {
+    if (closed) return;
+    if (fifo === null || fifo.size === 0) {
+      stalledStrikes = 0;
+      return;
+    }
+    if (organizeCapacity !== 'ok') {
+      // The link is known to be unable to take frames: that is the episode report's subject, not a
+      // stall. The deadline waits for the link instead of resending into a full queue.
+      armProgressDeadlineIfIdle();
+      return;
+    }
+    stalledStrikes += 1;
+    const nowMs = Date.now();
     try {
       onDiagnostic({
         market,
-        reason: `the durable ceiling has stalled: ${framesSinceAckProgress} frames have been sent since it last moved`,
+        reason: `the durable ceiling has stalled: ${fifo.size} frames are retained and unacknowledged`,
+        unreleasedFrames: fifo.size,
         framesSinceProgress: framesSinceAckProgress,
-        stalledMs: nowMs - unackedSinceMs,
+        stalledMs: nowMs - progressClockMs,
         upToSeq: lastAckUpToSeq,
         capacity: organizeCapacity,
         spoolBytes: spool?.bytes ?? 0,
+        strikes: stalledStrikes,
       });
     } catch {
-      // a diagnostic is best-effort; it must never interrupt sending a frame
+      // a diagnostic is best-effort
+    }
+    scheduleResend();
+    if (stalledStrikes >= STALL_STOPS_AFTER) {
+      // A release has not come for the whole retry budget while the link kept accepting resends:
+      // the retention cannot be drained here. Stopping loudly beats holding a hand-over (or a
+      // board) for ever - the answer to a cause that cannot be recovered from in place.
+      stopReception(`the retained frames could not be acknowledged after ${stalledStrikes} attempts`);
+      return;
+    }
+    armProgressDeadlineIfIdle();
+  }
+
+  function clearProgressDeadline() {
+    if (progressTimer !== null) {
+      clearTimer(progressTimer);
+      progressTimer = null;
     }
   }
 
   /**
-   * Set 1 (observability): an acknowledgement that moves the ceiling is progress - it resets the
-   * stall clock. A same-value acknowledgement does not reset it, so a ceiling that stops moving is
-   * reported rather than masked by repetition. The clock is per connection: a new connection's
-   * acknowledgements start a fresh clock instead of inheriting the old one's stall.
+   * Set 1/3: an acknowledgement that releases from the FIFO is progress - it restarts the stall
+   * clock and the retry budget. A same-value acknowledgement, or one that releases nothing (a
+   * stale value, another identity's range), does not, so a ceiling that stops moving is reported
+   * rather than masked by repetition and a stalled hand-over cannot be silenced by irrelevant
+   * acknowledgements. The clock is per connection: a new connection's releases start a fresh one.
    */
   function noteAckProgress(connectionId, upToSeq) {
     if (connectionId !== ackConnectionId) {
       ackConnectionId = connectionId;
       lastAckUpToSeq = null;
       framesSinceAckProgress = 0;
-      unackedSinceMs = 0;
     }
     if (lastAckUpToSeq !== null && upToSeq <= lastAckUpToSeq) return;
     lastAckUpToSeq = upToSeq;
     framesSinceAckProgress = 0;
-    unackedSinceMs = 0;
-    lastAckStallReportAtMs = 0;
+    stalledStrikes = 0;
+    clearProgressDeadline();
+    armProgressDeadlineIfIdle();
   }
 
   /**
-   * Move the spool cursor to the end of the last record the acknowledgement covers, for the connection
-   * it names. `advance` deletes every segment entirely behind that position, which is what keeps the
-   * spool bounded; a position inside a segment deletes nothing, so a partially-consumed segment is
-   * never discarded.
+   * Set 3: the single resend scheduler. Everything the spool still holds is offered again for
+   * exactly four reasons - the link became ready (attached, or its capacity returned), a hand-over
+   * is waiting for the previous connection to drain, the progress deadline expired with frames still
+   * unacknowledged, or a peer asked explicitly. An acknowledgement never triggers one. A run is
+   * bounded to a window of frames so the event loop gets a turn between windows, and a send the
+   * link refuses stops the window where it is - the rest waits for the next opportunity instead of
+   * the head being re-sent over and over.
    */
-  function advanceSpoolTo(connectionId, upToSeq) {
-    if (spool === null) return false;
-    let last = null;
-    try {
-      for (const record of spool.drainRecords()) {
-        const envelope = record.envelope;
-        if (envelope.connection_id !== connectionId) continue;
-        if (envelope.receive_seq > upToSeq) break;
-        last = { segment: record.segment, offset: record.offset };
-      }
-    } catch (error) {
-      // A segment whose bytes do not describe the records it claims is not something this walk may
-      // guess at; it stops where it is and says so rather than letting the read take down the link.
-      onDiagnostic({ market, reason: `the spool could not be walked to advance the cursor: ${error.message}` });
-      return false;
+  const RESEND_WINDOW_FRAMES = 256;
+
+  function scheduleResend() {
+    // Quiescence is not a reason to stop: sealing fences new reception, and the retained frames
+    // still owe an acknowledgement-driven drain. Only closing the process ends resends.
+    if (closed) return 0;
+    if (resendRunning || resendTimer !== null) {
+      resendQueued = true;
+      return 0;
     }
-    if (last === null) return false;
-    spool.advance(last);
-    return true;
+    return runResendWindow();
   }
 
-  /**
-   * Offer what the spool still holds, oldest segment first and within a segment in write order, so a
-   * resend after a reconnect cannot overtake data that was already waiting. The cursor is not moved
-   * here: only an acknowledgement moves it. A send that reports backpressure stops the walk where it
-   * is, leaving the rest for the next opportunity rather than dropping it.
-   */
-  function resendSpool({ connectionId = null, force = false } = {}) {
-    if (spool === null || spool.bytes === 0) return 0;
-    if (organizeChannelRef === null || (!force && organizeCapacity !== 'ok')) return 0;
+  function runResendWindow() {
+    if (closed) return 0;
+    if (spool === null || spool.bytes === 0) {
+      resendWalk = null;
+      resendPending = null;
+      return 0;
+    }
+    if (organizeChannelRef === null || organizeCapacity !== 'ok') return 0;
+    // The deadline watches this drain attempt itself: a window whose every offer is refused must
+    // still age into a report and the retry budget, not wait for some later event to notice.
+    armProgressDeadlineIfIdle();
+    resendRunning = true;
     let sent = 0;
     try {
-      for (const envelope of spool.drain()) {
-        if (connectionId !== null && envelope.connection_id !== connectionId) continue;
-        let ok = false;
-        try {
-          ok = organizeChannelRef.sendEnvelope(envelope);
-        } catch (error) {
-          onDiagnostic({ market, reason: `the organize link refused a resend: ${error.message}` });
-          ok = false;
+      // The walk is kept across windows and across a refusal: it resumes exactly where the link
+      // stopped taking frames, so a bounded window never re-sends the head while the rest waits.
+      // A record already drawn from the walk and then refused is held in `resendPending` and tried
+      // first next time - a refusal never advances past a record. The walk is dropped whenever an
+      // acknowledgement moves the cursor (handleDurableAck), because then the positions it holds
+      // describe records that have been released.
+      if (resendWalk === null) {
+        resendPending = null;
+        resendWalk = spool.drain();
+      }
+      while (sent < RESEND_WINDOW_FRAMES) {
+        if (resendPending !== null) {
+          if (!trySendResend(resendPending)) break; // still refused: held for the next window
+          resendPending = null;
+          sent += 1;
+          continue;
         }
-        if (!ok) break;
+        const step = resendWalk.next();
+        if (step.done === true) {
+          resendWalk = null;
+          break;
+        }
+        if (!trySendResend(step.value)) {
+          resendPending = step.value;
+          break;
+        }
         sent += 1;
       }
     } catch (error) {
       // A record the spool cannot hand back is not one this walk may guess at: it stops where it is,
       // leaves the spool untouched, and says so rather than taking the organize link down with it.
+      resendWalk = null;
+      resendPending = null;
       onDiagnostic({ market, reason: `the spool could not hand back a record: ${error.message}` });
+    } finally {
+      resendRunning = false;
     }
-    resentFrames += sent;
+    if (!closed && sent >= RESEND_WINDOW_FRAMES && resendWalk !== null) {
+      // The window was full: the walk has more, and the loop yields before the next window.
+      resendTimer = setTimer(() => {
+        resendTimer = null;
+        runResendWindow();
+      }, 0);
+      if (typeof resendTimer?.unref === 'function') resendTimer.unref();
+    } else if (resendQueued) {
+      resendQueued = false;
+      runResendWindow();
+    }
     return sent;
   }
 
+  /** One re-send: the same link and the same accounting as a first send, only the counter differs. */
+  function trySendResend(envelope) {
+    let ok = false;
+    try {
+      ok = organizeChannelRef.sendEnvelope(envelope);
+    } catch (error) {
+      onDiagnostic({ market, reason: `the organize link refused a resend: ${error.message}` });
+      ok = false;
+    }
+    if (!ok) return false;
+    resentFrames += 1;
+    linkHeldReported = false;
+    armProgressDeadlineIfIdle();
+    return true;
+  }
+
   function handleResend(message) {
-    return { resent: resendSpool({ connectionId: message.connection_id, force: true }) };
+    return { resent: scheduleResend() };
   }
 
   /**
@@ -557,9 +743,13 @@ export function createIngestProcess({
   }
 
   function handleReadiness(message) {
+    const before = organizeCapacity;
     if (typeof message.payload?.capacity === 'string') organizeCapacity = message.payload.capacity;
     if (message.payload?.ready === false) organizeCapacity = 'down';
-    const resent = organizeCapacity === 'ok' ? resendSpool({ connectionId: null }) : 0;
+    // Set 3: a capacity that has just come back is the moment the retained frames can move again. A
+    // repeated 'ok' is not - re-sending on every readiness report would duplicate a window that is
+    // already waiting for its acknowledgement.
+    const resent = organizeCapacity === 'ok' && before !== 'ok' ? scheduleResend() : 0;
     return { capacity: organizeCapacity, resent };
   }
 
@@ -679,7 +869,7 @@ export function createIngestProcess({
    * acknowledgement, so nothing here is released by the send.
    */
   function drainSpool() {
-    return { resent: resendSpool({ connectionId: null, force: true }) };
+    return { resent: scheduleResend() };
   }
 
   const spoolView =
@@ -764,8 +954,12 @@ export function createIngestProcess({
     attachOrganize(channel) {
       organizeChannelRef = channel;
       announceHello();
-      for (const pending of pendingAdmissions.values()) announceAccept(pending.message);
-      if (organizeCapacity === 'ok') resendSpool({ connectionId: null });
+      for (const pending of pendingAdmissions.values()) {
+        if (deferredAdmission !== null && pending.generation === deferredAdmission.generation) continue;
+        announceAccept(pending.message);
+      }
+      if (organizeCapacity === 'ok') scheduleResend();
+      tryDeferredAdmission();
       return true;
     },
 
@@ -865,8 +1059,9 @@ export function createIngestProcess({
         spooledFrames,
         resentFrames,
         spoolBytes: spool?.bytes ?? 0,
+        unreleasedFrames: fifo?.size ?? 0,
         framesSinceProgress: framesSinceAckProgress,
-        stalledMs: framesSinceAckProgress > 0 ? Date.now() - unackedSinceMs : 0,
+        stalledMs: (fifo?.size ?? 0) > 0 && progressClockMs > 0 ? Date.now() - progressClockMs : 0,
         lastAckUpToSeq,
         stopped,
       };

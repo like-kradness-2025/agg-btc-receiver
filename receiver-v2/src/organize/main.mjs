@@ -327,6 +327,92 @@ export function createOrganizeProcess({
     return note;
   }
 
+  /**
+   * Set 3: restore the acceptance a previous life of this board recorded. Without it, a restart whose
+   * spool still holds frames of the accepted connection could never acknowledge them again - the
+   * frames would be refused ("no connection has been accepted yet") and the retention that is supposed
+   * to guarantee delivery would pin the cursor for ever.
+   *
+   * The written-down acceptance is what is restored first: it exists from the moment the connection
+   * was adopted, even when no frame of it was ever durably organised (the watermark row only appears
+   * with the first frame, so a crash between adoption and that first frame is exactly the case it
+   * must cover). The most recently updated watermark row is the fallback for a store written before
+   * this record existed; the connection name is `run:venue:market:generation`, so the run and the
+   * generation can be recovered from it. A store with neither restores nothing.
+   */
+  function restoreAcceptedConnection() {
+    let connectionId = null;
+    let runIdRestored = null;
+    let generation = null;
+    let firstSeq = undefined;
+    let acceptance = null;
+    let watermark = null;
+    try {
+      acceptance = wiring.db
+        .prepare(
+          `SELECT connection_id, run_id, generation, updated_at_ms FROM organize_acceptance
+            WHERE market = ? AND stream = ?`,
+        )
+        .get(market, stream);
+      watermark = wiring.db
+        .prepare(
+          `SELECT connection_id, first_seq, updated_at_ms FROM organized_watermark
+            WHERE market = ? AND stream = ? ORDER BY updated_at_ms DESC, rowid DESC LIMIT 1`,
+        )
+        .get(market, stream);
+    } catch (error) {
+      diagnostic(`the stored acceptance could not be read: ${error.message}`);
+      return null;
+    }
+    // The newest fact wins. The acceptance is written at adoption, so it covers a crash before the
+    // first durable frame; the watermark advances with every organised frame, so it covers an
+    // acceptance whose write failed while its frames still made it to the board. A tie keeps the
+    // acceptance: at the same instant it reflects the later adoption.
+    const acceptanceAt = Number.isInteger(acceptance?.updated_at_ms) ? acceptance.updated_at_ms : null;
+    const watermarkAt = Number.isInteger(watermark?.updated_at_ms) ? watermark.updated_at_ms : null;
+    if (acceptanceAt !== null && (watermarkAt === null || acceptanceAt >= watermarkAt)) {
+      if (typeof acceptance.connection_id === 'string' && acceptance.connection_id.length > 0) {
+        connectionId = acceptance.connection_id;
+        runIdRestored = acceptance.run_id ?? null;
+        generation = Number.isInteger(acceptance.generation) ? acceptance.generation : null;
+      }
+    } else if (watermarkAt !== null) {
+      if (typeof watermark.connection_id === 'string' && watermark.connection_id.length > 0) {
+        connectionId = watermark.connection_id;
+        firstSeq = watermark.first_seq ?? undefined;
+      }
+    }
+    if (connectionId === null && watermarkAt !== null) {
+      // An acceptance row too damaged to name a connection still must not hide a usable watermark.
+      if (typeof watermark.connection_id === 'string' && watermark.connection_id.length > 0) {
+        connectionId = watermark.connection_id;
+        firstSeq = watermark.first_seq ?? undefined;
+      }
+    }
+    if (connectionId === null) return null;
+    if (runIdRestored === null || generation === null) {
+      const parts = connectionId.split(':');
+      if (runIdRestored === null && parts.length >= 4) runIdRestored = parts[0];
+      if (generation === null && parts.length >= 4 && Number.isInteger(Number(parts[parts.length - 1]))) {
+        generation = Number(parts[parts.length - 1]);
+      }
+    }
+    acceptedConnectionId = connectionId;
+    acceptedRunId = runIdRestored;
+    acceptedGeneration = generation;
+    organizer.accept(connectionId, {
+      firstSeq,
+      runId: runIdRestored,
+      generation: generation ?? undefined,
+    });
+    diagnostic('the stored acceptance was restored for recovery', {
+      connection_id: connectionId,
+      run_id: runIdRestored,
+      generation,
+    });
+    return { connectionId, runId: runIdRestored, generation };
+  }
+
   function sendDurableAck(ack, envelope) {
     if (ingestChannel === null) return false;
     try {
@@ -410,6 +496,26 @@ export function createOrganizeProcess({
       runId: acceptedRunId,
       generation: acceptedGeneration,
     });
+    // Set 3: the acceptance itself is written down the moment it is made. The watermark row only
+    // appears with the first durably organised frame, so a crash in between would otherwise lose
+    // the fact that this connection was adopted - and its retained frames could never be
+    // acknowledged after the restart. The record is what makes the confirmation true, so a write
+    // that fails is not confirmed: the adoption stays in memory (its frames still flow), and the
+    // requester hears the refusal - an unmade record stops the ingest loudly rather than passing
+    // as confirmed, and the restart re-runs the adoption and the write. An acceptance the next
+    // life could not read must never be reported as accepted.
+    try {
+      wiring.db
+        .prepare(
+          `INSERT OR REPLACE INTO organize_acceptance
+             (market, stream, connection_id, run_id, generation, updated_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(market, stream, acceptedConnectionId, acceptedRunId, acceptedGeneration, nowMs());
+    } catch (error) {
+      diagnostic(`the acceptance could not be written down: ${error.message}`);
+      return replyAccepted(message, false, `the acceptance could not be written down: ${error.message}`);
+    }
     replyAccepted(message, true, '');
     // Now that the connection is adopted, any owed frame from a previous life can reach the board.
     deliverOwed();
@@ -1054,6 +1160,9 @@ export function createOrganizeProcess({
       readinessTimer = null;
     }
   }
+
+  // Set 3: a restart recovers the acceptance an earlier life recorded, before anything can arrive.
+  restoreAcceptedConnection();
 
   if (markRunning) organizeStore.beginRun();
   startReadinessReporting();

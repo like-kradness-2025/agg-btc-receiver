@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS organize_gap (
   filled_at_ms INTEGER,
   reason TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS organize_acceptance (
+  market TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
+  run_id TEXT,
+  generation INTEGER,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (market, stream)
+);
 `;
 
 /**

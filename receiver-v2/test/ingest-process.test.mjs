@@ -517,29 +517,135 @@ test('a durable ceiling that stops moving while frames are sent is reported, and
     h.sockets[0].onopen();
     h.sockets[0].deliver('{"seq":1}');
     await until(() => h.organize.state.envelopes.length === 1);
-    await new Promise((resolve) => setTimeout(resolve, 90));
     h.sockets[0].deliver('{"seq":2}');
-    await until(() => h.diagnostics.some((d) => /durable ceiling has stalled/.test(String(d.reason))));
-    const report = h.diagnostics.find((d) => /durable ceiling has stalled/.test(String(d.reason)));
-    assert.equal(report.framesSinceProgress, 2, 'both sent frames are counted as sent since the last advance');
+    await until(() => h.organize.state.envelopes.length === 2);
 
-    // An advance clears the stall: frames sent straight after it are not reported again.
+    // The progress deadline is the timer that turns "nothing was acknowledged" into a report and a
+    // resend. Nothing acknowledges these frames, so firing it is the expiry.
+    h.fireByDelay(60);
+    const report = h.diagnostics.find((d) => /durable ceiling has stalled/.test(String(d.reason)));
+    assert.ok(report, 'the expired deadline reports the stall');
+    assert.equal(report.framesSinceProgress, 2, 'both sent frames are counted as sent since the last advance');
+    await until(() => h.organize.state.envelopes.length === 4, { timeoutMs: 2000 });
+    assert.equal(h.organize.state.envelopes.length, 4, 'the expired deadline asks for a resend of what is unacknowledged');
+
+    // An acknowledgement of everything so far clears the clock and the pending deadline; the clean
+    // run then re-arms it only for frames sent after it.
     h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 2 });
     await until(() => h.process.stats.lastAckUpToSeq === 2);
-    const before = h.diagnostics.filter((d) => /durable ceiling has stalled/.test(String(d.reason))).length;
     h.sockets[0].deliver('{"seq":3}');
-    await until(() => h.organize.state.envelopes.length === 3);
-    assert.equal(
-      h.diagnostics.filter((d) => /durable ceiling has stalled/.test(String(d.reason))).length,
-      before,
-      'progress resets the stall clock',
+    await until(() => h.process.stats.sentFrames === 3);
+    assert.equal(h.process.stats.framesSinceProgress, 1, 'the clock restarts with the frame sent after the advance');
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 3 });
+    await until(() => h.process.stats.lastAckUpToSeq === 3);
+    assert.equal(h.process.stats.framesSinceProgress, 0, 'the advance reset the stall clock');
+    assert.throws(() => h.fireByDelay(60), /a timer of 60 ms was armed/, 'the pending deadline was cleared');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a partial acknowledgement leaves the rest stalled and reported', async () => {
+  const h = await setup({ label: 'stall-partial', ackStallMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    h.sockets[0].deliver('{"seq":2}');
+    await until(() => h.organize.state.envelopes.length === 2);
+
+    // Only the first frame is acknowledged: the second is still retained, so the deadline fires
+    // again for it instead of the clock dying with the partial advance.
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.process.stats.lastAckUpToSeq === 1);
+    h.fireByDelay(60);
+    const report = h.diagnostics.find((d) => /durable ceiling has stalled/.test(String(d.reason)));
+    assert.ok(report, 'the deadline still fires while a frame stays unacknowledged');
+    assert.equal(report.unreleasedFrames, 1, 'the report names what is still retained');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a stall that survives the retry budget stops reception instead of resending for ever', async () => {
+  const h = await setup({ label: 'stall-limit', ackStallMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+
+    for (let attempt = 0; attempt < 8 && !h.process.stats.stopped; attempt += 1) {
+      try {
+        h.fireByDelay(60);
+      } catch {
+        break; // no deadline armed any more
+      }
+    }
+    assert.equal(h.process.stats.stopped, true, 'the run stops rather than resending for ever');
+    assert.ok(
+      h.diagnostics.filter((d) => /durable ceiling has stalled/.test(String(d.reason))).length >= 6,
+      'every expiry was reported before the stop',
     );
   } finally {
     await h.teardown();
   }
 });
 
-test('a frame that goes to the spool instead of the organize link is reported once, not per frame', async () => {
+test('sealing does not stop the drain: a stalled acknowledgement is still detected while sealed', async () => {
+  const h = await setup({ label: 'sealed-stall', ackStallMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    assert.equal(await h.process.sealTails(), null, 'the retained frame refuses a candidate');
+
+    // The deadline keeps its life through quiescence: the sealed process still owes its drain.
+    h.fireByDelay(60);
+    assert.ok(
+      h.diagnostics.some((d) => /durable ceiling has stalled/.test(String(d.reason))),
+      'the sealed drain is still watched',
+    );
+    await until(() => h.organize.state.envelopes.length === 2, { timeoutMs: 2000 });
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a resend window continues past its bound instead of re-sending the head', async () => {
+  const h = await setup({ label: 'resend-window' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    await until(() => h.organize.channel !== null);
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
+    for (let seq = 1; seq <= 300; seq += 1) h.sockets[0].deliver(`{"seq":${seq}}`);
+    await until(() => h.process.stats.spooledFrames === 300);
+
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await until(() => h.organize.state.envelopes.length === 256, { timeoutMs: 4000 });
+    // The window was full: the continuation timer carries on from where it stopped, so the frames
+    // past the 256th arrive next - and the head is never sent twice.
+    h.fireByDelay(0);
+    await until(() => h.organize.state.envelopes.length === 300, { timeoutMs: 4000 });
+    assert.deepEqual(
+      h.organize.state.envelopes.map((e) => e.receive_seq).slice(256),
+      Array.from({ length: 44 }, (_, i) => 257 + i),
+      'the second window resumes at the 257th frame',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('frames the link cannot take are reported once per episode, and a delivered frame closes it', async () => {
   const h = await setup({ label: 'spool-report' });
   try {
     h.process.start();
@@ -555,19 +661,22 @@ test('a frame that goes to the spool instead of the organize link is reported on
     assert.equal(
       h.diagnostics.filter((d) => /held in the spool/.test(String(d.reason))).length,
       1,
-      'the report is edge-triggered: one report when the spool first holds frames',
+      'the episode is reported once, not per frame',
     );
 
-    // When an acknowledgement empties the spool, the next empty-to-holding transition is a new
-    // episode and is reported again.
-    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 2, capacity: 'full' });
-    await until(() => h.process.spool.bytes === 0);
+    // The link takes frames again: the resend delivers them, which closes the episode...
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await until(() => h.organize.state.envelopes.length === 2);
+
+    // ...so the next frame the link refuses opens a new one.
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
     h.sockets[0].deliver('{"seq":3}');
     await until(() => h.process.stats.spooledFrames === 3);
     assert.equal(
       h.diagnostics.filter((d) => /held in the spool/.test(String(d.reason))).length,
       2,
-      'a second empty-to-holding transition is reported as a new episode',
+      'a new episode is reported again',
     );
   } finally {
     await h.teardown();
@@ -662,7 +771,15 @@ test('a throwing channel diagnostic still spools the frame and permits a candida
     assert.deepEqual(h.process.drainSpool(), { resent: 1 });
     assert.equal(h.envelopes[0].receive_seq, 1);
     assert.equal(await h.process.sealTails(), null, 'resend alone does not release retention');
-    h.process.handleControl({ type: 'durable_ack', connection_id: h.process.connectionId, payload: { up_to_seq: 1 } });
+    h.process.handleControl({
+      type: 'durable_ack',
+      market: MARKET,
+      stream: STREAM,
+      run_id: 'run-1',
+      connection_id: h.process.connectionId,
+      generation: 1,
+      payload: { up_to_seq: 1 },
+    });
     assert.equal(h.process.spool.bytes, 0);
     const afterAck = await h.process.sealTails();
     assert.equal(afterAck?.spoolEmpty, true, 'successful fallback was not marked as lost');
@@ -672,27 +789,46 @@ test('a throwing channel diagnostic still spools the frame and permits a candida
   }
 });
 
-for (const spoolMode of ['absent', 'unavailable', 'refusing']) {
-  test(`a throwing channel diagnostic with ${spoolMode} spool keeps reentrant sealing failure sticky`, async () => {
+test('a throwing channel diagnostic with an absent spool keeps reentrant sealing failure sticky', async () => {
+  const h = channelDiagnosticFailure('absent');
+  try {
+    let deliveryError = null;
+    try { h.socket.deliver('{"seq":1}'); } catch (error) { deliveryError = error; }
+    assert.ok(h.sealPromise instanceof Promise, 'the diagnostic began sealing reentrantly');
+    const candidate = await h.sealPromise;
+    assert.equal(h.process.ingestStore.readReceivedTail(h.process.connectionId, STREAM)?.lastReceivedSeq, 1);
+    assert.equal(h.process.stats.spooledFrames, 0);
+    assert.equal(h.process.spool?.bytes ?? 0, 0);
+    assert.equal(candidate, null, 'a received but unretained frame must never yield a candidate');
+    assert.deepEqual(h.diagnostics[0], { market: MARKET, reason: 'the organize link refused a frame: injected channel send failure' });
+    assert.equal(deliveryError, null, 'the diagnostic exception is isolated');
+    h.recover();
+    assert.equal(await h.process.sealTails(), null, 'recovered channel and spool availability cannot erase an unretained frame');
+  } finally {
+    h.close();
+  }
+});
+
+for (const spoolMode of ['unavailable', 'refusing']) {
+  test(`a frame a ${spoolMode} spool cannot retain is never handed on, and sealing stays refused`, async () => {
     const h = channelDiagnosticFailure(spoolMode);
     try {
       let deliveryError = null;
       try { h.socket.deliver('{"seq":1}'); } catch (error) { deliveryError = error; }
-      assert.ok(h.sealPromise instanceof Promise, 'the diagnostic began sealing reentrantly');
-      const candidate = await h.sealPromise;
-      assert.equal(h.process.ingestStore.readReceivedTail(h.process.connectionId, STREAM)?.lastReceivedSeq, 1);
+      // Retention comes first: the link was never asked, so nothing reported it and nothing began
+      // sealing reentrantly.
+      assert.equal(h.diagnostics.filter((d) => /refused a frame/.test(String(d.reason))).length, 0);
       assert.equal(h.process.stats.spooledFrames, 0);
       assert.equal(h.process.spool?.bytes ?? 0, 0);
-      assert.equal(candidate, null, 'a received but unretained frame must never yield a candidate');
-      assert.deepEqual(h.diagnostics[0], { market: MARKET, reason: 'the organize link refused a frame: injected channel send failure' });
+      assert.equal(h.process.stats.stopped, true, 'the ladder stopped reception');
       if (spoolMode === 'unavailable') {
         assert.match(deliveryError?.message ?? '', /injected spool unavailable/, 'retention reached the unavailable spool');
         assert.equal(h.process.spool.failed, null, 'candidate refusal requires sticky ingest failure even without spool.failed');
       } else {
-        assert.equal(deliveryError, null, 'the diagnostic exception is isolated');
+        assert.equal(deliveryError, null, 'a refused record is the ladder, not an exception');
       }
       h.recover();
-      assert.equal(await h.process.sealTails(), null, 'recovered channel and spool availability cannot erase an unretained frame');
+      assert.equal(await h.process.sealTails(), null, 'an unretained frame keeps sealing refused');
     } finally {
       h.close();
     }
@@ -745,6 +881,10 @@ test('a returned final-tail candidate and all of its tail entries are immutable'
     h.sockets[0].onopen();
     h.sockets[0].deliver('{"seq":1}');
     await until(() => h.organize.state.envelopes.length === 1);
+
+    // The retained frame is released by its acknowledgement: a nonempty spool refuses a candidate.
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.process.spool.bytes === 0);
 
     const candidate = await h.process.sealTails();
     assert.equal(Object.isFrozen(candidate), true, 'the candidate object is immutable');
@@ -842,6 +982,110 @@ test('a tail candidate waits for a durable ACK to release the local spool obliga
     assert.equal(afterAck?.tails[0]?.lastReceivedSeq, 1);
   } finally {
     await h.teardown();
+  }
+});
+
+test('a sent frame is retained until its acknowledgement, and an acknowledgement releases it', async () => {
+  const h = await setup({ label: 'write-ahead' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    assert.ok(h.process.spool.bytes > 0, 'the frame the link took is still retained until acknowledged');
+    assert.equal(h.process.stats.unreleasedFrames, 1);
+
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.process.spool.bytes === 0);
+    assert.equal(h.process.stats.unreleasedFrames, 0, 'the acknowledgement released the retention');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('an acknowledgement releases without asking for a resend', async () => {
+  const h = await setup({ label: 'ack-no-resend' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+
+    h.organize.sendDurableAck({ connectionId: h.process.connectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.process.spool.bytes === 0);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(h.organize.state.envelopes.length, 1, 'the acknowledgement itself never triggers a resend');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a hand-over waits for the previous connection to be acknowledged before it is announced', async () => {
+  const h = await setup({ label: 'handover-gate' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    const oldConnectionId = h.process.connectionId;
+
+    // The venue connection dies: the next generation must not be announced while the old one's
+    // frames are still unacknowledged.
+    h.sockets[0].onclose();
+    await until(() => h.process.generation === 2);
+    await until(() => h.organize.state.envelopes.length >= 2, { timeoutMs: 2000 });
+    assert.equal(
+      h.organize.state.accepts.filter((message) => message.generation === 2).length,
+      0,
+      'the deferred generation is not announced while the old one is unacknowledged',
+    );
+
+    // The acknowledgement drains the previous connection's retention and opens the gate.
+    h.organize.sendDurableAck({ connectionId: oldConnectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.process.spool.bytes === 0);
+    await until(() => h.organize.state.accepts.some((message) => message.generation === 2), { timeoutMs: 2000 });
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a restart rebuilds the release order from the spool and acknowledges what the old life retained', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ingest-restart-'));
+  const organize = await startFakeOrganize(join(dir, 'organize.sock'), { batchFrames: 1 });
+  try {
+    const first = await buildIngest({ dir, organize, label: 'first' });
+    first.process.start();
+    await until(() => first.sockets.length === 1);
+    first.sockets[0].onopen();
+    first.sockets[0].deliver('{"seq":1}');
+    await until(() => organize.state.envelopes.length === 1);
+    assert.ok(first.process.spool.bytes > 0, 'the frame is retained by the first life');
+    first.process.close();
+
+    // A new life over the same spool: the walk rebuilds the release order and the record can be
+    // offered and acknowledged again.
+    const second = await buildIngest({ dir, organize, label: 'second', spoolDir: join(dir, 'spool-first'), ackStallMs: 60 });
+    assert.ok(second.process.spool.bytes > 0, 'the new life found the retained record');
+    assert.equal(second.process.stats.unreleasedFrames, 1, 'and rebuilt the release order from the walk');
+
+    assert.equal(second.process.drainSpool().resent, 1, 'the startup drain offers it again');
+    await until(() => organize.state.envelopes.length === 2);
+    // The resend restarts the stall clock: with nothing acknowledging, the deadline still fires.
+    second.fireByDelay(60);
+    assert.ok(
+      second.diagnostics.some((d) => /durable ceiling has stalled/.test(String(d.reason))),
+      'a restart alone does not lose the stall detection',
+    );
+    organize.sendDurableAck({ connectionId: 'run-1:kraken:kraken_spot:1', generation: 1, upToSeq: 1 });
+    await until(() => second.process.spool.bytes === 0);
+    assert.deepEqual(second.process.spool.segments, [], 'the acknowledged segment is released');
+    second.process.close();
+  } finally {
+    await organize.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
