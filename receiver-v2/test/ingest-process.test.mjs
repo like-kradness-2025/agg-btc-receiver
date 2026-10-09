@@ -26,6 +26,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { createIngestProcess, openIngestProcess } from '../src/ingest/main.mjs';
+import { openIngestStore } from '../src/ingest/store.mjs';
 import { DEFAULT_ACK_DEADLINE_MS } from '../src/ingest/connection.mjs';
 import { startFakeOrganize } from '../test-support/fake-organize.mjs';
 
@@ -89,6 +90,7 @@ async function buildIngest({ dir, organize, label = 'a', ...options }) {
   const diagnostics = [];
   const gaps = [];
   const process = await openIngestProcess({
+    tailSaveMs: options.tailSaveMs ?? 0,
     market: MARKET,
     stream: STREAM,
     adapter: options.adapter ?? dataAdapter,
@@ -98,6 +100,7 @@ async function buildIngest({ dir, organize, label = 'a', ...options }) {
     takeoverFor: options.takeoverFor ?? (() => false),
     webSocketImpl: impl,
     organizeSocketPath: organize.server.path,
+    ingestStore: options.ingestStore ?? null,
     ingestStorePath: join(dir, `ingest-${label}.sqlite`),
     spoolDir: options.spoolDir ?? join(dir, `spool-${label}`),
     spoolOptions: options.spoolOptions ?? {},
@@ -378,7 +381,7 @@ test('C4: the null form sends nothing at all - never an empty frame', async () =
 test('the open ingest factory rejects a deferred executor before connecting its IPC channel', async () => {
   await withWorld(async ({ dir, organize }) => {
     await assert.rejects(
-      openIngestProcess({
+      openIngestProcess({ tailSaveMs: 0, 
         market: MARKET,
         stream: STREAM,
         adapter: dataAdapter,
@@ -462,7 +465,9 @@ test('a quiesce begun from an accepted receive callback keeps its tail before th
     h.process.ingestStore.updateReceivedTail = (tail) => {
       // This is the strongest callback/stop interleaving available on the synchronous fork path: the
       // receive callback has entered, and quiescence begins before its durable tail write completes.
-      quiescePromise = h.process.quiesce();
+      // The reception's start marker (position zero) also passes through here; the race this test
+      // stages is the frame's own durable write.
+      if (tail.lastReceivedSeq > 0) quiescePromise = h.process.quiesce();
       return updateReceivedTail(tail);
     };
 
@@ -493,8 +498,12 @@ test('a throwing tail diagnostic cannot discard a frame the organize link can ta
     },
   });
   try {
-    h.process.ingestStore.updateReceivedTail = () => {
-      throw new Error('injected tail write failure');
+    const writeTailDirectly = h.process.ingestStore.updateReceivedTail;
+    h.process.ingestStore.updateReceivedTail = (tail) => {
+      // The reception's start marker passes through untouched: this test stages a frame's own
+      // durable write failing (a marker failure refuses the generation, which its own test pins).
+      if (tail.lastReceivedSeq > 0) throw new Error('injected tail write failure');
+      return writeTailDirectly(tail);
     };
 
     h.process.start();
@@ -964,7 +973,9 @@ test('a receive-tail write failure stays sticky without dropping later handable 
     const updateReceivedTail = h.process.ingestStore.updateReceivedTail;
     let failOnce = true;
     h.process.ingestStore.updateReceivedTail = (tail) => {
-      if (failOnce) {
+      // The reception's start marker passes through untouched: the failure staged here is a frame's
+      // own durable write (a marker failure refuses the generation, which its own test pins).
+      if (failOnce && tail.lastReceivedSeq > 0) {
         failOnce = false;
         throw new Error('injected tail write failure');
       }
@@ -1394,6 +1405,137 @@ test('Set 6b: a retry whose acceptance cannot be sent keeps its clock armed', as
     const rearmed = h.timers.filter((timer) => timer.ms === 200 && !timer.cleared);
     assert.equal(rearmed.length, 1, 'the refused send re-armed the retry clock');
     assert.equal(h.organize.state.accepts.filter((message) => message.generation === 2).length, 0, 'nothing was announced over a dead link');
+  } finally {
+    await h.teardown();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Set 6d: the receive tail is written on its own clock, and everything that judges it forces it
+// ---------------------------------------------------------------------------------------------------
+
+test('Set 6d: the tail is written on its own clock, and the seal forces the pending position down', async () => {
+  const h = await setup({ label: 'tail-clock', tailSaveMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    const connectionId = h.process.connectionId;
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+
+    // The clock has not fired: the frame's position is pending. The reception's start is already
+    // written down (the marker the restart accuses when a run dies before its first save), but it
+    // still says nothing has been heard.
+    assert.equal(h.process.receivedTails()[0]?.lastReceivedSeq, 0, 'the start marker is all the store has');
+    h.fireByDelay(60);
+    assert.equal(h.process.receivedTails()[0]?.lastReceivedSeq, 1, 'the clock wrote the position down');
+
+    // A second frame arrives and stays pending: the seal must force it, because the candidate is
+    // read from the store and a seal that judged the stale tail would claim less than was heard.
+    h.sockets[0].deliver('{"seq":2}');
+    await until(() => h.organize.state.envelopes.length === 2);
+    assert.equal(h.process.receivedTails()[0]?.lastReceivedSeq, 1, 'the second position is still pending');
+    h.organize.sendDurableAck({ connectionId, generation: 1, upToSeq: 2 });
+    await until(() => h.process.spool.bytes === 0);
+    const candidate = await h.process.sealTails();
+    assert.equal(candidate?.tails[0]?.lastReceivedSeq, 2, 'the seal forced the pending position down');
+    assert.equal(candidate?.spoolEmpty, true);
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('Set 6d: a tail that cannot be written latches, keeps its positions and refuses the seal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ingest-tail-fail-'));
+  const failure = { armed: false };
+  class FailOneCommit extends DatabaseSync {
+    exec(sql) {
+      if (failure.armed && sql.trim().toUpperCase() === 'COMMIT') {
+        failure.armed = false;
+        throw new Error('injected tail commit failure');
+      }
+      return super.exec(sql);
+    }
+  }
+  let h;
+  let store;
+  try {
+    store = openIngestStore({ path: join(dir, 'ingest.sqlite'), Database: FailOneCommit });
+    h = await setup({ label: 'tail-fail', dir, tailSaveMs: 60, ingestStore: store });
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    const connectionId = h.process.connectionId;
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+
+    // The clock fires into a failing commit: the position stays pending, the failure is reported
+    // and the clock is re-armed rather than left waiting for a trigger that never comes.
+    failure.armed = true;
+    h.fireByDelay(60);
+    assert.equal(h.process.receivedTails()[0]?.lastReceivedSeq, 0, 'nothing of the frame position was written');
+    assert.ok(
+      h.diagnostics.some((d) => /the receive tail could not be written/.test(String(d.reason))),
+      'the failure was reported',
+    );
+
+    // The seal is refused over a claim the store does not hold - and its own forced flush is the
+    // retry: with the failure cleared the position is written down, but the latch stays sticky by
+    // contract, so this life can produce no candidate again.
+    // The retry clock keeps the positions moving: the re-armed clock writes them once the failure
+    // clears, even though the latch (and so the seal's refusal) stays for the rest of this life.
+    h.fireByDelay(60);
+    await until(() => h.process.receivedTails()[0]?.lastReceivedSeq === 1, { label: 'the retried clock to write' });
+    assert.equal(await h.process.sealTails(), null, 'a tail failure is sticky for the rest of this life');
+  } finally {
+    if (h) await h.teardown();
+    else rmSync(dir, { recursive: true, force: true });
+    try {
+      store?.close();
+    } catch {
+      // the store may already be closed
+    }
+  }
+});
+
+test('Set 6d: a reception whose start cannot be written down does not begin, and a retry recovers it', async () => {
+  const h = await setup({ label: 'start-marker' });
+  try {
+    const updateReceivedTail = h.process.ingestStore.updateReceivedTail;
+    let failMarker = true;
+    h.process.ingestStore.updateReceivedTail = (tail) => {
+      if (failMarker && tail.lastReceivedSeq === 0) throw new Error('injected marker failure');
+      return updateReceivedTail(tail);
+    };
+    h.process.start();
+    await until(() =>
+      h.diagnostics.some((d) => /the reception's start could not be written down/.test(String(d.reason))),
+    );
+    assert.equal(h.sockets.length, 0, 'the generation was refused: no socket was opened for it');
+
+    // The refusal is of this attempt, not of the reception: a retry is armed (the same backoff every
+    // failed attempt uses - zero on the first attempt), the announcement is made again, and once the
+    // start can be written down the reception begins and frames flow.
+    failMarker = false;
+    h.fireByDelay(0);
+    // The retried announcement is admitted; its connect waits out the attempt's backoff (attempt 2:
+    // 1000 ms plus jitter), which the harness fires by hand like every other timer here.
+    await until(() => h.timers.some((entry) => !entry.cleared && entry.ms >= 1000 && entry.ms <= 1275), {
+      label: 'the connect backoff of the retried attempt',
+    });
+    const connectTimer = h.timers.find((entry) => !entry.cleared && entry.ms >= 1000 && entry.ms <= 1275);
+    connectTimer.cleared = true;
+    connectTimer.fn();
+    await until(() => h.sockets.length === 1, { label: 'the retried reception to begin' });
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    assert.deepEqual(
+      h.process.receivedTails().map((tail) => tail.lastReceivedSeq),
+      [1],
+      'the retried generation wrote its start down and then the frame - the refused attempt left no row',
+    );
   } finally {
     await h.teardown();
   }

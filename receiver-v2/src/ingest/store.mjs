@@ -90,6 +90,30 @@ export function openIngestStore({ path, nowMs = () => Date.now(), Database = Dat
       upsert.run(connectionId, stream ?? '', market, lastReceivedSeq, lastRecvMonoNs, nowMs());
     },
 
+    /**
+     * Set 6d: several tails in one transaction. The reception side writes its tail on every arrival,
+     * and a commit per frame is what a disk with millisecond fsyncs charges for; the caller keeps
+     * only the latest position of each identity and writes them together on its own clock.
+     */
+    updateReceivedTails(entries) {
+      if (closed) throw new TypeError('this ingest store is closed');
+      if (entries.length === 0) return;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const { connectionId, market, stream = '', lastReceivedSeq, lastRecvMonoNs } of entries) {
+          upsert.run(connectionId, stream ?? '', market, lastReceivedSeq, lastRecvMonoNs, nowMs());
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // the original failure is the one to report
+        }
+        throw error;
+      }
+    },
+
     readReceivedTail(connectionId, stream = '') {
       const row = readOne.get(connectionId, stream ?? '');
       return row ? rowToTail(row) : null;

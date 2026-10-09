@@ -666,6 +666,47 @@ export function createRunSupervisor(options = {}) {
     );
   }
 
+  /**
+   * §9.2 (the same rule the in-process structure applies through its own wiring): record the
+   * interval each unclean earlier run left behind, before the boundary is followed again.
+   *
+   * The receive tail is a lower bound on what that run heard - it is saved on its own clock now, so
+   * the last moments before a crash are not in it - and a run that did not write its completion
+   * marker may have received frames that were never made durable. That interval must stay visible as
+   * a suspected gap rather than be smoothed over. It is recorded once per restart, and never deleted
+   * (C7): a board recovered by new data does not erase the history it could not prove.
+   */
+  async function recordRestartGaps() {
+    let recorded = 0;
+    const tails = await withStartupDeadline(children.ingest.process.receivedTails(), 'the receive tails');
+    for (const tail of tails) {
+      // A connection name begins with the run that issued it (C2), and a run id has no colon, so
+      // the first field names the run unambiguously.
+      const tailRunId = String(tail.connectionId).split(':')[0];
+      // This run's own tail is not a past interval: this run has not ended.
+      if (tailRunId === runId) continue;
+      // Only a run with no completion marker is one that may have lost frames; a run that closed
+      // cleanly has a tail that is a true upper bound, so there is nothing to suspect.
+      const state = await withStartupDeadline(
+        children.organize.process.runMarkerState(tailRunId),
+        'the run marker of an earlier run',
+      );
+      if (state === 'complete') continue;
+      await withStartupDeadline(
+        children.organize.process.recordSuspectedGap({
+          market: tail.market,
+          stream: tail.stream,
+          fromMs: tail.updatedAtMs,
+          toMs: nowMs(),
+          reason: `a run that did not close cleanly received up to sequence ${tail.lastReceivedSeq} on ${tail.connectionId}; frames after it are unaccounted for`,
+        }),
+        'a suspected gap',
+      );
+      recorded += 1;
+    }
+    return { recorded };
+  }
+
   /** Keep the new connection gated until every confirmed ledger row is applied or otherwise resolved. */
   async function waitForDeliveryRecovery() {
     for (;;) {
@@ -730,6 +771,11 @@ export function createRunSupervisor(options = {}) {
           // (a) mark this run live.
           await withStartupDeadline(children.organize.process.beginRun(), 'beginRun');
           step('a:beginRun', {});
+
+          // (a2) §9.2: the intervals unclean earlier runs left behind, before the boundary is
+          // followed again - the same rule the in-process structure applies.
+          const restartGaps = await recordRestartGaps();
+          step('a2:restartGaps', restartGaps);
 
           // (b) hand organize the book's applied boundary - never omitted, even when it is empty.
           const boundary = children.book.process.appliedBoundary;

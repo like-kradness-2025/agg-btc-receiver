@@ -87,6 +87,11 @@ export function createIngestProcess({
   // them, exactly like the connection's timers; production gets the real ones.
   setTimer = setTimeout,
   clearTimer = clearTimeout,
+  // Set 6d: how long a received position may wait before it is written to the receive tail. The
+  // tail is written on every arrival, and one commit per frame is what a disk with millisecond
+  // fsyncs charges for; the latest position of each identity waits for this clock instead. Zero is
+  // the synchronous mode (the frame-by-frame order tests pin).
+  tailSaveMs = 100,
   ...receiveOptions
 } = {}) {
   if (!adapter) throw new TypeError('the ingest process needs a venue adapter');
@@ -219,23 +224,98 @@ export function createIngestProcess({
     },
   });
 
-  /** Record how far this process can show it heard, per connection and board. */
-  function writeReceivedTail(envelope) {
+  /**
+   * Set 6d: the receive tail, batched. The tail is the reception side's evidence of what it heard,
+   * and it is written on every arrival - but a commit per frame is what a disk with millisecond
+   * fsyncs charges for, and the record only needs the latest position of each identity. The latest
+   * positions wait for the save clock, and everything that judges the tail reads it only after a
+   * flush: `finalTailCandidate` (the seal) forces one, and the close makes a best effort of one.
+   * The failure latch is unchanged: a tail that could not be written stays sticky, so the seal is
+   * refused rather than made over a claim the store does not hold.
+   */
+  let tailSaveTimer = null;
+  const pendingTails = new Map();
+  const tailKey = (connectionId, streamName) => `${connectionId}\u0000${streamName ?? ''}`;
+
+  function scheduleTailSave() {
+    if (closed || tailSaveTimer !== null || tailSaveMs <= 0) return;
+    tailSaveTimer = setTimer(() => {
+      tailSaveTimer = null;
+      try {
+        flushTails();
+      } catch (error) {
+        // The positions stay pending, unacknowledged by the store: the next arrival, the next
+        // flush point or the seal retries them, and the clock is re-armed so a quiet link does
+        // not leave them waiting for a trigger that never comes.
+        try {
+          onDiagnostic({ market, reason: `the receive tail could not be written: ${error.message}` });
+        } catch {
+          // a diagnostic is best-effort by contract
+        }
+        if (pendingTails.size > 0) scheduleTailSave();
+      }
+    }, tailSaveMs);
+    if (typeof tailSaveTimer?.unref === 'function') tailSaveTimer.unref();
+  }
+
+  /** Write the pending positions down; a failure keeps them pending and latches the fact. */
+  function flushTails() {
+    if (tailSaveTimer !== null) {
+      clearTimer(tailSaveTimer);
+      tailSaveTimer = null;
+    }
+    if (pendingTails.size === 0) return;
+    const entries = [...pendingTails.values()];
     try {
-      store.updateReceivedTail({
-        connectionId: envelope.connection_id,
-        market,
-        stream: envelope.stream ?? stream,
-        lastReceivedSeq: envelope.receive_seq,
-        lastRecvMonoNs: envelope.recv_mono_ns,
-      });
+      store.updateReceivedTails(entries);
     } catch (error) {
       if (tailWriteFailure === null) tailWriteFailure = error;
+      // The positions stay pending, and the clock is re-armed here so a forced flush (the seal, the
+      // stop) that failed leaves a retry behind rather than positions waiting for an explicit ask.
+      if (pendingTails.size > 0) scheduleTailSave();
+      throw error;
+    }
+    pendingTails.clear();
+  }
+
+  /** Record how far this process can show it heard, per connection and board. */
+  function writeReceivedTail(envelope) {
+    const entry = {
+      connectionId: envelope.connection_id,
+      market,
+      stream: envelope.stream ?? stream,
+      lastReceivedSeq: envelope.receive_seq,
+      lastRecvMonoNs: envelope.recv_mono_ns,
+    };
+    if (tailSaveMs <= 0) {
       try {
-        onDiagnostic({ market, reason: `the receive tail could not be written: ${error.message}` });
-      } catch {
-        // a diagnostic must not prevent this accepted frame from being handed on or spooled
+        store.updateReceivedTail(entry);
+      } catch (error) {
+        if (tailWriteFailure === null) tailWriteFailure = error;
+        try {
+          onDiagnostic({ market, reason: `the receive tail could not be written: ${error.message}` });
+        } catch {
+          // a diagnostic must not prevent this accepted frame from being handed on or spooled
+        }
       }
+      return;
+    }
+    pendingTails.set(tailKey(entry.connectionId, entry.stream), entry);
+    scheduleTailSave();
+  }
+
+  /**
+   * A frame that was heard but could not be retained. The spool does not hold it, so the tail is
+   * the only durable carrier of "this was received" - the claim is forced onto disk here rather
+   * than waiting for the clock, because a crash in that window would leave a frame that was heard
+   * and never delivered with nothing to answer for it.
+   */
+  function markUnretained() {
+    unretainedFrameFailure = true;
+    try {
+      flushTails();
+    } catch {
+      // the latch above is the fact; a tail that could not be written has its own latch
     }
   }
 
@@ -248,7 +328,7 @@ export function createIngestProcess({
   function deriveAndSend(envelope) {
     const derived = deriveChanges(adapter, envelope);
     if (!derived.ok) {
-      unretainedFrameFailure = true;
+      markUnretained();
       onDiagnostic({ market, reason: `the level changes were refused: ${derived.reason}` });
       onGap({ market, reason: derived.reason, seq: envelope.receive_seq });
       return { accepted: false, reason: derived.reason };
@@ -347,7 +427,7 @@ export function createIngestProcess({
       // A spool that throws has nothing more to offer - a torn record stops it taking anything -
       // so the ladder's third rung is taken here exactly as it is on a refusal; the failure still
       // surfaces to the caller.
-      unretainedFrameFailure = true;
+      markUnretained();
       stopReception('nothing could hold the frame');
       onGap({ market, reason: `the spool could not hold the frame: ${error.message}`, seq: envelope.receive_seq });
       throw error;
@@ -356,7 +436,7 @@ export function createIngestProcess({
       fifo.record({ identity: ackIdentityOf(envelope), seq: envelope.receive_seq, position });
       return { accepted: true, spooled: true, position };
     }
-    unretainedFrameFailure = true;
+    markUnretained();
     stopReception('nothing could hold the frame');
     onGap({ market, reason: 'the spool could not hold the frame and it was not handed on', seq: envelope.receive_seq });
     return { accepted: false, reason: 'nothing could hold the frame' };
@@ -422,6 +502,34 @@ export function createIngestProcess({
    */
   function handleGeneration(info) {
     if (closed || quiescing) return false;
+    // Set 6d: the reception's start is written down before the socket can open. The tail's later
+    // positions wait for their save clock, so without this row a run that died before its first
+    // save would leave nothing at all behind - and a restart's §9.2 scan, which accuses the
+    // interval after each unclean run's tail, would have no tail to accuse. The marker is written
+    // synchronously (a reception's start is rare, one per connection) and its position of zero
+    // says exactly what it is: nothing has been heard yet.
+    try {
+      store.updateReceivedTail({
+        connectionId: info.connectionId,
+        market,
+        stream,
+        lastReceivedSeq: 0,
+        lastRecvMonoNs: info.recvMonoNs ?? 0,
+      });
+    } catch (error) {
+      if (tailWriteFailure === null) tailWriteFailure = error;
+      try {
+        onDiagnostic({ market, reason: `the reception's start could not be written down: ${error.message}` });
+      } catch {
+        // a diagnostic must not replace the refusal
+      }
+      // Fail closed: a reception whose start is not written down must not begin. A crash before any
+      // tail exists would leave this generation's interval unaccounted for - the restart's §9.2
+      // scan has only the tails to accuse - so the generation is refused here and the socket stays
+      // closed; the venue's next attempt tries again, and the run's deadline reports a reception
+      // that never started.
+      return false;
+    }
     const message = acceptMessage(info);
     pendingAdmissions.set(info.generation, {
       generation: info.generation,
@@ -1026,6 +1134,15 @@ export function createIngestProcess({
         return null;
       }
     }
+    // Set 6d: the candidate is read from the store, so the pending positions must be written down
+    // first - a seal that judged a tail the store does not hold yet would claim less than this
+    // process heard (or, worse, nothing of the last clock's reception).
+    try {
+      flushTails();
+    } catch (error) {
+      onDiagnostic({ market, reason: `the receive tail could not be written before sealing: ${error.message}` });
+      return null;
+    }
     const candidate = finalTailCandidate();
     if (candidate === null) return null;
     sendControlBestEffort(
@@ -1164,6 +1281,13 @@ export function createIngestProcess({
     async stop() {
       if (closed) return { stopped: false, reason: 'this ingest process is closed' };
       await quiesce();
+      // Set 6d: the last clock's positions belong to the store before this life ends; a failure
+      // is not fatal here - it latches, and the stop's own result reports it.
+      try {
+        flushTails();
+      } catch {
+        // the latch is the fact
+      }
       spool?.close();
       const failure = receptionCloseFailure ?? tailWriteFailure ?? spool?.failed;
       const abnormal = failure != null || unretainedFrameFailure;
@@ -1181,6 +1305,17 @@ export function createIngestProcess({
       if (admissionRetryTimer !== null) {
         clearTimer(admissionRetryTimer);
         admissionRetryTimer = null;
+      }
+      if (tailSaveTimer !== null) {
+        clearTimer(tailSaveTimer);
+        tailSaveTimer = null;
+      }
+      try {
+        // Best effort: a tail that could not be written keeps its latch, and the store is closing
+        // either way.
+        flushTails();
+      } catch {
+        // the latch is the fact
       }
       spool?.close();
       if (openedStoreHere) {

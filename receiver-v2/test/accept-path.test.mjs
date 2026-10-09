@@ -79,7 +79,7 @@ async function buildIngest({ dir, router, label = 'ingest' }) {
   const { sockets, impl } = fakeSockets();
   const starts = [];
   const diagnostics = [];
-  const process = await openIngestProcess({
+  const process = await openIngestProcess({ tailSaveMs: 0, 
     market: MARKET,
     stream: STREAM,
     adapter: dataAdapter,

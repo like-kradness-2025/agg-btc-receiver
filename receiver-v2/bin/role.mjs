@@ -42,6 +42,8 @@ export const ROLE_METHODS = Object.freeze({
     'resumeFromBoundary',
     'deliverOwed',
     'recoveryStatus',
+    'runMarkerState',
+    'recordSuspectedGap',
     'stop',
     'close',
   ]),

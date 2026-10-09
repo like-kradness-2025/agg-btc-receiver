@@ -1517,6 +1517,12 @@ export function createOrganizeProcess({
         .map((row) => ({ connectionId: row.connection_id, upToSeq: row.up_to_receive_seq ?? null, firstSeq: row.first_seq ?? null }));
     },
     runMarkerState: (query = runId) => organizeStore.runMarkerState(query),
+    /**
+     * §9.2: a suspected gap is a fact about a restart, recorded by the supervisor's startup - the
+     * same rule the in-process structure applies through its own wiring.
+     */
+    recordSuspectedGap: (payload) => organizeStore.recordSuspectedGap(payload),
+    suspectedGaps: (query = {}) => organizeStore.suspectedGaps(query),
     ledgerSize: () => ledger.size(),
     get serving() {
       return serving;

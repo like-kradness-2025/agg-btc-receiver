@@ -688,7 +688,7 @@ export function createReceiveConnection({
     // The announcement is settled by this, not by its return value alone: when the structure is free it runs
     // the announcement now and calls this, and when an operation is running the announcement waits, and this
     // is called when it runs. A connection nobody admitted never opens its socket.
-    const settle = (admitted) => {
+    const settle = (admitted, { retry = false } = {}) => {
       if (closed) return;
       if (admitted === false) {
         // A connection nobody downstream admitted must not start receiving. Opening the socket anyway would
@@ -696,6 +696,23 @@ export function createReceiveConnection({
         // a refused connection are refused again further down, after they have been counted as received.
         setState('refused', reason);
         onDiagnostic({ market, generation, reason: 'this connection was not admitted downstream' });
+        if (retry) {
+          // A refusal that came from the reception itself - the announcement could not be made,
+          // because the reception's start could not be written down - refuses this attempt, not the
+          // connection: the next attempt announces again, and once the start can be written down the
+          // reception begins. The delay is the same backoff every other failed attempt uses, and the
+          // guards make a stale timer a no-op. A refusal from downstream stays terminal: the same
+          // connection would be refused again.
+          const opensGeneration = generation;
+          const retryTimer = setTimer(
+            () => onEvent('reconnect-timer', () => {
+              if (closed || generation !== opensGeneration || socket !== null) return;
+              replaceSocket('not admitted; retrying');
+            }),
+            delayForAttempt(attempts),
+          );
+          if (typeof retryTimer.unref === 'function') retryTimer.unref();
+        }
         return;
       }
       setState('connecting', reason);
@@ -849,7 +866,7 @@ export function createReceiveConnection({
       venue,
       settle,
     });
-    if (announced === false) settle(false);
+    if (announced === false) settle(false, { retry: true });
   }
 
   function delayForAttempt(attempt) {

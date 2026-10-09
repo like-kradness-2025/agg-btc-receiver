@@ -142,7 +142,7 @@ async function buildIngest({ dir, organize, adapter, label = 'a', spoolOptions =
   const { sockets, impl } = fakeSockets();
   const diagnostics = [];
   const gaps = [];
-  const process = await openIngestProcess({
+  const process = await openIngestProcess({ tailSaveMs: 0, 
     market: MARKET,
     stream: STREAM,
     adapter,

@@ -150,8 +150,9 @@ test('frames flow ingest -> organize -> book and the board serves', async () => 
 
     assert.equal(book.appliedBoundary.upToSeq, 3, 'every frame reached the board');
     assert.equal(book.appliedBoundary.connectionId, `${RUN}:${VENUE}:${MARKET}:1`);
+    // Set 6d: the tail is written on its own clock now, so the row appears within the save interval.
+    await until(() => ingest.receivedTails()[0]?.lastReceivedSeq === 3, { label: 'the receive tail to be written' });
     assert.equal(ingest.receivedTails().length, 1, 'the receive tail was written on the reception side');
-    assert.equal(ingest.receivedTails()[0].lastReceivedSeq, 3);
 
     const readiness = supervisor.readiness();
     assert.equal(readiness.ready, true, `the run is ready: ${JSON.stringify(readiness.reasons)}`);
@@ -169,7 +170,7 @@ test('a clean stop keeps the processing order and leaves the run incomplete for 
     venueSocket.deliver('sub-ack');
     for (const seq of [1, 2, 3]) venueSocket.deliver(`{"seq":${seq}}`);
     await until(() => book.isRunning === true, { label: 'the board to serve' });
-    assert.equal(ingest.receivedTails()[0].lastReceivedSeq, 3);
+    await until(() => ingest.receivedTails()[0]?.lastReceivedSeq === 3, { label: 'the receive tail to be written' });
 
     const result = await supervisor.stop();
 
@@ -225,7 +226,7 @@ test('an unconfirmed book stop remains abnormal without a completeness judgement
     venueSocket.deliver('sub-ack');
     for (const seq of [1, 2, 3]) venueSocket.deliver(`{"seq":${seq}}`);
     await until(() => book.isRunning === true, { label: 'the board to serve' });
-    assert.equal(ingest.receivedTails()[0].lastReceivedSeq, 3);
+    await until(() => ingest.receivedTails()[0]?.lastReceivedSeq === 3, { label: 'the receive tail to be written' });
 
     // Simulate a board whose stop cannot be confirmed: its stop returns no true result.
     book.stop = () => ({ stopped: false, reason: 'the stop could not be confirmed' });
@@ -298,4 +299,121 @@ test('store close failures stay abnormal while all remaining roles are terminate
     // The injected close threw after the real in-process store closed, so cleanup can confirm it.
     supervisor.exclusion.release({ path: storePath, confirmedTerminated: true });
   });
+});
+
+test('a restart records the interval an unclean earlier run left behind as a suspected gap', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'run-restart-gaps-'));
+  const paths = {
+    routerListenPath: join(dir, 'router.sock'),
+    ingestStorePath: join(dir, 'ingest.sqlite'),
+    organizeStorePath: join(dir, 'organize.sqlite'),
+    bookStorePath: join(dir, 'book.sqlite'),
+    spoolDir: join(dir, 'spool'),
+  };
+  const firstVenue = fakeSockets();
+  const first = createRunSupervisor({
+    market: MARKET,
+    stream: STREAM,
+    venue: VENUE,
+    adapter: venueAdapter,
+    runId: 'run-1',
+    ...paths,
+    webSocketImpl: firstVenue.impl,
+    startupDeadlineMs: 8000,
+  });
+  try {
+    await first.start();
+    const socket = firstVenue.sockets[0];
+    socket.onopen();
+    socket.deliver('sub-ack');
+    for (const seq of [1, 2, 3]) socket.deliver(`{"seq":${seq}}`);
+    await until(() => first.children.book.process.isRunning === true, { label: 'the board to serve' });
+    // Set 6d: the tail is written on its own clock, so the restart check waits for the save interval.
+    await until(
+      () => first.children.ingest.process.receivedTails()[0]?.lastReceivedSeq === 3,
+      { label: 'the receive tail to be written' },
+    );
+    // The run stops without completing: its marker is not `complete`, so its tail is only a lower
+    // bound on what it heard.
+    await first.stop();
+  } finally {
+    await first.close();
+  }
+
+  const secondVenue = fakeSockets();
+  const second = createRunSupervisor({
+    market: MARKET,
+    stream: STREAM,
+    venue: VENUE,
+    adapter: venueAdapter,
+    runId: 'run-2',
+    ...paths,
+    webSocketImpl: secondVenue.impl,
+    startupDeadlineMs: 8000,
+  });
+  try {
+    await second.start();
+    const gaps = second.children.organize.process.suspectedGaps();
+    assert.equal(gaps.length, 1, 'the unclean earlier run left exactly one suspected interval');
+    assert.equal(gaps[0].stream, STREAM);
+    assert.match(gaps[0].reason, /did not close cleanly received up to sequence 3 on run-1:/);
+    assert.ok(gaps[0].from_ms <= gaps[0].to_ms, 'the interval runs from the tail to this restart');
+  } finally {
+    await second.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a run that died before it heard anything is still accused by its start marker', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'run-restart-gaps-empty-'));
+  const paths = {
+    routerListenPath: join(dir, 'router.sock'),
+    ingestStorePath: join(dir, 'ingest.sqlite'),
+    organizeStorePath: join(dir, 'organize.sqlite'),
+    bookStorePath: join(dir, 'book.sqlite'),
+    spoolDir: join(dir, 'spool'),
+  };
+  const firstVenue = fakeSockets();
+  const first = createRunSupervisor({
+    market: MARKET,
+    stream: STREAM,
+    venue: VENUE,
+    adapter: venueAdapter,
+    runId: 'run-1',
+    ...paths,
+    webSocketImpl: firstVenue.impl,
+    startupDeadlineMs: 8000,
+  });
+  try {
+    await first.start();
+    // The socket is open, but no frame ever arrives: only the reception's start marker exists.
+    assert.equal(firstVenue.sockets.length, 1);
+    const tails = first.children.ingest.process.receivedTails();
+    assert.equal(tails.length, 1, 'the reception start was written down before the socket opened');
+    assert.equal(tails[0].lastReceivedSeq, 0, 'and it claims nothing yet');
+    await first.stop();
+  } finally {
+    await first.close();
+  }
+
+  const secondVenue = fakeSockets();
+  const second = createRunSupervisor({
+    market: MARKET,
+    stream: STREAM,
+    venue: VENUE,
+    adapter: venueAdapter,
+    runId: 'run-2',
+    ...paths,
+    webSocketImpl: secondVenue.impl,
+    startupDeadlineMs: 8000,
+  });
+  try {
+    await second.start();
+    const gaps = second.children.organize.process.suspectedGaps();
+    assert.equal(gaps.length, 1, 'even a run that heard nothing leaves its interval accused');
+    assert.match(gaps[0].reason, /received up to sequence 0 on run-1:/);
+  } finally {
+    await second.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
