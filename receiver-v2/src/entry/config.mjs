@@ -177,6 +177,17 @@ export function loadConfig(configPath) {
     }
     routerPath = raw.routerPath;
   }
+  // Set 7a: where the canonical raw is written. Optional - a deployment that names no `rawDir` runs
+  // without a raw writer (the pre-Set-7 behaviour), so an existing config keeps working unchanged. A
+  // value that is present must be a non-empty string so a half-written key fails loudly rather than
+  // silently writing the raw nowhere.
+  let rawDir;
+  if (Object.prototype.hasOwnProperty.call(raw, 'rawDir')) {
+    if (typeof raw.rawDir !== 'string' || raw.rawDir.length === 0) {
+      throw new TypeError('the config\'s "rawDir" must be a non-empty string when present');
+    }
+    rawDir = raw.rawDir;
+  }
   return Object.freeze({
     venue: raw.venue,
     market: raw.market,
@@ -187,6 +198,7 @@ export function loadConfig(configPath) {
     // entrance does not turn a missing key into a value the deployment never chose.
     ...(startupDeadlineMs === undefined ? {} : { startupDeadlineMs }),
     ...(routerPath === undefined ? {} : { routerPath }),
+    ...(rawDir === undefined ? {} : { rawDir }),
     // The venue-specific extras, only when the file carries them. Kraken needs a symbol; Bitfinex
     // defaults to tBTCUSD. A url is optional and defaults inside the adapter.
     symbol: typeof raw.symbol === 'string' && raw.symbol.length > 0 ? raw.symbol : undefined,

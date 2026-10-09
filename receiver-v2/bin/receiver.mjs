@@ -182,6 +182,7 @@ async function main(argv) {
       organizeStorePath: config.stores.organize,
       bookStorePath: config.stores.book,
       spoolDir: config.spoolDir,
+      ...(config.rawDir === undefined ? {} : { rawDir: config.rawDir }),
       routerListenPath: routerPath,
       // The startup deadline is carried only when the config named one: absent means the supervisor's own
       // default applies, so the entrance does not pass a value the deployment never chose.

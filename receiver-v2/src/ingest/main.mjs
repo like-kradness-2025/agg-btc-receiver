@@ -30,6 +30,11 @@ import { createReceiveConnection } from './connection.mjs';
 import { createSpool } from '../spool.mjs';
 import { ackIdentityOf, rebuildAckFifo } from '../ack-fifo.mjs';
 import { openIngestStore } from './store.mjs';
+import {
+  openRawWriter,
+  DEFAULT_RAW_BATCH_WINDOW_MS,
+  DEFAULT_RAW_BATCH_MAX_ROWS,
+} from '../raw.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
 import { attachChanges, deriveChanges } from '../changes.mjs';
 import { connect } from '../ipc.mjs';
@@ -63,6 +68,12 @@ export function createIngestProcess({
   ingestStorePath = null,
   spoolDir = null,
   spoolOptions = {},
+  // Set 7a: where the canonical raw lives. One database per market is opened under this root and the
+  // frames reception hears are written there (see `src/raw.mjs`). Absent means no raw writer: the
+  // process behaves exactly as before, which is what keeps every pre-Set-7 configuration unchanged.
+  rawDir = null,
+  rawBatchWindowMs = DEFAULT_RAW_BATCH_WINDOW_MS,
+  rawBatchMaxRows = DEFAULT_RAW_BATCH_MAX_ROWS,
   // The restart identity of this child process. It is deliberately separate from the receive run and
   // from the connection generation (ruling ⑧): a book or organize restart is a fact about that child,
   // and it must not move the receive generation. Overridden by the caller so two lives of one run get
@@ -105,6 +116,30 @@ export function createIngestProcess({
   if (store === null) throw new TypeError('the ingest process needs an ingest store (a path or an open store)');
 
   const spool = spoolDir ? createSpool({ dir: spoolDir, ...spoolOptions }) : null;
+  // Set 7a: the canonical raw writer. It owns one database per market under `rawDir`, and it is the
+  // single writer of those files (the same discipline as the store above). Opened here, synchronously,
+  // so a directory that cannot be created fails construction rather than the first frame.
+  const raw =
+    rawDir === null
+      ? null
+      : openRawWriter({
+          dir: rawDir,
+          batchWindowMs: rawBatchWindowMs,
+          maxBatchRows: rawBatchMaxRows,
+          // The session id travels on every stored line. It names this writer instance the way v1's did
+          // (`sqlite:pid:time`), so a restart's rows are distinguishable from a previous life's.
+          writerSessionId: `raw:${instance}:${Date.now()}`,
+          // A flush raised from the raw's own window timer has no caller to throw to: it stops
+          // reception here, exactly like a failed write on the receive path.
+          onError: (error) => {
+            try {
+              onDiagnostic({ market, reason: `the canonical raw could not be flushed: ${error.message}` });
+            } catch {
+              // a diagnostic must not replace the loud stop
+            }
+            stopReception('the canonical raw could not be flushed');
+          },
+        });
   // Set 3: the release order of everything the spool holds, rebuilt once from the walk. The cursor
   // only ever moves past a record that itself is acknowledged (see ack-fifo.mjs); a spool-less
   // configuration has nothing to release.
@@ -134,6 +169,7 @@ export function createIngestProcess({
   let closed = false;
   let tailWriteFailure = null;
   let receptionCloseFailure = null;
+  let rawFlushFailure = null;
   let unretainedFrameFailure = false;
   // The generations reception is waiting for an acceptance on, keyed by generation. Only these may be
   // settled by an `accepted`; anything else is a stale instance's answer (C2).
@@ -204,9 +240,14 @@ export function createIngestProcess({
       // (④) the receive tail is written on the reception side, before anything else: a frame the board
       // refuses was still received, and "received" is a fact about reception, not a verdict downstream.
       writeReceivedTail(envelope);
+      // Set 7a: the canonical raw is not written here but at the connection, for every parsed data
+      // frame and before anything judges it (see `onRawFrame`): a frame this connection refuses - a
+      // gap, a stale diff - is still a frame that was received, and v1 recorded it too. Writing it
+      // here would record only the frames that already passed the judgment.
       return deriveAndSend(envelope);
     },
     onGeneration: handleGeneration,
+    onRawFrame: (frame) => writeRawFrame(frame),
     onSubscriptions: handleSubscriptions,
     onState: (info) => {
       try {
@@ -223,6 +264,98 @@ export function createIngestProcess({
       }
     },
   });
+
+  /**
+   * Set 7a: the REST depth snapshot, as one raw record. A snapshot does not arrive as a socket frame -
+   * the adapter's depth synchronizer fetches and applies it while preparing the connection - so the
+   * adapter exposes a sink (`setRawSnapshotSink`) and this is what is installed there. v1 wrote a
+   * snapshot under both `book_updates` (it is a full level replacement) and `snapshots` (the stream
+   * downstream reads to anchor a book), so the same record is appended to both streams here.
+   */
+  function writeRawSnapshot(snapshot) {
+    if (raw === null) return;
+    if (!snapshot || !Number.isFinite(snapshot.event_ts_ms) || snapshot.event_ts_ms <= 0) {
+      // A snapshot with no event time cannot be a raw row downstream can read; failing loudly here is
+      // the same rule as a socket frame's record.
+      onDiagnostic({ market, reason: 'the depth snapshot carried no usable event time and was not written raw' });
+      return;
+    }
+    const base = {
+      market,
+      event_ts_ms: snapshot.event_ts_ms,
+      // v1's REST-sync snapshot states no source time: `source_event_ts_ms: null` and
+      // `source_event_time_known: false` (`lib/binance-connector.mjs:299-305`). Claiming the wall clock
+      // as the source time would assert a venue timestamp the venue never gave.
+      source_event_ts_ms: snapshot.source_event_ts_ms ?? null,
+      source_event_time_known: snapshot.source_event_time_known === true,
+      recv_ts_ms: Date.now(),
+      recv_mono_ns: Number(process.hrtime.bigint()),
+      connection_id: connection.connectionId,
+      sequence_order: null,
+      receive_seq: null,
+      payload: snapshot.payload,
+    };
+    try {
+      raw.append({ ...base, stream: 'book_updates' });
+      raw.append({ ...base, stream: 'snapshots' });
+    } catch (error) {
+      try {
+        onDiagnostic({ market, reason: `the canonical raw snapshot could not be written: ${error.message}` });
+      } catch {
+        // a diagnostic must not replace the loud stop
+      }
+      stopReception('the canonical raw snapshot could not be written');
+      throw error;
+    }
+  }
+
+  // The sink belongs to the adapter and is installed before the connection can open a socket (the
+  // socket is opened by `start()`, after construction). An adapter with no snapshot (a pure WS venue)
+  // has no such hook and this is a no-op.
+  adapter?.setRawSnapshotSink?.((snapshot) => writeRawSnapshot(snapshot));
+
+  /**
+   * Set 7a: write one received frame to the canonical raw, from the connection's `onRawFrame` hook -
+   * that is, for every parsed data frame and before anything judges it. The adapter decides whether
+   * the frame is a raw record at all and what stream it belongs to (`rawEventFor`), because only the
+   * adapter can read the venue's bytes. A frame the adapter does not classify is not written - Set 7a
+   * covers the board frames; trades are Set 7b's. A write that fails is loud: reported, reception
+   * stopped, and the error rethrown, so a raw that cannot be written is never mistaken for a healthy
+   * run.
+   */
+  function writeRawFrame(frame) {
+    if (raw === null) return;
+    const derived = adapter?.rawEventFor ? adapter.rawEventFor(frame) : null;
+    if (!derived) return;
+    try {
+      raw.append({
+        market,
+        stream: derived.stream,
+        event_ts_ms: derived.event_ts_ms,
+        recv_ts_ms: frame.atMs,
+        recv_mono_ns: frame.atNs,
+        // The raw's own arrival counter, not the stamped receive sequence: v1 numbered every frame it
+        // heard on the way in, including the frames its synchronization later refused, and the raw is
+        // the record of the hearing.
+        receive_seq: frame.arrivalSeq,
+        worker_seq: frame.arrivalSeq,
+        connection_id: frame.connectionId,
+        sequence_order: frame.arrivalSeq,
+        source_event_ts_ms: derived.source_event_ts_ms ?? null,
+        source_event_time_known: derived.source_event_time_known === true,
+        source_id: derived.source_id ?? null,
+        payload: derived.payload,
+      });
+    } catch (error) {
+      try {
+        onDiagnostic({ market, reason: `the canonical raw could not be written: ${error.message}` });
+      } catch {
+        // a diagnostic must not replace the loud stop
+      }
+      stopReception('the canonical raw could not be written');
+      throw error;
+    }
+  }
 
   /**
    * Set 6d: the receive tail, batched. The tail is the reception side's evidence of what it heard,
@@ -1288,8 +1421,16 @@ export function createIngestProcess({
       } catch {
         // the latch is the fact
       }
+      // Set 7a: the last window's raw rows belong on disk before this life ends - a run that stops
+      // without confirming them would leave frames it heard unrecorded. The failure is kept, not
+      // swallowed: it is carried into the stop's own result below.
+      try {
+        raw?.flush();
+      } catch (error) {
+        if (rawFlushFailure === null) rawFlushFailure = error;
+      }
       spool?.close();
-      const failure = receptionCloseFailure ?? tailWriteFailure ?? spool?.failed;
+      const failure = receptionCloseFailure ?? rawFlushFailure ?? tailWriteFailure ?? spool?.failed;
       const abnormal = failure != null || unretainedFrameFailure;
       return {
         stopped: receptionCloseFailure === null,
@@ -1318,10 +1459,26 @@ export function createIngestProcess({
         // the latch is the fact
       }
       spool?.close();
+      // Set 7a: closing the raw flushes the last window and closes the databases. A failure here means
+      // the last rows did not land, and a run that ends without recording what it heard must not be
+      // reported as a clean shutdown: the failure is reported and rethrown (after the stores are
+      // closed) so the role exits non-zero.
+      let rawCloseFailure = null;
+      try {
+        raw?.close();
+      } catch (error) {
+        rawCloseFailure = error;
+        try {
+          onDiagnostic({ market, reason: `the canonical raw could not be flushed at close: ${error.message}` });
+        } catch {
+          // a diagnostic must not replace the failure
+        }
+      }
       if (openedStoreHere) {
         store.close();
       }
       closed = true;
+      if (rawCloseFailure !== null) throw rawCloseFailure;
     },
 
     get roleInstance() {

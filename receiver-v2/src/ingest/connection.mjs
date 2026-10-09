@@ -94,6 +94,8 @@ export function createReceiveConnection({
   maxBackoffMs = 30_000,
   onEnvelope = () => {},
   onGeneration = () => {},
+  // Set 7a: every parsed data frame, before any judgment (see handleMessage).
+  onRawFrame = null,
   // Every event - a socket message, open/close/error, a timer - is handed here with the socket it came from,
   // and the work runs inside whatever the caller puts behind this: the structure runs it as an operation of
   // its own, or keeps it in order when one is already running. Nothing is done from the event entry itself.
@@ -129,6 +131,10 @@ export function createReceiveConnection({
   let connectionId = null;
   let socket = null;
   let receiveSeq = 0;
+  // Set 7a: every frame this connection hears, numbered as it arrives. It numbers the frames the
+  // synchronization later refuses as well, so the count runs ahead of `receiveSeq`; the raw is the
+  // record of the hearing, not of the verdict.
+  let rawFramesSeen = 0;
   let subscriptionState = UNSUBSCRIBED;
   // C3: the keys asked for on the current socket, or null when the connection was not told a set. The
   // ack deadline timer for that same socket, and the reason the link failed (for the band's report).
@@ -645,6 +651,16 @@ export function createReceiveConnection({
     preparationPending = false;
     preparationFrames = [];
     keepAlivePlan = null;
+    // Set 7a: this connection is over, and a depth preparation still in flight belongs to it (it may be
+    // waiting on its REST snapshot, which can take seconds). It is invalidated here rather than at the
+    // next `onConnectionOpen`: until that happened the adapter would still call it current and let its
+    // snapshot anchor the book and reach the raw under this connection's name - a boundary the venue
+    // has already moved past, written into the record a restart loads from.
+    try {
+      adapter.resetConnection?.(connectionId);
+    } catch {
+      // an adapter that cannot reset must not block the teardown itself
+    }
     if (!socket) return;
     const dying = socket;
     socket = null;
@@ -805,6 +821,16 @@ export function createReceiveConnection({
         const atMs = wallClockMs();
         const atNs = monotonicNs();
         const fromGeneration = generation;
+        // Set 7a: the raw record is written here, where the frame arrives, before anything judges it and
+        // before the REST preparation buffers it. v1 wrote every frame down on the way in - a frame the
+        // synchronization later refused, or one buffered while the connection was being prepared, is
+        // still a frame that was received. Recording at the arrival is also why the replay of the
+        // preparation buffer (which runs through `handleMessage`) cannot write the same frame twice:
+        // this is the only place the hook runs.
+        rawFramesSeen += 1;
+        if (typeof onRawFrame === 'function') {
+          onRawFrame({ raw, atMs, atNs, connectionId, generation, arrivalSeq: rawFramesSeen });
+        }
         if (preparationPending) {
           // REST preparation can be slower than the silence deadline. The frame is still buffered and
           // must not reach the stream before synchronization, but its arrival proves the socket is alive.

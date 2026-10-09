@@ -297,6 +297,8 @@ export function createRunSupervisor(options = {}) {
     organizeStorePath = null,
     bookStorePath = null,
     spoolDir = null,
+    // Set 7a: where the canonical raw lives, handed to the ingest child. Absent means no raw writer.
+    rawDir = null,
     routerListenPath,
     webSocketImpl,
     rawWriter = null,
@@ -521,6 +523,7 @@ export function createRunSupervisor(options = {}) {
           organizeSocketPath: router.path,
           ingestStorePath,
           spoolDir,
+          ...(rawDir === null ? {} : { rawDir }),
           channelOptions: ROUTE_OPTIONS,
           readinessIntervalMs,
           onStop: (info) => diagnostic(`reception stopped: ${info?.reason ?? 'unknown'}`, { kind: 'stop' }),

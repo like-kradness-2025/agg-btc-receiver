@@ -52,6 +52,7 @@ export function toChildSpec(
       routerSocketPath: options.organizeSocketPath,
       storePath: options.ingestStorePath,
       spoolDir: options.spoolDir,
+      rawDir: options.rawDir,
       websocketModule,
       adapterModule,
       adapterSpec,

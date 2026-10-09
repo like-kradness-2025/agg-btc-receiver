@@ -141,6 +141,7 @@ async function buildRole(spec, send) {
       organizeSocketPath: spec.routerSocketPath,
       ingestStorePath: spec.storePath,
       spoolDir: spec.spoolDir,
+      rawDir: spec.rawDir,
       channelOptions,
       readinessIntervalMs: spec.readinessIntervalMs ?? 0,
       onDiagnostic,
