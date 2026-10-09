@@ -130,6 +130,11 @@ export function createChannel(socket, options = {}) {
   let bufferedBytes = 0;
   let backpressured = false;
   let closed = false;
+  // Set 5: one armed drain listener per channel, and the memory that the channel's own bound (not
+  // the socket's) refused something, so its relief can be announced too.
+  let drainListenerArmed = false;
+  let drainHandler = null;
+  let refusedByBound = false;
 
   function flushBatch() {
     if (batchTimer !== null) {
@@ -141,10 +146,29 @@ export function createChannel(socket, options = {}) {
     batch = [];
     bufferedBytes = Math.max(0, bufferedBytes - payload.length);
     const ok = socket.write(payload);
-    if (!ok) socket.once('drain', () => {
-      backpressured = false;
-      onDrain();
-    });
+    if (!ok && !drainListenerArmed) {
+      // One listener per channel: arming one per refused write left the socket with a stack of
+      // pending listeners (the MaxListeners warning the soak showed), and the drain event then fired
+      // the recovery callback once for each of them. The listener is the channel's, and `close`
+      // removes it.
+      drainListenerArmed = true;
+      drainHandler = () => {
+        drainListenerArmed = false;
+        drainHandler = null;
+        backpressured = false;
+        onDrain();
+      };
+      socket.once('drain', drainHandler);
+    }
+    // The channel's own bound can refuse while the socket is fine; its relief is a drain fact too.
+    if (refusedByBound && bufferedBytes < maxBufferedBytes) {
+      refusedByBound = false;
+      queueMicrotask(() => {
+        if (closed) return;
+        backpressured = false;
+        onDrain();
+      });
+    }
   }
 
   /**
@@ -159,6 +183,15 @@ export function createChannel(socket, options = {}) {
     closed = true;
     bufferedBytes = 0;
     batch = [];
+    if (drainListenerArmed && drainHandler !== null) {
+      drainListenerArmed = false;
+      try {
+        socket.removeListener('drain', drainHandler);
+      } catch {
+        /* the socket may already be gone */
+      }
+      drainHandler = null;
+    }
     onError(error);
     try {
       socket.destroy();
@@ -188,6 +221,7 @@ export function createChannel(socket, options = {}) {
     // keeps or spools this frame, it never means the frame was taken and dropped.
     const wouldHold = bufferedBytes + framed.length + socket.writableLength;
     if (wouldHold > maxBufferedBytes) {
+      refusedByBound = true;
       if (!backpressured) {
         backpressured = true;
         onBackpressure({ bufferedBytes: wouldHold, maxBufferedBytes });
@@ -311,6 +345,15 @@ export function createChannel(socket, options = {}) {
     close() {
       flushBatch();
       closed = true;
+      if (drainListenerArmed && drainHandler !== null) {
+        drainListenerArmed = false;
+        try {
+          socket.removeListener('drain', drainHandler);
+        } catch {
+          /* the socket may already be gone */
+        }
+        drainHandler = null;
+      }
       socket.end();
     },
     get queuedBytes() {

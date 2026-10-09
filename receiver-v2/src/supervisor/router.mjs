@@ -66,6 +66,11 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
   const REFUSAL_REPORT_MIN_MS = 1000;
   const refusals = [];
   const refusalTally = new Map(); // reason -> count
+  // Set 5: who has been told "full" and has not been told the room came back, and which destination
+  // refused them. A sender that only ever hears "full" waits for a signal that never comes - and
+  // waiting for its own next message cannot be the trigger, because it has none to send. The
+  // destination's own drain is the event that ends the wait.
+  const fullSignalled = new Map(); // sender channel -> the destination role that refused
   let refusalTotal = 0;
   let refusalBurst = 0;
   let lastRefusalReason = null;
@@ -152,8 +157,9 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
    * Tell a sender its relay is over the bound. This is a capacity signal, never an acknowledgement:
    * the owner keeps the frame and resends it when capacity returns.
    */
-  function signalFull(channel) {
+  function signalFull(channel, destRole) {
     if (!channel || typeof channel.sendControl !== 'function') return;
+    fullSignalled.set(channel, destRole ?? null);
     try {
       channel.sendControl({
         version: IPC_VERSION,
@@ -163,6 +169,27 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
       });
     } catch {
       /* a signal that cannot be sent is not a fact about the message */
+    }
+  }
+
+  /**
+   * The other half of the full signal: a message from this sender has been taken again, so the room
+   * is back. Without it a sender that was told "full" would keep its frames held until some other
+   * event - the soak's stuck drain was exactly that wait.
+   */
+  function signalRoom(channel) {
+    if (!channel || typeof channel.sendControl !== 'function') return false;
+    try {
+      return (
+        channel.sendControl({
+          version: IPC_VERSION,
+          type: 'readiness',
+          role_instance: 'supervisor',
+          payload: { role: 'supervisor', capacity: 'ok', ready: true },
+        }) === true
+      );
+    } catch {
+      return false; // the wait is kept, so a later drain or success can try again
     }
   }
 
@@ -177,8 +204,11 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
       ok = false;
     }
     if (ok !== true) {
-      signalFull(fromChannel);
+      signalFull(fromChannel, destRole);
       return refuse(`the ${destRole} relay could not take the message`, { type: message?.type });
+    }
+    if (fullSignalled.get(fromChannel) === destRole && signalRoom(fromChannel)) {
+      fullSignalled.delete(fromChannel); // a notice that could not be sent keeps the wait alive
     }
     noteRouted(destRole, 'control');
     return { routed: true, to: destRole };
@@ -195,8 +225,11 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
       ok = false;
     }
     if (ok !== true) {
-      signalFull(fromChannel);
+      signalFull(fromChannel, destRole);
       return refuse(`the ${destRole} relay could not take the frame`, frameIdentity(envelope));
+    }
+    if (fullSignalled.get(fromChannel) === destRole && signalRoom(fromChannel)) {
+      fullSignalled.delete(fromChannel); // a notice that could not be sent keeps the wait alive
     }
     noteRouted(destRole, 'envelope');
     return { routed: true, to: destRole };
@@ -339,7 +372,33 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
   function detach(channel) {
     const binding = bindings.get(channel);
     bindings.delete(channel);
+    fullSignalled.delete(channel);
     if (binding?.role && byRole.get(binding.role) === channel) byRole.delete(binding.role);
+  }
+
+  /**
+   * A peer's link drained: it can take messages again. Every sender waiting on that role's capacity
+   * hears the room is back - without this, the wait could only end through the sender's own next
+   * message, and a sender that was told "full" has none to send.
+   */
+  function handlePeerDrain(channel) {
+    const role = bindings.get(channel)?.role ?? null;
+    let woken = 0;
+    // The drained peer may be a destination (its waiters can be woken) or a waiting sender itself:
+    // a notice this sender could not hear is retried now that its link is readable again. Without
+    // this, a refused notice would wait for the destination's next drain, which may never come.
+    if (fullSignalled.has(channel) && signalRoom(channel)) {
+      fullSignalled.delete(channel);
+      woken += 1;
+    }
+    if (role === null) return { woken };
+    for (const [sender, destRole] of [...fullSignalled]) {
+      if (destRole === role && signalRoom(sender)) {
+        fullSignalled.delete(sender); // a notice that could not be sent is tried again later
+        woken += 1;
+      }
+    }
+    return { woken };
   }
 
   let closeServer = () => {};
@@ -349,6 +408,7 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
     handleControl,
     handleEnvelope,
     handleError,
+    handlePeerDrain,
     attach,
     detach,
     roleOf,
@@ -417,6 +477,7 @@ export async function openRouter({ listenPath, channelOptions = {}, ...hooks } =
         router.handleError(error, channel);
         router.detach(channel);
       },
+      onDrain: () => router.handlePeerDrain(channel),
     });
     socket.on('close', () => router.detach(channel));
     router.attach(channel);

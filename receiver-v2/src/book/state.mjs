@@ -217,6 +217,31 @@ function openBookWithin(options, wiring) {
       .get() !== undefined;
 
   wiring.db.exec(BOOK_SCHEMA);
+  // Set 5: collapse the unfilled rows an earlier version wrote per observation into one row per
+  // (connection, waiting point), keeping the widest seen edge. Idempotent, so it runs on every open.
+  wiring.db
+    .prepare(
+      `UPDATE book_gap SET seen_seq = (
+         SELECT MAX(other.seen_seq) FROM book_gap AS other
+          WHERE other.market = book_gap.market AND other.stream = book_gap.stream
+            AND other.connection_id = book_gap.connection_id AND other.waiting_for = book_gap.waiting_for
+            AND other.filled_at_ms IS NULL
+       )
+       WHERE filled_at_ms IS NULL AND id IN (
+         SELECT MIN(id) FROM book_gap WHERE filled_at_ms IS NULL
+          GROUP BY market, stream, connection_id, waiting_for
+       )`,
+    )
+    .run();
+  wiring.db
+    .prepare(
+      `DELETE FROM book_gap
+        WHERE filled_at_ms IS NULL AND id NOT IN (
+          SELECT MIN(id) FROM book_gap WHERE filled_at_ms IS NULL
+           GROUP BY market, stream, connection_id, waiting_for
+        )`,
+    )
+    .run();
   const anchorStatement = wiring.db.prepare(
     `INSERT OR REPLACE INTO board_anchor (market, stream, up_to_receive_seq, updated_at_ms)
      VALUES (?, ?, ?, ?)`,
@@ -691,12 +716,23 @@ function openBookWithin(options, wiring) {
   }
 
   function recordGap(waitingFor, seenSeq) {
-    wiring.db
+    // One hole is one row: a hole under load is seen again with every frame above it, and writing a
+    // row per observation multiplied one hole into hundreds. The same waiting point extends its seen
+    // edge instead, and the row is only written when the hole is new.
+    const updated = wiring.db
       .prepare(
-        `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `UPDATE book_gap SET seen_seq = MAX(seen_seq, ?)
+          WHERE market = ? AND stream = ? AND connection_id = ? AND filled_at_ms IS NULL AND waiting_for = ?`,
       )
-      .run(market, stream, applied.connectionId, waitingFor, seenSeq, nowMs());
+      .run(seenSeq, market, stream, applied.connectionId, waitingFor);
+    if (updated.changes === 0) {
+      wiring.db
+        .prepare(
+          `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(market, stream, applied.connectionId, waitingFor, seenSeq, nowMs());
+    }
     // C7: a hole in what this connection has delivered means the board is no longer in a state it may
     // call serving. The hole stays a record; it is the phase that has to change.
     phase = SYNCING;

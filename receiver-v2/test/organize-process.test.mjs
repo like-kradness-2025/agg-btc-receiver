@@ -799,7 +799,7 @@ test('a live channel change re-offers the owed set on the new channel', async ()
   }
 });
 
-test('an offer the link refused is swept again on the next frame', () => {
+test('an offer the link refused is swept again on the next frame', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-blocked-'));
   try {
     const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
@@ -821,6 +821,8 @@ test('an offer the link refused is swept again on the next frame', () => {
 
     block = false;
     process.handleEnvelope(envelope(2), ingest);
+    // The sweep is scheduled, not run inline: it offers the blocked frame and the new one, in order.
+    await until(() => book.envelopes.length >= 2);
     assert.deepEqual(
       book.envelopes.map((e) => e.receive_seq),
       [1, 2],
@@ -832,7 +834,7 @@ test('an offer the link refused is swept again on the next frame', () => {
   }
 });
 
-test('a refused offer on the ordinary path arms a sweep for the next frame', () => {
+test('a refused offer on the ordinary path arms a sweep for the next frame', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-blocked2-'));
   try {
     const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
@@ -848,8 +850,10 @@ test('a refused offer on the ordinary path arms a sweep for the next frame', () 
     const inner = book.sendEnvelope.bind(book);
     book.sendEnvelope = (envelopeOut) => (block ? false : inner(envelopeOut));
 
-    // The first frame completes the initial sweep: from here the ordinary path is in charge.
+    // The first frame completes the initial sweep (scheduled, so awaited): from here the ordinary
+    // path is in charge.
     process.handleEnvelope(envelope(1), ingest);
+    await until(() => book.envelopes.length >= 1);
     assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1], 'the initial sweep delivered the first frame');
 
     // The next frame is refused on the ordinary path: it must arm a sweep, not vanish.
@@ -859,6 +863,7 @@ test('a refused offer on the ordinary path arms a sweep for the next frame', () 
 
     block = false;
     process.handleEnvelope(envelope(3), ingest);
+    await until(() => book.envelopes.length >= 3);
     assert.deepEqual(
       book.envelopes.map((e) => e.receive_seq),
       [1, 2, 3],
@@ -870,7 +875,185 @@ test('a refused offer on the ordinary path arms a sweep for the next frame', () 
   }
 });
 
-test('a router error without a channel clears the offer memory, and the next frame re-offers', () => {
+test('a pass longer than one chunk keeps the sweep alive for later requests', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-chunk-'));
+  try {
+    const timers = [];
+    const setTimerFake = (fn, ms) => {
+      const timer = { fn, ms, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    };
+    const clearTimerFake = (timer) => {
+      timer.cleared = true;
+    };
+    const fire = (ms) => {
+      const timer = timers.find((entry) => entry.ms === ms && !entry.cleared);
+      assert.ok(timer, `a timer of ${ms} ms was armed`);
+      timer.cleared = true;
+      timer.fn();
+    };
+    const process = createOrganizeProcess({
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      storePath: join(dir, 'organize.sqlite'),
+      setTimer: setTimerFake,
+      clearTimer: clearTimerFake,
+    });
+    const book = memoryChannel();
+    let block = true;
+    const inner = book.sendEnvelope.bind(book);
+    book.sendEnvelope = (envelopeOut) => (block ? false : inner(envelopeOut));
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      book,
+    );
+    process.handleControl(acceptedMessage({ connectionId: CID }), book);
+    const ingest = memoryChannel();
+    for (let seq = 1; seq <= 600; seq += 1) process.handleEnvelope(envelope(seq), ingest);
+
+    block = false;
+    fire(0); // the pass: 512 entries in the first chunk, then a yield
+    fire(0); // the continuation: the rest of the entries
+    assert.equal(book.envelopes.length, 600, 'every owed entry was offered across the chunk boundary');
+
+    // The regression this guards: the continuation used to leave the "armed" marker behind, and
+    // every later request was turned away - a later drain could never start a pass again.
+    const before = timers.length;
+    process.handleLinkDrain();
+    assert.ok(
+      timers.slice(before).some((entry) => entry.ms === 0 && !entry.cleared),
+      'a later request arms a fresh pass',
+    );
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an offer that was lost between the hops is re-offered when the epoch turns', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-epoch-'));
+  try {
+    const timers = [];
+    const setTimerFake = (fn, ms) => {
+      const timer = { fn, ms, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    };
+    const clearTimerFake = (timer) => {
+      timer.cleared = true;
+    };
+    const fire = (ms) => {
+      const timer = timers.find((entry) => entry.ms === ms && !entry.cleared);
+      assert.ok(timer, `a timer of ${ms} ms was armed`);
+      timer.cleared = true;
+      timer.fn();
+    };
+    let clock = 1_000_000;
+    const process = createOrganizeProcess({
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      storePath: join(dir, 'organize.sqlite'),
+      setTimer: setTimerFake,
+      clearTimer: clearTimerFake,
+      nowMs: () => clock,
+    });
+    const book = memoryChannel();
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      book,
+    );
+    process.handleControl(acceptedMessage({ connectionId: CID }), book);
+    const ingest = memoryChannel();
+    process.handleEnvelope(envelope(1), ingest);
+    fire(0);
+    assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1], 'the first pass offered the frame');
+
+    // The offer was accepted by the link but never reached the book (a relay dropped it in
+    // silence): no new frame arrives, so only the epoch can bring it back.
+    clock += 11_000;
+    const epochTimer = timers.find((entry) => entry.ms >= 1000 && !entry.cleared);
+    assert.ok(epochTimer, 'the epoch pass was armed after the sweep completed');
+    epochTimer.cleared = true;
+    epochTimer.fn();
+    fire(0);
+    assert.deepEqual(
+      book.envelopes.map((e) => e.receive_seq),
+      [1, 1],
+      'the epoch re-offered what an earlier offer had claimed to deliver',
+    );
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a new owed frame after an empty pass re-arms the epoch pass', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'organize-epoch-rearm-'));
+  try {
+    const timers = [];
+    const setTimerFake = (fn, ms) => {
+      const timer = { fn, ms, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    };
+    const clearTimerFake = (timer) => {
+      timer.cleared = true;
+    };
+    const fire = (ms) => {
+      const timer = timers.find((entry) => entry.ms === ms && !entry.cleared);
+      assert.ok(timer, `a timer of ${ms} ms was armed`);
+      timer.cleared = true;
+      timer.fn();
+    };
+    let clock = 2_000_000;
+    const process = createOrganizeProcess({
+      market: MARKET,
+      stream: STREAM,
+      runId: RUN,
+      storePath: join(dir, 'organize.sqlite'),
+      setTimer: setTimerFake,
+      clearTimer: clearTimerFake,
+      nowMs: () => clock,
+    });
+    const book = memoryChannel();
+    process.handleControl(
+      makeMessage({ version: IPC_VERSION, type: 'hello', role_instance: 'book-1', run_id: RUN, payload: { role: 'book' } }),
+      book,
+    );
+    process.handleControl(acceptedMessage({ connectionId: CID }), book);
+    const ingest = memoryChannel();
+    // A pass over an empty owed set leaves no epoch pass armed; a frame that becomes owed
+    // afterwards must arm it, or a silently dropped offer would never come back.
+    process.handleLinkDrain();
+    fire(0);
+    assert.equal(
+      timers.filter((entry) => entry.ms >= 1000 && !entry.cleared).length,
+      0,
+      'an empty pass arms no epoch pass',
+    );
+    process.handleEnvelope(envelope(1), ingest);
+    assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1]);
+    clock += 11_000;
+    const epochTimer = timers.find((entry) => entry.ms >= 1000 && !entry.cleared);
+    assert.ok(epochTimer, 'the new owed frame armed the epoch pass');
+    epochTimer.cleared = true;
+    epochTimer.fn();
+    fire(0);
+    assert.deepEqual(
+      book.envelopes.map((e) => e.receive_seq),
+      [1, 1],
+      'the epoch re-offered the frame the ordinary path had already claimed to deliver',
+    );
+    process.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a router error without a channel clears the offer memory, and the next frame re-offers', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'organize-router-err-'));
   try {
     const process = createOrganizeProcess({ market: MARKET, stream: STREAM, runId: RUN, storePath: join(dir, 'organize.sqlite') });
@@ -883,12 +1066,14 @@ test('a router error without a channel clears the offer memory, and the next fra
     const ingest = memoryChannel();
 
     process.handleEnvelope(envelope(1), ingest);
+    await until(() => book.envelopes.length >= 1);
     assert.deepEqual(book.envelopes.map((e) => e.receive_seq), [1]);
 
     // The router reports a failure without naming a channel: the frames it was offered are not its
     // to keep, so the next frame re-offers the set.
     process.handleError(new Error('the router failed'), undefined);
     process.handleEnvelope(envelope(2), ingest);
+    await until(() => book.envelopes.length >= 3);
     assert.deepEqual(
       book.envelopes.map((e) => e.receive_seq),
       [1, 1, 2],

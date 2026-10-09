@@ -92,6 +92,58 @@ test('a frame with a hole before it is refused, and the hole is recorded', async
   });
 });
 
+test('one hole is one row, and its seen edge only grows', async () => {
+  await withBook(async (dir) => {
+    const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });
+    const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: store });
+    book.accept('conn-1', { firstSeq: 1 });
+    book.apply({ envelope: envelope(1), changes: [change(1)] });
+
+    book.apply({ envelope: envelope(10), changes: [change(10)] });
+    book.apply({ envelope: envelope(20), changes: [change(20)] });
+    book.apply({ envelope: envelope(15), changes: [change(15)] });
+    const gaps = internalsOf(store)
+      .db.prepare('SELECT waiting_for, seen_seq FROM book_gap WHERE filled_at_ms IS NULL')
+      .all();
+    assert.equal(gaps.length, 1, 'a hole under load stays one row');
+    assert.equal(gaps[0].waiting_for, 2, 'waiting where it always was');
+    assert.equal(gaps[0].seen_seq, 20, 'with the widest seen edge, never narrowed');
+
+    book.apply({ envelope: envelope(2), changes: [change(2)] });
+    assert.deepEqual(book.openGaps(), [], 'and the fill closes it');
+    store.close();
+  });
+});
+
+test('the rows an earlier version multiplied are collapsed when the store opens', async () => {
+  await withBook(async (dir) => {
+    const path = join(dir, 'state.sqlite');
+    const first = openDurability({ path, runId: 'run-1' });
+    openBook({ market: 'kraken_spot', stream: 'trades', durability: first }); // the schema the rows live in
+    // What the older writer left behind: three unfilled rows for the same hole.
+    for (const seen of [10, 12, 11]) {
+      internalsOf(first).db
+        .prepare(
+          `INSERT INTO book_gap (market, stream, connection_id, waiting_for, seen_seq, detected_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run('kraken_spot', 'trades', 'conn-1', 2, seen, 1_792_000_000_000);
+    }
+    first.close();
+
+    const second = openDurability({ path, runId: 'run-1' });
+    const book = openBook({ market: 'kraken_spot', stream: 'trades', durability: second });
+    const gaps = internalsOf(second)
+      .db.prepare('SELECT waiting_for, seen_seq FROM book_gap WHERE filled_at_ms IS NULL')
+      .all();
+    assert.equal(gaps.length, 1, 'one row remains');
+    assert.equal(gaps[0].waiting_for, 2);
+    assert.equal(gaps[0].seen_seq, 12, 'carrying the widest edge of the rows it replaced');
+    assert.equal(book.openGaps().length, 1, 'and the hole itself is unchanged');
+    second.close();
+  });
+});
+
 test('without a first sequence there is nothing to anchor the boundary to', async () => {
   await withBook(async (dir) => {
     const store = openDurability({ path: join(dir, 'state.sqlite'), runId: 'run-1' });

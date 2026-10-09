@@ -208,6 +208,61 @@ test('append returns the position just past the record, exactly as a walk report
   });
 });
 
+test('a walk may start at a position of its own, ahead of the release cursor', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir });
+    for (let i = 1; i <= 4; i += 1) spool.append(envelope(i));
+    spool.sync();
+    const records = [...spool.drainRecords()];
+    assert.equal(records.length, 4, 'the whole spool reads');
+    // Start past the first record: the walk yields from there, and the release cursor is untouched.
+    const from = { segment: records[0].segment, offset: records[0].offset };
+    const tail = [...spool.drainRecords({ from })];
+    assert.deepEqual(
+      tail.map((record) => record.envelope.receive_seq),
+      [2, 3, 4],
+      'the walk starts where it was told to',
+    );
+    assert.deepEqual(spool.cursor, { segment: null, offset: 0 }, 'and moves no cursor');
+    // The whole spool is still readable from the cursor: `from` decides the reading start only.
+    assert.deepEqual(
+      [...spool.drainRecords()].map((record) => record.envelope.receive_seq),
+      [1, 2, 3, 4],
+    );
+  });
+});
+
+test('a walk from a released segment starts at the beginning of the next segment', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir, segmentBytes: 300 });
+    for (let i = 1; i <= 12; i += 1) spool.append(envelope(i));
+    spool.sync();
+    const records = [...spool.drainRecords()];
+    const stalePosition = { segment: records[0].segment, offset: records[0].offset };
+    // Release the first segment entirely: the position now names a segment that is gone.
+    const firstSegmentRecords = records.filter((record) => record.segment === records[0].segment);
+    spool.advance({ segment: firstSegmentRecords.at(-1).segment, offset: firstSegmentRecords.at(-1).offset });
+    const remaining = [...spool.drainRecords()].map((record) => record.envelope.receive_seq);
+    assert.ok(remaining.length > 0, 'records after the released segment remain');
+    // The stale position's offset must not eat the next segment's beginning, and the positions the
+    // walk reports must be the segment's own - a consumer resuming from a shifted one would skip
+    // the bytes the stale offset named.
+    const fromStaleRecords = [...spool.drainRecords({ from: stalePosition })];
+    assert.deepEqual(
+      fromStaleRecords.map((record) => record.envelope.receive_seq),
+      remaining,
+      'the walk starts at the next segment whole, not mid-way',
+    );
+    const normalRecords = [...spool.drainRecords()];
+    assert.deepEqual(
+      fromStaleRecords.map((record) => ({ segment: record.segment, offset: record.offset })),
+      normalRecords.map((record) => ({ segment: record.segment, offset: record.offset })),
+      'and reports the same positions the segment itself reports',
+    );
+    spool.close();
+  });
+});
+
 test('a position that was an end when it was read is not an end once the segment has grown', async () => {
   await withSpool(async (dir) => {
     const spool = createSpool({ dir });

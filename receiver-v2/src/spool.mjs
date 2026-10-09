@@ -305,12 +305,17 @@ export function createSpool(options = {}) {
    * tail keeps the position inside its segment here - the record it follows is the last complete one -
    * and only an advance that finds the position at the file's end releases the segment.
    */
-  function* drainRecords({ limit = Infinity } = {}) {
+  function* drainRecords({ limit = Infinity, from = null } = {}) {
     let read = 0;
-    let startOffset = cursor.offset;
+    // Set 5: a walk may start at a position of its own - the ordered pump's send position, which is
+    // ahead of the release cursor. `from` changes only where the reading starts; the release rule
+    // still belongs to `advance` alone.
+    const start = from === null ? cursor : from;
+    let startOffset = start.offset;
+    let startSegment = start.segment;
     unreadable = null; // this walk's verdict, not an earlier one's
     for (const segment of segments) {
-      if (cursor.segment !== null && segment.index < cursor.segment) continue;
+      if (startSegment !== null && startSegment !== undefined && segment.index < startSegment) continue;
       const file = path.join(dir, segment.name);
       const fd = fsModule.openSync(file, 'r');
       let buf;
@@ -319,7 +324,13 @@ export function createSpool(options = {}) {
       } finally {
         fsModule.closeSync(fd);
       }
-      if (startOffset > 0) buf = buf.subarray(startOffset);
+      // The offset belongs to the segment it was read in. A position whose segment has since been
+      // released must not have its offset applied to the next segment: that would skip the next
+      // segment's beginning. The walk simply starts at the next segment's first record - and the
+      // positions it reports must start there too, or a consumer resuming from one would skip the
+      // bytes the stale offset named.
+      const sliceFrom = startSegment === segment.index ? startOffset : 0;
+      if (sliceFrom > 0) buf = buf.subarray(sliceFrom);
       const decoder = createFrameDecoder({ maxBytes: FRAME_MAX_BYTES + 1 });
       let records;
       try {
@@ -328,10 +339,10 @@ export function createSpool(options = {}) {
         // A length the format cannot have written means the segment desynchronised, and nothing
         // after it can be trusted: the walk ends here rather than inventing positions. The verdict
         // is recorded, so a consumer can stop on it instead of reading the end as a finished drain.
-        unreadable = { segment: segment.index, offset: startOffset, error };
+        unreadable = { segment: segment.index, offset: sliceFrom, error };
         return;
       }
-      let at = startOffset;
+      let at = sliceFrom;
       for (let index = 0; index < records.length; index += 1) {
         if (read >= limit) return;
         const record = records[index];

@@ -271,6 +271,67 @@ test('① the relay is bounded: an over-full destination is refused, and the sen
   assert.equal(capacity.payload.capacity, 'full');
 });
 
+test('a sender told full is told when the room comes back, and told again if it fills', () => {
+  const router = createRouter();
+  const ingest = bindRole(router, memoryRole(), 'ingest', 'ingest-1');
+  const book = bindRole(router, memoryRole(), 'book', 'book-1');
+  book.refuseControls = true;
+
+  router.handleControl(acceptMessage(), ingest);
+  assert.equal(
+    ingest.sent.filter((m) => m.type === 'readiness' && m.payload?.capacity === 'full').length,
+    1,
+    'the sender hears full',
+  );
+  assert.equal(
+    ingest.sent.filter((m) => m.type === 'readiness' && m.payload?.capacity === 'ok').length,
+    0,
+    'and nothing else yet',
+  );
+
+  // The destination takes a message again: the room notice is the other half of the full signal.
+  book.refuseControls = false;
+  router.handleControl(acceptMessage({ requestId: 'req-accept-2' }), ingest);
+  assert.equal(
+    ingest.sent.filter((m) => m.type === 'readiness' && m.payload?.capacity === 'ok').length,
+    1,
+    'the room coming back is announced once',
+  );
+
+  // A third refusal fills it again, and the cycle can repeat.
+  book.refuseControls = true;
+  router.handleControl(acceptMessage({ requestId: 'req-accept-3' }), ingest);
+  assert.equal(
+    ingest.sent.filter((m) => m.type === 'readiness' && m.payload?.capacity === 'full').length,
+    2,
+    'a later refusal is announced too',
+  );
+
+  // The destination's own drain ends the wait even when the sender has nothing to send: waiting for
+  // the sender's next message cannot be the only way out, because a sender told "full" has none.
+  router.handlePeerDrain(book);
+  assert.equal(
+    ingest.sent.filter((m) => m.type === 'readiness' && m.payload?.capacity === 'ok').length,
+    2,
+    'the drain notice arrives without any further send',
+  );
+
+  // A notice that cannot be sent is not a notice: the wait survives, and a later drain retries.
+  book.refuseControls = true;
+  router.handleControl(acceptMessage({ requestId: 'req-accept-4' }), ingest);
+  ingest.refuseControls = true;
+  assert.deepEqual(router.handlePeerDrain(book), { woken: 0 }, 'a sender that cannot hear is not woken');
+  ingest.refuseControls = false;
+  // The waiting sender's own link drained: the notice it could not hear is retried there too - the
+  // destination's next drain may never come.
+  router.handlePeerDrain(ingest);
+  assert.equal(
+    ingest.sent.filter((m) => m.type === 'readiness' && m.payload?.capacity === 'ok').length,
+    3,
+    'the waiting sender drained and the pending notice was delivered',
+  );
+});
+
 test('② an accept lost on the way is recovered by an idempotent resend of the same request', () => {
   const router = createRouter();
   const ingest = bindRole(router, memoryRole(), 'ingest', 'ingest-1');

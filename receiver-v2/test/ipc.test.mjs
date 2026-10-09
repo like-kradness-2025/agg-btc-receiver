@@ -144,6 +144,70 @@ test('a queue over its bound is reported rather than absorbed', () => {
   assert.ok(reported[0].bufferedBytes > 100);
 });
 
+test('a refused write arms one drain listener, however many writes are refused', () => {
+  const drainListeners = [];
+  const fakeSocket = {
+    write: () => false, // a peer that never drains
+    once: (event, fn) => {
+      if (event !== 'drain') return;
+      // A real socket removes a once-listener when it fires; the fake has to do the same.
+      const wrapped = () => {
+        const index = drainListeners.indexOf(wrapped);
+        if (index >= 0) drainListeners.splice(index, 1);
+        fn();
+      };
+      drainListeners.push(wrapped);
+    },
+    removeListener: (event, fn) => {
+      const index = drainListeners.indexOf(fn);
+      if (index >= 0) drainListeners.splice(index, 1);
+    },
+    end: () => {},
+    on: () => {},
+    writableLength: 0,
+  };
+  let drained = 0;
+  const channel = createChannel(fakeSocket, {
+    batchFrames: 1,
+    onDrain: () => {
+      drained += 1;
+    },
+  });
+  for (let i = 1; i <= 5; i += 1) channel.sendEnvelope(envelope(i));
+  assert.equal(drainListeners.length, 1, 'one listener, not one per refused write');
+  drainListeners[0](); // the socket drains
+  assert.equal(drained, 1, 'the recovery callback fires once');
+  assert.equal(drainListeners.length, 0, 'and the listener is spent');
+  channel.sendEnvelope(envelope(6));
+  assert.equal(drainListeners.length, 1, 'the next refusal arms a fresh one');
+});
+
+test("the channel's own bound announces its relief like the socket's", async () => {
+  const fakeSocket = {
+    write: () => true,
+    once: () => {},
+    removeListener: () => {},
+    end: () => {},
+    on: () => {},
+    writableLength: 0,
+  };
+  let drained = 0;
+  const channel = createChannel(fakeSocket, {
+    batchFrames: 100,
+    maxBufferedBytes: 700,
+    onDrain: () => {
+      drained += 1;
+    },
+  });
+  let refused = false;
+  for (let i = 1; i <= 10 && !refused; i += 1) refused = channel.sendEnvelope(envelope(i)) === false;
+  assert.equal(refused, true, 'the bound refused something');
+  assert.equal(drained, 0, 'nothing is announced while the bound holds');
+  channel.flush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, 1, 'the relief is announced once');
+});
+
 test('an unknown tag is reported as an error, not treated as data', () => {
   const errors = [];
   const handlers = {};

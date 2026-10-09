@@ -645,6 +645,125 @@ test('a resend window continues past its bound instead of re-sending the head', 
   }
 });
 
+test('a fresh frame never overtakes one that is still held', async () => {
+  const h = await setup({ label: 'no-overtaking' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    await until(() => h.organize.channel !== null);
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
+    for (let seq = 1; seq <= 300; seq += 1) h.sockets[0].deliver(`{"seq":${seq}}`);
+    await until(() => h.process.stats.spooledFrames === 300);
+
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await until(() => h.organize.state.envelopes.length === 256, { timeoutMs: 4000 });
+    // While the walk is parked between windows, a fresh frame arrives: it must wait for the frames
+    // held in front of it, not jump the queue (the overtaking that opened a hole under the soak).
+    h.sockets[0].deliver('{"seq":301}');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(
+      h.organize.state.envelopes.length,
+      256,
+      'the fresh frame did not overtake the 44 still held in front of it',
+    );
+
+    h.fireByDelay(0); // the continuation window carries on
+    await until(() => h.organize.state.envelopes.length === 301, { timeoutMs: 4000 });
+    assert.deepEqual(
+      h.organize.state.envelopes.map((e) => e.receive_seq),
+      Array.from({ length: 301 }, (_, i) => i + 1),
+      'everything arrived in order, exactly once',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a capacity return drains only what has never been sent', async () => {
+  const h = await setup({ label: 'drain-no-dup' });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    h.sockets[0].deliver('{"seq":2}');
+    await until(() => h.organize.state.envelopes.length === 2);
+
+    // Both frames are in flight (sent, not yet acknowledged). The link reports full and then ok:
+    // the drain continues from where sending stopped - it does not re-send what is already out.
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(h.organize.state.envelopes.length, 2, 'nothing already sent was sent twice');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('a stalled ceiling is reported while the link is full, and recovers from the head when it opens', async () => {
+  const h = await setup({ label: 'recover-full', ackStallMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
+    h.fireByDelay(60);
+    const stalled = h.diagnostics.find((d) => /durable ceiling has stalled/.test(String(d.reason)));
+    assert.ok(stalled, 'the stall is reported even while the link is full');
+    assert.equal(stalled.capacity, 'full', 'and the report names the link state');
+
+    // The link opens: the recovery the stall wanted runs from the first unreleased record, so the
+    // frame that never got its acknowledgement is offered again.
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await until(() => h.organize.state.envelopes.length >= 2, { timeoutMs: 2000 });
+    assert.deepEqual(
+      h.organize.state.envelopes.map((e) => e.receive_seq),
+      [1, 1],
+      'the recovery re-offers the unacknowledged frame from the head',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('retention that began while the link was full is still watched and recovers', async () => {
+  const h = await setup({ label: 'full-first', ackStallMs: 60 });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    await until(() => h.organize.channel !== null);
+    h.organize.sendReadiness({ capacity: 'full' });
+    await until(() => h.process.stats.capacity === 'full');
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.process.stats.spooledFrames === 1);
+
+    // The retention began while the link could take nothing: the deadline still has to arm, report,
+    // and remember that a recovery is wanted.
+    h.fireByDelay(60);
+    const stalled = h.diagnostics.find((d) => /durable ceiling has stalled/.test(String(d.reason)));
+    assert.ok(stalled, 'the deadline armed while the link was full and reported');
+    assert.equal(stalled.capacity, 'full');
+
+    h.organize.sendReadiness({ capacity: 'ok' });
+    await until(() => h.organize.state.envelopes.length >= 1, { timeoutMs: 2000 });
+    assert.deepEqual(
+      h.organize.state.envelopes.map((e) => e.receive_seq),
+      [1],
+      'the frame the link never took is offered when it opens',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
 test('frames the link cannot take are reported once per episode, and a delivered frame closes it', async () => {
   const h = await setup({ label: 'spool-report' });
   try {

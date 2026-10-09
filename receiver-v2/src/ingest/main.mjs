@@ -103,7 +103,22 @@ export function createIngestProcess({
   // Set 3: the release order of everything the spool holds, rebuilt once from the walk. The cursor
   // only ever moves past a record that itself is acknowledged (see ack-fifo.mjs); a spool-less
   // configuration has nothing to release.
-  const fifo = spool === null ? null : rebuildAckFifo(spool.drainRecords());
+  // Set 5: the same walk remembers the first retained sequence, because everything a restart finds
+  // retained is unsent as far as this life knows - the ordered pump starts there.
+  let firstRetainedSeq = null;
+  const fifo =
+    spool === null
+      ? null
+      : rebuildAckFifo(
+          (function* () {
+            for (const record of spool.drainRecords()) {
+              if (firstRetainedSeq === null && Number.isInteger(record.envelope?.receive_seq)) {
+                firstRetainedSeq = record.envelope.receive_seq;
+              }
+              yield record;
+            }
+          })(),
+        );
 
   let organizeChannelRef = organizeChannel;
   // What organize last told us about its capacity. Anything but 'ok' means the frame cannot be handed
@@ -140,6 +155,17 @@ export function createIngestProcess({
   let resendQueued = false;
   let resendWalk = null;
   let resendPending = null;
+  // Set 5: the ordered pump. `nextToSendSeq` is the sequence the next send must carry - everything
+  // before it has been sent; `pumpPos` is the spool position just past the last record sent. A new
+  // frame is sent directly only when it is exactly this next sequence; anything behind a held frame
+  // waits for the walk, which sends in order. `resendMode` picks the walk's start: the drain
+  // continues from the pump's position; a recovery walks again from the first unreleased record.
+  let nextToSendSeq = firstRetainedSeq;
+  let pumpPos = spool === null ? null : spool.cursor;
+  let resendMode = 'drain';
+  // A stall seen while the link could not take frames: the recovery it wants runs the moment the
+  // link opens (or the next attempt can try), not never.
+  let recoveryWanted = false;
   let deferredAdmission = null;
 
   const connection = createReceiveConnection({
@@ -228,13 +254,26 @@ export function createIngestProcess({
     if (spool !== null) {
       const retained = spoolFrame(envelope);
       if (retained.accepted === false) return retained;
-      if (trySend(envelope)) return { accepted: true, sent: true };
-      // Held because the link would not take it: counted, and the episode is reported once - not
-      // once per frame - so a capacity episode is visible without flooding the log. The retention
-      // is also put under the progress deadline here: a first send that failed while the link is
-      // nominally ready must age into a report and a retry rather than wait for another event.
+      // Set 5: the ordered pump. A frame goes out directly only when it is exactly the next in
+      // order - nothing held in front of it. Anything else waits for the pump, which walks in
+      // order, so a new frame can never overtake one that is still retained (the overtaking that
+      // opened a hole nothing could close under the soak).
+      if (Number.isInteger(envelope.receive_seq) && nextToSendSeq === null) {
+        nextToSendSeq = envelope.receive_seq; // the first frame of the connection starts the pump here
+      }
+      if (envelope.receive_seq === nextToSendSeq && trySend(envelope)) {
+        if (retained.position !== undefined && retained.position !== false) pumpPos = retained.position;
+        nextToSendSeq = envelope.receive_seq + 1;
+        return { accepted: true, sent: true };
+      }
+      // Held because the link would not take it, or because it is not next: counted, and the
+      // episode is reported once - not once per frame - so a capacity episode is visible without
+      // flooding the log. The retention is also put under the progress deadline here: a first send
+      // that failed while the link is nominally ready must age into a report and a retry rather
+      // than wait for another event, and the pump is asked to carry what it can.
       spooledFrames += 1;
       armProgressDeadlineIfIdle();
+      scheduleResend();
       if (!linkHeldReported) {
         linkHeldReported = true;
         try {
@@ -297,7 +336,7 @@ export function createIngestProcess({
     }
     if (position !== false && position !== null) {
       fifo.record({ identity: ackIdentityOf(envelope), seq: envelope.receive_seq, position });
-      return { accepted: true, spooled: true };
+      return { accepted: true, spooled: true, position };
     }
     unretainedFrameFailure = true;
     stopReception('nothing could hold the frame');
@@ -380,6 +419,12 @@ export function createIngestProcess({
     // trip; the acceptance goes out the moment the release FIFO empties (tryDeferredAdmission).
     deferredAdmission = { generation: info.generation, message };
     if (fifo !== null && fifo.size > 0) {
+      // The wait ends when the old connection's retention drains, and the frames that need an
+      // answer are exactly the ones already sent: the offer is a recovery walk from the first
+      // unreleased record, not a drain of what has never been sent.
+      resendMode = 'recover';
+      resendWalk = null;
+      resendPending = null;
       scheduleResend();
       return undefined;
     }
@@ -490,6 +535,14 @@ export function createIngestProcess({
       return { accepted: false, reason };
     }
     pending.info.settle?.(true);
+    // Set 5: the new connection's numbering starts over. Everything the previous connection held was
+    // released before this acceptance went out (the hand-over gate), so the pump restarts cleanly at
+    // the spool's end and the first frame of the new connection opens it again.
+    nextToSendSeq = null;
+    pumpPos = spool === null ? null : spool.cursor;
+    resendMode = 'drain';
+    resendWalk = null;
+    resendPending = null;
     return { accepted: true };
   }
 
@@ -508,8 +561,12 @@ export function createIngestProcess({
       const released = fifo.noteAck({ identity: ackIdentityOf(message), upToSeq });
       if (released.position !== null) {
         spool.advance(released.position);
-        resendWalk = null; // the walk describes released positions; the next one starts at the cursor
-        resendPending = null;
+        if (resendMode === 'recover') {
+          // The release moved the cursor under the recovery walk; its next segments may be gone.
+          // A drain walk sits ahead of the cursor and is never invalidated by a release.
+          resendWalk = null;
+          resendPending = null;
+        }
         noteAckProgress(message.connection_id, upToSeq);
         advanced = true;
       }
@@ -546,7 +603,9 @@ export function createIngestProcess({
     if (!Number.isFinite(ackStallMs) || ackStallMs <= 0) return;
     if (closed) return;
     if (fifo === null || fifo.size === 0) return;
-    if (organizeCapacity !== 'ok') return;
+    // No capacity gate here: retention that began while the link was full must still age into a
+    // report (and into the recovery the report wants) - the expiry itself decides what the link's
+    // state allows, and the retry budget only counts the attempts it could have taken.
     progressClockMs = Date.now();
     progressTimer = setTimer(() => {
       progressTimer = null;
@@ -561,13 +620,11 @@ export function createIngestProcess({
       stalledStrikes = 0;
       return;
     }
-    if (organizeCapacity !== 'ok') {
-      // The link is known to be unable to take frames: that is the episode report's subject, not a
-      // stall. The deadline waits for the link instead of resending into a full queue.
-      armProgressDeadlineIfIdle();
-      return;
-    }
-    stalledStrikes += 1;
+    // The report is the fact whether or not the link can take frames: a ceiling that stopped
+    // moving is exactly what a reader needs to see, and the retry budget only counts the attempts
+    // the link could actually have taken (a full link's stall is the episode report's subject).
+    const canTry = organizeCapacity === 'ok';
+    if (canTry) stalledStrikes += 1;
     const nowMs = Date.now();
     try {
       onDiagnostic({
@@ -584,8 +641,15 @@ export function createIngestProcess({
     } catch {
       // a diagnostic is best-effort
     }
-    scheduleResend();
-    if (stalledStrikes >= STALL_STOPS_AFTER) {
+    if (canTry) {
+      enterRecovery();
+      scheduleResend();
+    } else {
+      // The link cannot take frames: the recovery is wanted, and the moment the link opens is the
+      // moment it runs (the readiness transition or the next attempt takes it).
+      recoveryWanted = true;
+    }
+    if (canTry && stalledStrikes >= STALL_STOPS_AFTER) {
       // A release has not come for the whole retry budget while the link kept accepting resends:
       // the retention cannot be drained here. Stopping loudly beats holding a hand-over (or a
       // board) for ever - the answer to a cause that cannot be recovered from in place.
@@ -593,6 +657,21 @@ export function createIngestProcess({
       return;
     }
     armProgressDeadlineIfIdle();
+  }
+
+  /**
+   * Switch the pump to a recovery walk: what was lost between the hops cannot be known, so
+   * everything unacknowledged goes again, in order, from the first unreleased record. A recovery
+   * already under way continues where it stopped.
+   */
+  function enterRecovery() {
+    recoveryWanted = false;
+    if (resendMode !== 'recover' || resendWalk === null) {
+      resendMode = 'recover';
+      resendWalk = null;
+      resendPending = null;
+    }
+    return true;
   }
 
   function clearProgressDeadline() {
@@ -658,31 +737,43 @@ export function createIngestProcess({
     armProgressDeadlineIfIdle();
     resendRunning = true;
     let sent = 0;
+    let budget = RESEND_WINDOW_FRAMES;
     try {
       // The walk is kept across windows and across a refusal: it resumes exactly where the link
       // stopped taking frames, so a bounded window never re-sends the head while the rest waits.
       // A record already drawn from the walk and then refused is held in `resendPending` and tried
-      // first next time - a refusal never advances past a record. The walk is dropped whenever an
-      // acknowledgement moves the cursor (handleDurableAck), because then the positions it holds
-      // describe records that have been released.
+      // first next time - a refusal never advances past a record.
       if (resendWalk === null) {
         resendPending = null;
-        resendWalk = spool.drain();
+        // Drain continues from where the last send stopped; recovery walks again from the first
+        // unreleased record, because what was lost between the hops cannot be known.
+        resendWalk =
+          resendMode === 'recover'
+            ? spool.drainRecords({ from: spool.cursor })
+            : spool.drainRecords({ from: pumpPos ?? spool.cursor });
       }
-      while (sent < RESEND_WINDOW_FRAMES) {
+      while (budget > 0) {
         if (resendPending !== null) {
-          if (!trySendResend(resendPending)) break; // still refused: held for the next window
+          if (!sendRecord(resendPending)) break; // still refused: held for the next window
           resendPending = null;
           sent += 1;
+          budget -= 1;
           continue;
         }
         const step = resendWalk.next();
         if (step.done === true) {
           resendWalk = null;
+          resendMode = 'drain'; // the walk finished: the pump continues from its end position
           break;
         }
-        if (!trySendResend(step.value)) {
-          resendPending = step.value;
+        budget -= 1;
+        const record = step.value;
+        const seq = record.envelope?.receive_seq;
+        if (resendMode === 'drain' && Number.isInteger(seq) && Number.isInteger(nextToSendSeq) && seq < nextToSendSeq) {
+          continue; // already sent while this walk was parked (the direct path): never sent twice
+        }
+        if (!sendRecord(record)) {
+          resendPending = record;
           break;
         }
         sent += 1;
@@ -692,11 +783,15 @@ export function createIngestProcess({
       // leaves the spool untouched, and says so rather than taking the organize link down with it.
       resendWalk = null;
       resendPending = null;
-      onDiagnostic({ market, reason: `the spool could not hand back a record: ${error.message}` });
+      try {
+        onDiagnostic({ market, reason: `the spool could not hand back a record: ${error.message}` });
+      } catch {
+        // a diagnostic is best-effort; it must never escape into the delivery path
+      }
     } finally {
       resendRunning = false;
     }
-    if (!closed && sent >= RESEND_WINDOW_FRAMES && resendWalk !== null) {
+    if (!closed && budget === 0 && resendWalk !== null) {
       // The window was full: the walk has more, and the loop yields before the next window.
       resendTimer = setTimer(() => {
         resendTimer = null;
@@ -710,13 +805,28 @@ export function createIngestProcess({
     return sent;
   }
 
+  /**
+   * One send out of the pump: the same link and the same accounting as a first send, and the record
+   * it confirmed becomes the pump's position and the next sequence.
+   */
+  function sendRecord(record) {
+    if (!trySendResend(record.envelope)) return false;
+    pumpPos = { segment: record.segment, offset: record.offset };
+    if (Number.isInteger(record.envelope.receive_seq)) nextToSendSeq = record.envelope.receive_seq + 1;
+    return true;
+  }
+
   /** One re-send: the same link and the same accounting as a first send, only the counter differs. */
   function trySendResend(envelope) {
     let ok = false;
     try {
       ok = organizeChannelRef.sendEnvelope(envelope);
     } catch (error) {
-      onDiagnostic({ market, reason: `the organize link refused a resend: ${error.message}` });
+      try {
+        onDiagnostic({ market, reason: `the organize link refused a resend: ${error.message}` });
+      } catch {
+        // a diagnostic is best-effort; it must never escape into the delivery path
+      }
       ok = false;
     }
     if (!ok) return false;
@@ -727,6 +837,11 @@ export function createIngestProcess({
   }
 
   function handleResend(message) {
+    // An explicit resend re-offers what is unacknowledged, in order, from the first unreleased
+    // record: a recovery, not a drain.
+    resendMode = 'recover';
+    resendWalk = null;
+    resendPending = null;
     return { resent: scheduleResend() };
   }
 
@@ -749,7 +864,12 @@ export function createIngestProcess({
     // Set 3: a capacity that has just come back is the moment the retained frames can move again. A
     // repeated 'ok' is not - re-sending on every readiness report would duplicate a window that is
     // already waiting for its acknowledgement.
-    const resent = organizeCapacity === 'ok' && before !== 'ok' ? scheduleResend() : 0;
+    let resent = 0;
+    if (organizeCapacity === 'ok' && before !== 'ok') {
+      // A stall that was seen while the link was full runs its recovery now that the link is back.
+      if (recoveryWanted) enterRecovery();
+      resent = scheduleResend();
+    }
     return { capacity: organizeCapacity, resent };
   }
 
@@ -938,6 +1058,8 @@ export function createIngestProcess({
   return {
     /** The consume side of the organize link, wired by whoever opened the channel. */
     handleControl,
+    /** The link to organize drained: the retained frames may move again. */
+    handleLinkDrain: () => ({ resent: scheduleResend() }),
     handleError,
 
     /** Announce this process to the supervisor. */
@@ -958,7 +1080,11 @@ export function createIngestProcess({
         if (deferredAdmission !== null && pending.generation === deferredAdmission.generation) continue;
         announceAccept(pending.message);
       }
-      if (organizeCapacity === 'ok') scheduleResend();
+      if (organizeCapacity === 'ok') {
+        // A stall that was seen while the link was gone runs its recovery now that it is back.
+        if (recoveryWanted) enterRecovery();
+        scheduleResend();
+      }
       tryDeferredAdmission();
       return true;
     },
@@ -1083,6 +1209,7 @@ export async function openIngestProcess(options) {
         ...channelOptions,
         onControl: (message) => process?.handleControl(message),
         onError: (error) => process?.handleError(error),
+        onDrain: () => process?.handleLinkDrain(),
       })
     : null;
   process = createIngestProcess({ ...rest, organizeChannel: channel });

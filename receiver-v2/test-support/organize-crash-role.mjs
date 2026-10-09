@@ -83,10 +83,14 @@ function frame() {
   });
 }
 
-process.on('message', (message) => {
+process.on('message', async (message) => {
   if (message?.kind !== 'seed') return;
   try {
     const result = organizer.handleEnvelope(frame(), ingest);
+    // The owed delivery is scheduled (Set 5): let its pass run before reporting, so the envelope
+    // that reaches the parent through the channel shim arrives ahead of this report, exactly as a
+    // synchronous hand-over would have.
+    await new Promise((resolve) => setTimeout(resolve, 50));
     process.send?.({
       kind: 'seeded',
       result,

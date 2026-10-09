@@ -139,6 +139,9 @@ export function createOrganizeProcess({
   // Stage 5c: the periodic readiness report (ruling ⑬). It travels the ordinary control path to the
   // supervisor's router, which observes it. Disabled (0) by default.
   readinessIntervalMs = 0,
+  // The clocks the scheduled sweep runs on; tests pass their own, production gets the real ones.
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
 } = {}) {
   if (!market || !stream) throw new TypeError('the organize process needs a market and a stream');
   if (!runId) throw new TypeError('the organize process needs a run id');
@@ -319,10 +322,14 @@ export function createOrganizeProcess({
     // for). A frame the book cannot take yet stays owed - only its `applied_ack` releases it. The
     // ordinary path offers just this frame; a sweep runs only after an offer was blocked.
     if (owedSweepNeeded) {
-      const sweep = deliverOwed();
-      if (!sweep.blocked) owedSweepNeeded = false;
+      // A sweep is already wanted (a blocked offer, a channel change): it covers this frame too, in
+      // arrival order, so the ordinary path offers nothing on its own.
+      requestSweep();
     } else if (note.durable === true || note.alreadyDurable === true) {
       deliverEntry(envelope);
+      // An offer made on the ordinary path can be dropped between the hops in silence: the epoch
+      // pass is what brings it back when no other event asks.
+      armEpochSweep();
     }
     return note;
   }
@@ -784,6 +791,22 @@ export function createOrganizeProcess({
    * refuses (for instance before its connection is adopted) simply stays owed: nothing here releases it,
    * only the book's `applied_ack` does.
    */
+  // What the link to the book last said about its capacity. The room coming back after a full
+  // signal is a moment the owed set may move again - and, on the router's recovery notice, the
+  // moment the frames a relay dropped are worth offering afresh.
+  let bookCapacity = 'ok';
+
+  function handleBookReadiness(message) {
+    const before = bookCapacity;
+    if (typeof message.payload?.capacity === 'string') bookCapacity = message.payload.capacity;
+    if (message.payload?.ready === false) bookCapacity = 'down';
+    if (bookCapacity === 'ok' && before !== 'ok') {
+      sweepBlocked = false;
+      requestSweep();
+    }
+    return { readiness: message.payload ?? null };
+  }
+
   function deliverOwed() {
     if (bookChannel === null) return { delivered: 0, blocked: false, reason: 'no book is connected to organize' };
     let delivered = 0;
@@ -793,6 +816,147 @@ export function createOrganizeProcess({
       if (outcome === 'sent') delivered += 1;
     }
     return { delivered, blocked: false };
+  }
+
+  // Set 5: the sweep is scheduled and bounded. A pass walks the owed set in chunks with a yield
+  // between them, so a full link can no longer turn every arriving frame into a full walk of the
+  // whole owed set - the per-frame walk that burned a core under the soak. A pass that ends blocked
+  // keeps its retry: the request is postponed, never dropped. And the offer memory is forgotten on a
+  // slow cycle, so a frame whose offer was lost between the hops is offered again rather than
+  // skipped for ever.
+  const SWEEP_CHUNK = 512;
+  const SWEEP_OFFER_EPOCH_MS = 10000;
+  const SWEEP_RETRY_MS = 1000;
+  let sweepTimer = null;
+  let sweepRetryTimer = null;
+  let epochTimer = null;
+  let sweepRunning = false;
+  let sweepQueued = false;
+  // A blocked pass is not retried once per arriving frame: the retry timer, a drain, a capacity
+  // return or an explicit resend is what wakes it.
+  let sweepBlocked = false;
+  // The offer epoch starts now: a fresh process has nothing offered to forget, and the first
+  // re-offer cycle is one full epoch away rather than immediate.
+  let lastOfferEpochMs = nowMs();
+
+  function requestSweep() {
+    if (closed) return;
+    if (sweepRunning) {
+      sweepQueued = true;
+      return;
+    }
+    if (sweepBlocked) return; // a retry, a drain, a capacity return or a resend wakes it
+    if (sweepTimer !== null) return;
+    sweepTimer = setTimer(() => {
+      sweepTimer = null;
+      runSweepPass();
+    }, 0);
+    if (typeof sweepTimer?.unref === 'function') sweepTimer.unref();
+  }
+
+  /**
+   * The next pass is due at the epoch boundary: without it, offers that were dropped between the
+   * hops would only be re-offered when some other event happened to request a pass, and an ordinary
+   * path that keeps succeeding never does.
+   */
+  function armEpochSweep() {
+    if (closed || epochTimer !== null) return;
+    const delay = Math.max(1000, lastOfferEpochMs + SWEEP_OFFER_EPOCH_MS - nowMs());
+    epochTimer = setTimer(() => {
+      epochTimer = null;
+      sweepBlocked = false;
+      requestSweep();
+    }, delay);
+    if (typeof epochTimer?.unref === 'function') epochTimer.unref();
+  }
+
+  function clearEpochSweep() {
+    if (epochTimer !== null) {
+      clearTimer(epochTimer);
+      epochTimer = null;
+    }
+  }
+
+  function armSweepRetry() {
+    if (closed || sweepRetryTimer !== null) return;
+    sweepRetryTimer = setTimer(() => {
+      sweepRetryTimer = null;
+      sweepBlocked = false;
+      requestSweep();
+    }, SWEEP_RETRY_MS);
+    if (typeof sweepRetryTimer?.unref === 'function') sweepRetryTimer.unref();
+  }
+
+  function clearSweepRetry() {
+    if (sweepRetryTimer !== null) {
+      clearTimer(sweepRetryTimer);
+      sweepRetryTimer = null;
+    }
+  }
+
+  function runSweepPass() {
+    if (closed || bookChannel === null) return;
+    const atMs = nowMs();
+    if (atMs - lastOfferEpochMs >= SWEEP_OFFER_EPOCH_MS) {
+      // The offer memory describes what a previous pass handed to the link, not what the book
+      // holds. Re-offering everything owed on a slow cycle makes delivery eventual; between
+      // cycles the memory keeps the passes cheap.
+      owedOffered.clear();
+      lastOfferEpochMs = atMs;
+    }
+    let entries = null;
+    try {
+      entries = ledger.pending({ state: 'owed' });
+    } catch (error) {
+      diagnostic(`the owed set could not be read: ${error.message}`);
+      return;
+    }
+    sweepRunning = true;
+    let index = 0;
+    const step = () => {
+      if (closed || bookChannel === null) {
+        sweepRunning = false;
+        return;
+      }
+      let budget = SWEEP_CHUNK;
+      while (index < entries.length && budget > 0) {
+        const entry = entries[index];
+        index += 1;
+        budget -= 1;
+        const outcome = offerOwedEntry(entry);
+        if (outcome === 'blocked') {
+          // The link is full: the rest stays owed, and the retry keeps trying until a drain or a
+          // capacity return gets through. Requests that arrive meanwhile are coalesced, not run.
+          sweepRunning = false;
+          sweepBlocked = true;
+          armSweepRetry();
+          sweepQueued = false;
+          return;
+        }
+      }
+      if (index < entries.length) {
+        sweepTimer = setTimer(() => {
+          // The timer has fired: clear it before the chunk runs, or every later request would be
+          // turned away by the "one is already armed" guard and the sweep would never resume.
+          sweepTimer = null;
+          step();
+        }, 0); // yield to the event loop between chunks
+        if (typeof sweepTimer?.unref === 'function') sweepTimer.unref();
+        return;
+      }
+      sweepRunning = false;
+      sweepBlocked = false;
+      owedSweepNeeded = false;
+      clearSweepRetry();
+      // Whatever is still owed is re-offered when the epoch turns, even if no other event asks.
+      if (entries.length > 0) armEpochSweep();
+      else clearEpochSweep();
+      if (sweepQueued) {
+        sweepQueued = false;
+        requestSweep();
+      }
+    };
+    step();
   }
 
   /** The set of receive_seqs this channel has already been offered for one connection. */
@@ -1086,14 +1250,14 @@ export function createOrganizeProcess({
       case 'resend': {
         setRole(channel, 'book');
         // Frames owed to the book are re-offered on request: the offer memory forgets what the
-        // current channel has seen and the delivery path walks the owed set again, arrival order.
+        // current channel has seen and the scheduled sweep walks the owed set again, arrival order.
         resetOffers();
-        const sweep = deliverOwed();
-        owedSweepNeeded = sweep.blocked;
-        return { resend: true, pending: ledger.size(), delivered: sweep.delivered };
+        sweepBlocked = false;
+        requestSweep();
+        return { resend: true, pending: ledger.size(), delivered: 0 };
       }
       case 'readiness':
-        return { readiness: message.payload ?? null };
+        return handleBookReadiness(message);
       case 'error':
         diagnostic(`a peer reported an error: ${message.payload?.reason ?? 'unknown'}`);
         return { seen: true };
@@ -1176,6 +1340,12 @@ export function createOrganizeProcess({
     handleControl,
     handleEnvelope,
     handleError,
+    /** The link to the book drained: the owed set may move again. */
+    handleLinkDrain: () => {
+      sweepBlocked = false;
+      requestSweep();
+      return { swept: true };
+    },
     adoptChannel,
     attachRouter,
     announceHello,
@@ -1226,6 +1396,12 @@ export function createOrganizeProcess({
       reportRefusalBurst(' more');
       closeServer();
       stopReadinessReporting();
+      if (sweepTimer !== null) {
+        clearTimer(sweepTimer);
+        sweepTimer = null;
+      }
+      clearSweepRetry();
+      clearEpochSweep();
       stopped = true;
       closed = true;
       if (openedStoreHere) {
@@ -1288,6 +1464,7 @@ export async function openOrganizeProcess({ listenPath = null, routerSocketPath 
       onControl: (message) => process.handleControl(message),
       onEnvelope: (envelope) => process.handleEnvelope(envelope),
       onError: (error) => process.handleError(error),
+      onDrain: () => process.handleLinkDrain(),
     });
     process.attachRouter(channel);
     process.announceHello();
@@ -1302,6 +1479,7 @@ export async function openOrganizeProcess({ listenPath = null, routerSocketPath 
       onControl: (message) => process.handleControl(message, channel),
       onEnvelope: (envelope) => process.handleEnvelope(envelope, channel),
       onError: (error) => process.handleError(error, channel),
+      onDrain: () => process.handleLinkDrain(),
     });
     process.adoptChannel(channel);
   });
