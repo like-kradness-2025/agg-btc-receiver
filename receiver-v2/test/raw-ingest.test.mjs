@@ -19,6 +19,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { openIngestProcess } from '../src/ingest/main.mjs';
 import { startFakeOrganize } from '../test-support/fake-organize.mjs';
 import { createBinanceFuturesAdapter } from '../src/ingest/venues/binance-spot.mjs';
+import { createBybitSpotAdapter } from '../src/ingest/venues/bybit.mjs';
 
 const MARKET = 'binance_perp';
 const STREAM = 'trades';
@@ -87,7 +88,7 @@ function depthAdapter() {
   };
 }
 
-async function withIngest(fn, { rawBatchWindowMs = 3_600_000, adapter: adapterOverride = null } = {}) {
+async function withIngest(fn, { rawBatchWindowMs = 3_600_000, adapter: adapterOverride = null, market = MARKET } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'raw-ingest-'));
   const organize = await startFakeOrganize(join(dir, 'organize.sock'), { batchFrames: 1 });
   const adapter = adapterOverride ?? depthAdapter();
@@ -96,7 +97,7 @@ async function withIngest(fn, { rawBatchWindowMs = 3_600_000, adapter: adapterOv
   const stops = [];
   const process = await openIngestProcess({
     tailSaveMs: 0,
-    market: MARKET,
+    market,
     stream: STREAM,
     adapter,
     venue: VENUE,
@@ -130,12 +131,12 @@ async function withIngest(fn, { rawBatchWindowMs = 3_600_000, adapter: adapterOv
   }
 }
 
-function readBatches(dir) {
+function readBatches(dir, market = MARKET) {
   // No file yet means nothing has been confirmed: the writer opens a market's database lazily, on the
   // first batch it actually writes.
   let db;
   try {
-    db = new DatabaseSync(join(dir, 'raw', `${MARKET}.sqlite`), { readOnly: true });
+    db = new DatabaseSync(join(dir, 'raw', `${market}.sqlite`), { readOnly: true });
   } catch {
     return [];
   }
@@ -315,4 +316,36 @@ test('⑦ a depth snapshot is recorded twice: once as book_updates and once unde
     assert.equal(envelope.payload.seq, 42);
     assert.equal(envelope.event_ts_ms, 1_792_000_005_000);
   });
+});
+
+test('⑦b a trade frame on the real receive path is recorded under trades, never under the book', async () => {
+  // A real adapter, not the fake: this proves the Set 7b wiring end to end - the trade reaches the
+  // connection (which drops it from the board), and `rawEventFor` writes it to the canonical raw.
+  const adapter = createBybitSpotAdapter({ market: 'bybit_spot' });
+  await withIngest(
+    async ({ dir, process, sockets }) => {
+      process.start();
+      await until(() => sockets.length === 1);
+      sockets[0].onopen();
+      sockets[0].deliver(JSON.stringify({
+        topic: 'publicTrade.BTCUSDT',
+        type: 'snapshot',
+        data: [{ s: 'BTCUSDT', S: 'Buy', p: '100', v: '1.5', T: 1_792_000_000_111, i: 'trade-1' }],
+      }));
+      process.stop();
+      process.close();
+
+      const rows = readBatches(dir, 'bybit_spot');
+      assert.deepEqual([...new Set(rows.map((row) => row.stream))], ['trades'], 'the trade is recorded, nothing on the book streams');
+      const [line] = decodeLines(rows[0].raw_gzip);
+      const envelope = JSON.parse(line);
+      assert.equal(envelope.market, 'bybit_spot');
+      assert.equal(envelope.stream, 'trades');
+      assert.equal(envelope.source_id, 'trade-1');
+      assert.equal(envelope.payload.market, 'bybit_spot');
+      assert.equal(envelope.payload.side, 'buy');
+      assert.equal(envelope.payload.tradeId, 'trade-1');
+    },
+    { adapter, market: 'bybit_spot' },
+  );
 });

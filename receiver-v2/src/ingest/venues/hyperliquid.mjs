@@ -35,6 +35,8 @@
  * fetches it.
  */
 
+import { rawTrade, rawBook, collapse } from './raw-shape.mjs';
+
 const HYPERLIQUID_COINS = Object.freeze({
   hyperliquid_perp: Object.freeze(['BTC']),
 });
@@ -93,11 +95,44 @@ function makeHyperliquidAdapter({ market = 'hyperliquid_perp', symbol = 'BTC', u
   let failed = false;
   let provenFailed = false;
 
+  // Set 7b: the raw mirror of the l2Book, held in the venue's own level strings, so an update can be
+  // written as v1 wrote it - only the levels that changed, a removed level as size '0'
+  // (`lib/hyperliquid-connector.mjs:82-110`). `emittedSnapshot` mirrors v1's one-shot `ws_sync`
+  // snapshot, taken from the first l2Book of a connection.
+  let rawMirror = { bids: new Map(), asks: new Map() };
+  let emittedSnapshot = false;
+
   function resetState() {
     lastAcceptedMs = null;
     lastProvenMs = null;
     failed = false;
     provenFailed = false;
+    rawMirror = { bids: new Map(), asks: new Map() };
+    emittedSnapshot = false;
+  }
+
+  /** v1's changed-level diff: old prices first, then new ones, a level absent on a side written '0'. */
+  function changedLevels(oldMap, pairs) {
+    const order = [];
+    const seen = new Set();
+    for (const price of oldMap.keys()) {
+      seen.add(price);
+      order.push(price);
+    }
+    for (const [price] of pairs) {
+      if (!seen.has(price)) {
+        seen.add(price);
+        order.push(price);
+      }
+    }
+    const next = new Map(pairs);
+    const changed = [];
+    for (const price of order) {
+      const oldQty = oldMap.get(price) ?? '0';
+      const newQty = next.get(price) ?? '0';
+      if (oldQty !== newQty) changed.push([price, newQty]);
+    }
+    return changed;
   }
 
   /**
@@ -309,6 +344,53 @@ function makeHyperliquidAdapter({ market = 'hyperliquid_perp', symbol = 'BTC', u
       }
       lastProvenMs = frame.ms;
       return true;
+    },
+
+    /**
+     * Set 7b: classify one received frame as a raw record, an array of records, or null. The payloads
+     * are the running v1 store's, measured 2026-10-10 (`hyperliquid_perp`): an `l2Book` is a full
+     * replacement, but v1 wrote it two ways - the first frame of a connection as a
+     * `{snapshot_origin:'ws_sync', type:'snapshot', bids, asks, ts, seq:null}` (to both streams), and
+     * every frame after as `{type:'update', bids:<changed>, asks:<changed>, ts}` with NO `seq` and no
+     * other key (the changed-level diff, a removed level written as '0'). A trade is v1's
+     * `{market, price, qty, side, ts, tradeId}` (`px`/`sz`, `side === 'B'`, `time`, `tid`).
+     */
+    rawEventFor(frame) {
+      const data = asObject(frame?.raw);
+      if (data === null) return null;
+      if (data.channel === 'trades') {
+        if (!isTradeFrame(data)) return null;
+        const out = [];
+        for (const trade of data.data) {
+          const ts = normaliseTs(trade.time);
+          if (ts === null || ts <= 0) continue;
+          out.push(rawTrade({ market, price: Number(trade.px), qty: Number(trade.sz), side: trade.side === 'B' ? 'buy' : 'sell', ts, tradeId: trade.tid }));
+        }
+        return collapse(out);
+      }
+      if (data.channel !== 'l2Book') return null;
+      if (bookFrameOf(data) === null) return null;
+      const body = data.data;
+      const rowsOf = (levels) => (Array.isArray(levels) ? levels.map((level) => [String(level.px), String(level.sz)]) : []);
+      const bids = rowsOf(body.levels?.[0]);
+      const asks = rowsOf(body.levels?.[1]);
+      const ts = normaliseTs(body.time);
+      if (ts === null || ts <= 0) return null;
+      const out = [];
+      if (!emittedSnapshot) {
+        emittedSnapshot = true;
+        const payload = { snapshot_origin: 'ws_sync', type: 'snapshot', bids, asks, ts, seq: null };
+        const write = (stream) => rawBook({ market, stream, payload, event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true });
+        out.push(write('book_updates'), write('snapshots'));
+      }
+      const changedBids = changedLevels(rawMirror.bids, bids);
+      const changedAsks = changedLevels(rawMirror.asks, asks);
+      rawMirror = { bids: new Map(bids), asks: new Map(asks) };
+      if (changedBids.length > 0 || changedAsks.length > 0) {
+        const payload = { type: 'update', bids: changedBids, asks: changedAsks, ts };
+        out.push(rawBook({ market, payload, event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true }));
+      }
+      return collapse(out);
     },
 
     /** The book time (ms), for the envelope's `meta.venue_seq`. Only l2Book frames have one. */

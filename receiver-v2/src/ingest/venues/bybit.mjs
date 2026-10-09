@@ -35,6 +35,8 @@
  * missing one fails closed into a resubscribe rather than a second source of the same book.
  */
 
+import { rawTrade, rawBook, rawLiquidation, collapse } from './raw-shape.mjs';
+
 const BYBIT_SYMBOLS = new Set(['BTCUSDT']);
 
 const LINEAR_WS = 'wss://stream.bybit.com/v5/public/linear';
@@ -334,6 +336,68 @@ function makeBybitAdapter({ market, category, symbol = 'BTCUSDT', bookDepth, url
       if (lastProvenU !== null && u <= lastProvenU) return false;
       lastProvenU = u;
       return true;
+    },
+
+    /**
+     * Set 7b: classify one received frame as a raw record, or an array of records (a frame carrying
+     * several trades, or a snapshot written to both `book_updates` and `snapshots`), or null. The
+     * payloads are the running v1 store's, measured 2026-10-10 (`bybit_spot`/`bybit_perp`):
+     * a delta is `{prev_seq: <the previous update id>, type:'update', bids, asks, ts, seq}` and a
+     * snapshot is `{snapshot_origin:'ws_sync', type:'snapshot', bids, asks, ts, seq}` - the two are
+     * not the same shape, and a delta is never written as a `snapshots` row. A trade is v1's
+     * `{market, price, qty, side, ts, tradeId}` (`t.p`/`t.v`, `S === 'Buy'`, `T`, `i`).
+     */
+    rawEventFor(frame) {
+      const data = asObject(frame?.raw);
+      if (data === null || typeof data.topic !== 'string') return null;
+      if (data.topic === tradeTopic) {
+        if (!isTradeFrame(data)) return null;
+        const out = [];
+        for (const row of data.data) {
+          const ts = Number.isInteger(row.T) && row.T > 0 ? row.T : null;
+          if (ts === null) continue;
+          out.push(rawTrade({ market, price: Number(row.p), qty: Number(row.v), side: row.S === 'Buy' ? 'buy' : 'sell', ts, tradeId: row.i }));
+        }
+        return collapse(out);
+      }
+      if (liquidationTopic !== null && data.topic === liquidationTopic) {
+        if (!isLiquidationFrame(data)) return null;
+        const rows = Array.isArray(data.data) ? data.data : [data.data];
+        const out = [];
+        for (const row of rows) {
+          const price = Number(row.p);
+          const qty = Number(row.v);
+          if (!(price > 0) || !(qty > 0)) continue;
+          out.push(rawLiquidation({
+            market, exchange: 'bybit', symbol: row.s ?? symbol, side: row.S === 'Sell' ? 'sell' : 'buy',
+            price, qty, notional: price * qty, raw_type: 'liquidation', trade_id: null,
+            source_ts: Number.isInteger(row.T) ? row.T : null, ts: frame.atMs,
+          }));
+        }
+        return collapse(out);
+      }
+      if (data.topic === bookTopic) {
+        const book = bookFrameOf(data);
+        if (book === null) return null;
+        const bids = book.data.b.map((level) => [String(level[0]), String(level[1])]);
+        const asks = book.data.a.map((level) => [String(level[0]), String(level[1])]);
+        // Bybit puts the message time at the top level (`{topic, type, ts, data}`), and its orderbook
+        // `data` carries no `ts` of its own; v1 falls back the same way (`data.data?.ts ?? data.ts`,
+        // `lib/bybit-connector.mjs:61`). Reading only `data.ts` returned null and dropped every normal
+        // frame - the whole board missing from the raw.
+        const rawTs = book.data.ts ?? book.ts;
+        const ts = Number.isInteger(rawTs) && rawTs > 0 ? rawTs : null;
+        if (ts === null) return null;
+        const updateId = book.data.u ?? book.u;
+        if (book.type === 'snapshot') {
+          const payload = { snapshot_origin: 'ws_sync', type: 'snapshot', bids, asks, ts, seq: updateId };
+          const write = (stream) => rawBook({ market, stream, payload, event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true });
+          return [write('book_updates'), write('snapshots')];
+        }
+        const payload = { prev_seq: lastAcceptedU, type: 'update', bids, asks, ts, seq: updateId };
+        return rawBook({ market, payload, event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true });
+      }
+      return null;
     },
 
     /** The update id, for the envelope's `meta.venue_seq`. Only book frames have one. */

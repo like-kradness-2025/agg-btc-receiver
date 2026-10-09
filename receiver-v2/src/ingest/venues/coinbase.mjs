@@ -28,6 +28,8 @@
  * the subscription's own synchronization path and the adapter never fetches it.
  */
 
+import { rawTrade, rawBook, collapse } from './raw-shape.mjs';
+
 const COINBASE_PRODUCTS = Object.freeze({
   coinbase_spot: Object.freeze(['BTC-USD']),
 });
@@ -338,6 +340,57 @@ function makeCoinbaseAdapter({ market = 'coinbase_spot', symbol = 'BTC-USD', url
       }
       lastProvenSeq = frame.seq;
       return true;
+    },
+
+    /**
+     * Set 7b: classify one received frame as a raw record, an array of records, or null. The payloads
+     * are the running v1 store's, measured 2026-10-10 (`coinbase_spot`): a book frame carries
+     * `event_time_source:'local'` (the venue gives no exchange time for the book) and either
+     * `{prev_seq, type:'update', bids, asks, ts, seq}` or `{snapshot_origin:'ws_sync',
+     * event_time_source:'local', type:'snapshot', bids, asks, ts, seq}`. A trade is v1's
+     * `{market, price, qty, side, ts, tradeId}` plus `trade_event_type`. The trade side keeps v1's
+     * exact mapping (`lib/coinbase-connector.mjs:218-224`: `SELL` -> `'buy'`), which is what the v1
+     * store holds and what the downstream reads - not the intuitive mapping, but the measured one.
+     */
+    rawEventFor(frame) {
+      const data = asObject(frame?.raw);
+      if (data === null) return null;
+      if (data.channel === 'market_trades') {
+        if (!isTradeFrame(data)) return null;
+        const out = [];
+        for (const event of data.events) {
+          for (const trade of event.trades) {
+            const ts = Date.parse(trade.time);
+            if (!Number.isFinite(ts) || ts <= 0) continue;
+            out.push(rawTrade({
+              market, price: Number(trade.price), qty: Number(trade.size),
+              side: trade.side === 'SELL' ? 'buy' : 'sell', ts, tradeId: trade.trade_id,
+              extra: { trade_event_type: event.type },
+            }));
+          }
+        }
+        return collapse(out);
+      }
+      if (data.channel === 'l2_data') {
+        const book = l2FrameOf(data);
+        if (book === null) return null;
+        const bids = [];
+        const asks = [];
+        for (const event of book.events) {
+          for (const update of event.updates) {
+            (update.side === 'bid' ? bids : asks).push([String(update.price_level), String(update.new_quantity)]);
+          }
+        }
+        const ts = frame.atMs;
+        if (book.type === 'snapshot') {
+          const payload = { snapshot_origin: 'ws_sync', event_time_source: 'local', type: 'snapshot', bids, asks, ts, seq: book.seq };
+          const write = (stream) => rawBook({ market, stream, payload, event_ts_ms: ts });
+          return [write('book_updates'), write('snapshots')];
+        }
+        const payload = { prev_seq: lastAcceptedSeq, event_time_source: 'local', type: 'update', bids, asks, ts, seq: book.seq };
+        return rawBook({ market, payload, event_ts_ms: ts });
+      }
+      return null;
     },
 
     /** The book sequence, for the envelope's `meta.venue_seq`. Only l2 frames have one. */

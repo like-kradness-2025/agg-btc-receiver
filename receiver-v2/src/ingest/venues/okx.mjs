@@ -36,6 +36,8 @@
  * one fails closed into a resubscribe rather than a second source of the same book.
  */
 
+import { rawTrade, rawBook, rawLiquidation, collapse } from './raw-shape.mjs';
+
 const OKX_INSTRUMENTS = Object.freeze({
   okx_perp: Object.freeze(['BTC-USDT-SWAP']),
   okx_spot: Object.freeze(['BTC-USDT']),
@@ -77,7 +79,7 @@ function validLevel(level) {
   return price !== null && price > 0 && size !== null && size >= 0;
 }
 
-function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, restUrl = null, bookDepth = 400 } = {}) {
+function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, restUrl = null, bookDepth = 400, contractValue = 1 } = {}) {
   const known = OKX_INSTRUMENTS[market];
   if (!Array.isArray(known) || !known.includes(symbol)) {
     throw new TypeError(`unsupported OKX instrument for ${market}: ${symbol}`);
@@ -358,6 +360,66 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
       return true;
     },
 
+    /**
+     * Set 7b: classify one received frame as a raw record, an array of records, or null. The payloads
+     * are the running v1 store's, measured 2026-10-10 (`okx_spot`/`okx_perp`): an update is
+     * `{prev_seq, type:'update', bids, asks, ts, seq}` (the venue's own `prevSeqId` when present, else
+     * the last accepted `seqId`), a snapshot is `{snapshot_origin:'ws_sync', type:'snapshot', bids,
+     * asks, ts, seq}`. A trade is v1's `{market, price, qty, side, ts, tradeId}` with `qty` in coin
+     * (`sz * ctVal`); a liquidation is v1's `{market, exchange, symbol, side, price, qty, notional,
+     * raw_type:'liquidation-orders', trade_id, source_ts, ts}`.
+     */
+    rawEventFor(frame) {
+      const data = asObject(frame?.raw);
+      if (data === null) return null;
+      const channel = data.arg?.channel;
+      if (channel === 'trades') {
+        if (data.arg?.instId !== symbol || !isTradeFrame(data)) return null;
+        const out = [];
+        for (const row of data.data) {
+          const ts = Number(row.ts);
+          if (!Number.isInteger(ts) || ts <= 0) continue;
+          out.push(rawTrade({ market, price: Number(row.px), qty: Number(row.sz) * contractValue, side: row.side === 'buy' ? 'buy' : 'sell', ts, tradeId: row.tradeId }));
+        }
+        return collapse(out);
+      }
+      if (channel === 'liquidation-orders') {
+        const rows = ourLiquidationRows(data);
+        if (rows === null || rows.length === 0) return null;
+        const out = [];
+        for (const row of rows) {
+          for (const detail of row.details) {
+            const price = Number(detail.fillPx ?? detail.bkPx);
+            const qty = Number(detail.sz) * contractValue;
+            if (!(price > 0) || !(qty > 0)) continue;
+            const sourceTs = Number(detail.ts);
+            out.push(rawLiquidation({
+              market, exchange: 'okx', symbol: row.instId, side: detail.side === 'buy' ? 'buy' : 'sell',
+              price, qty, notional: price * qty, raw_type: 'liquidation-orders', trade_id: null,
+              source_ts: Number.isInteger(sourceTs) && sourceTs > 0 ? sourceTs : null, ts: frame.atMs,
+            }));
+          }
+        }
+        return collapse(out);
+      }
+      if (channel === 'books') {
+        const book = bookFrameOf(data);
+        if (book === null) return null;
+        const bids = book.bids.map((level) => [String(level[0]), String(level[1])]);
+        const asks = book.asks.map((level) => [String(level[0]), String(level[1])]);
+        const ts = Number(data.data?.[0]?.ts);
+        if (!Number.isInteger(ts) || ts <= 0) return null;
+        if (book.action === 'snapshot') {
+          const payload = { snapshot_origin: 'ws_sync', type: 'snapshot', bids, asks, ts, seq: book.seqId };
+          const write = (stream) => rawBook({ market, stream, payload, event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true });
+          return [write('book_updates'), write('snapshots')];
+        }
+        const payload = { prev_seq: Number.isInteger(book.prevSeqId) ? book.prevSeqId : lastAcceptedSeq, type: 'update', bids, asks, ts, seq: book.seqId };
+        return rawBook({ market, payload, event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true });
+      }
+      return null;
+    },
+
     /** The book sequence, for the envelope's `meta.venue_seq`. Only book frames have one. */
     venueSeqOf(raw) {
       const frame = bookFrameOf(raw);
@@ -368,7 +430,9 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
 
 /** The USDT perpetual (BTC-USDT-SWAP): books at 400 levels, trades, and liquidations. */
 export function createOkxPerpAdapter({ market = 'okx_perp', symbol = 'BTC-USDT-SWAP', bookDepth = 400, url = null, restUrl = null } = {}) {
-  return makeOkxAdapter({ market, symbol, instType: 'SWAP', liquidation: true, bookDepth, url, restUrl });
+  // v1 measured the swap contract as 0.01 BTC (`lib/okx-connector.mjs:17`); a trade or liquidation
+  // size is contracts, so the raw qty is `sz * ctVal` exactly as v1 emitted it.
+  return makeOkxAdapter({ market, symbol, instType: 'SWAP', liquidation: true, bookDepth, url, restUrl, contractValue: 0.01 });
 }
 
 /** The Spot market (BTC-USDT): books at 400 levels and trades. */

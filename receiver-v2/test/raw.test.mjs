@@ -360,9 +360,13 @@ test('the Binance depth adapter classifies a depth frame and lets a snapshot thr
   const spotWithPu = { ...depthFrame, data: { ...depthFrame.data, pu: 156 } };
   assert.equal(adapter.rawEventFor({ raw: JSON.stringify(spotWithPu) }).payload.prev_seq, undefined, 'spot never writes prev_seq');
 
-  // A trade frame is not a Set 7a raw record: rawEventFor returns null and nothing is written for it.
-  const tradeFrame = { stream: 'btcusdt@trade', data: { e: 'trade', s: 'BTCUSDT', p: '100', q: '1', t: 1 } };
-  assert.equal(adapter.rawEventFor({ raw: JSON.stringify(tradeFrame) }), null);
+  // A trade frame is a Set 7b raw record: v1's `{market, price, qty, side, ts, tradeId}` (`t` is the
+  // trade id, `m` the maker flag, `T` the trade time). Set 7b's own test file fixes each venue's shape.
+  const tradeFrame = { stream: 'btcusdt@trade', data: { e: 'trade', s: 'BTCUSDT', p: '100', q: '1', t: 1, T: 1_792_000_000_000, m: false } };
+  const tradeRecord = adapter.rawEventFor({ raw: JSON.stringify(tradeFrame) });
+  assert.equal(tradeRecord.stream, 'trades');
+  assert.equal(tradeRecord.payload.tradeId, '1');
+  assert.equal(tradeRecord.payload.market, 'binance_spot');
 
   // The REST snapshot applied by the synchronizer reaches the sink as a raw snapshot record.
   const seen = [];

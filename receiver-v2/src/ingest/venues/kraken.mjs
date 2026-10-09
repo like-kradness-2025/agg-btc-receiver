@@ -26,6 +26,8 @@
  * answer honestly.
  */
 
+import { rawTrade, rawBook, collapse } from './raw-shape.mjs';
+
 const IGNORED_EVENTS = new Set(['systemStatus', 'heartbeat', 'pong', 'ping']);
 
 function normalizeSubscriptionSymbols(value) {
@@ -224,6 +226,22 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
     return side(book.asks, 'ask') + side(book.bids, 'bid');
   }
 
+  /**
+   * Set 7b: the v1 payload for one Kraken book frame. Measured 2026-10-10 (`kraken_spot`): a book
+   * frame is `{checksum, sequence_mode:'checksum', event_time_source:'local', type, bids, asks, ts}`
+   * - the venue gives a checksum, not a sequence, so there is NO `seq` key at all (v1 passed
+   * `undefined`, which JSON drops), and the event time is local (Kraken book frames carry none). A
+   * `snapshot` is written to both `book_updates` and `snapshots`.
+   */
+  function bookRecords(type, checksum, bids, asks, atMs) {
+    const payload = { checksum: checksum ?? null, sequence_mode: 'checksum', event_time_source: 'local', type, bids, asks, ts: atMs };
+    if (type === 'snapshot') {
+      const write = (stream) => rawBook({ market, stream, payload, event_ts_ms: atMs });
+      return [write('book_updates'), write('snapshots')];
+    }
+    return rawBook({ market, payload, event_ts_ms: atMs });
+  }
+
   return {
     url: url ?? 'wss://ws.kraken.com/v2',
     stream,
@@ -396,6 +414,90 @@ export function createKrakenAdapter({ market = 'kraken_spot', symbol, bookDepth 
       mirrorSeeded = true;
       mirrorConnectionId = connectionId ?? mirrorConnectionId;
       return true;
+    },
+
+    /**
+     * Set 7b: classify one received frame as a raw record, an array of records, or null. Both frame
+     * forms this adapter accepts are translated to the v1 payload: the v2 API object form (the one
+     * this adapter subscribes to) and the v1 API array form. A trade is v1's
+     * `{market, price, qty, side, ts, tradeId}` - the array form rebuilds v1's own composite trade id
+     * (`${time}-${price}-${qty}-${orderType}-${misc}`), the object form uses the venue's `trade_id`.
+     */
+    rawEventFor(frame) {
+      const raw = frame?.raw;
+      const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw ?? '');
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return null;
+      }
+      const atMs = Number.isFinite(frame?.atMs) && frame.atMs > 0 ? Math.floor(frame.atMs) : Date.now();
+
+      if (!Array.isArray(data) && data?.channel === 'book') {
+        if (data.type !== 'snapshot' && data.type !== 'update') return null;
+        const bids = [];
+        const asks = [];
+        let checksum = null;
+        for (const row of Array.isArray(data.data) ? data.data : []) {
+          if (!row || row.symbol !== symbol) continue;
+          if (row.checksum != null && checksum === null) checksum = Number.isFinite(Number(row.checksum)) ? Number(row.checksum) : row.checksum;
+          for (const level of Array.isArray(row.bids) ? row.bids : []) bids.push([String(level.price), String(level.qty)]);
+          for (const level of Array.isArray(row.asks) ? row.asks : []) asks.push([String(level.price), String(level.qty)]);
+        }
+        return bookRecords(data.type, checksum, bids, asks, atMs);
+      }
+
+      if (!Array.isArray(data) && data?.channel === 'trade') {
+        const out = [];
+        for (const row of Array.isArray(data.data) ? data.data : []) {
+          if (!row || row.symbol !== symbol) continue;
+          const price = Number(row.price);
+          const qty = Number(row.qty);
+          if (!(price > 0) || !(qty > 0)) continue;
+          let ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : Number(row.timestamp);
+          if (!Number.isFinite(ts) || ts <= 0) {
+            const seconds = Number(String(row.trade_id ?? '').split('-')[0]);
+            ts = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds * 1000) : null;
+          }
+          if (ts === null) continue;
+          out.push(rawTrade({ market, price, qty, side: row.side === 'sell' ? 'sell' : 'buy', ts, tradeId: row.trade_id }));
+        }
+        return collapse(out);
+      }
+
+      if (Array.isArray(data)) {
+        const { channel, payloads } = channelOf(data);
+        if (channel && channel.startsWith('book-')) {
+          let checksum = null;
+          let type = 'update';
+          const bids = [];
+          const asks = [];
+          for (const payload of payloads) {
+            if (payload.c != null && checksum === null) checksum = Number.isFinite(Number(payload.c)) ? Number(payload.c) : payload.c;
+            if (payload.as !== undefined || payload.bs !== undefined) type = 'snapshot';
+            for (const level of Array.isArray(payload.b ?? payload.bs) ? payload.b ?? payload.bs : []) bids.push([String(level[0]), String(level[1])]);
+            for (const level of Array.isArray(payload.a ?? payload.as) ? payload.a ?? payload.as : []) asks.push([String(level[0]), String(level[1])]);
+          }
+          return bookRecords(type, checksum, bids, asks, atMs);
+        }
+        if (isTradeFrame(data)) {
+          const out = [];
+          for (const t of Array.isArray(data[1]) ? data[1] : []) {
+            if (!Array.isArray(t) || t.length < 4) continue;
+            const price = Number(t[0]);
+            const qty = Number(t[1]);
+            const seconds = Number(t[2]);
+            if (!(price > 0) || !(qty > 0) || !Number.isFinite(seconds) || seconds <= 0) continue;
+            out.push(rawTrade({
+              market, price, qty, side: t[3] === 's' ? 'sell' : 'buy', ts: Math.floor(seconds * 1000),
+              tradeId: `${t[2]}-${t[0]}-${t[1]}-${t[4] ?? ''}-${t[5] ?? ''}`,
+            }));
+          }
+          return collapse(out);
+        }
+      }
+      return null;
     },
 
     // Kraken book frames carry a checksum rather than a sequence number, so there is no venue

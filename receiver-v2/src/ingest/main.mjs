@@ -327,25 +327,31 @@ export function createIngestProcess({
     if (raw === null) return;
     const derived = adapter?.rawEventFor ? adapter.rawEventFor(frame) : null;
     if (!derived) return;
+    // Set 7b: one frame can carry more than one raw record - a trade frame with several trades, or a
+    // snapshot the adapter writes to both `book_updates` and `snapshots`. Set 7a's single-record
+    // return is unchanged (an object), so an adapter that still returns one record still works.
+    const records = Array.isArray(derived) ? derived : [derived];
     try {
-      raw.append({
-        market,
-        stream: derived.stream,
-        event_ts_ms: derived.event_ts_ms,
-        recv_ts_ms: frame.atMs,
-        recv_mono_ns: frame.atNs,
-        // The raw's own arrival counter, not the stamped receive sequence: v1 numbered every frame it
-        // heard on the way in, including the frames its synchronization later refused, and the raw is
-        // the record of the hearing.
-        receive_seq: frame.arrivalSeq,
-        worker_seq: frame.arrivalSeq,
-        connection_id: frame.connectionId,
-        sequence_order: frame.arrivalSeq,
-        source_event_ts_ms: derived.source_event_ts_ms ?? null,
-        source_event_time_known: derived.source_event_time_known === true,
-        source_id: derived.source_id ?? null,
-        payload: derived.payload,
-      });
+      for (const record of records) {
+        raw.append({
+          market,
+          stream: record.stream,
+          event_ts_ms: record.event_ts_ms,
+          recv_ts_ms: frame.atMs,
+          recv_mono_ns: frame.atNs,
+          // The raw's own arrival counter, not the stamped receive sequence: v1 numbered every frame it
+          // heard on the way in, including the frames its synchronization later refused, and the raw is
+          // the record of the hearing.
+          receive_seq: frame.arrivalSeq,
+          worker_seq: frame.arrivalSeq,
+          connection_id: frame.connectionId,
+          sequence_order: frame.arrivalSeq,
+          source_event_ts_ms: record.source_event_ts_ms ?? null,
+          source_event_time_known: record.source_event_time_known === true,
+          source_id: record.source_id ?? null,
+          payload: record.payload,
+        });
+      }
     } catch (error) {
       try {
         onDiagnostic({ market, reason: `the canonical raw could not be written: ${error.message}` });

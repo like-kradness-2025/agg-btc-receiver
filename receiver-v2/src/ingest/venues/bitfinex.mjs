@@ -1,5 +1,7 @@
 /** Bitfinex public aggregated book adapter (SEQ_ALL + OB_CHECKSUM). */
 
+import { rawBook } from './raw-shape.mjs';
+
 const INFO_RECONNECT = 20051;
 const INFO_MAINTENANCE_START = 20060;
 const INFO_MAINTENANCE_END = 20061;
@@ -37,12 +39,14 @@ export function createBitfinexAdapter({
   let mirror = { bids: new Map(), asks: new Map() };
   let pending = [];
   let failed = false;
+  let sawSnapshot = false;
 
   function resetState() {
     lastSeq = null;
     mirror = { bids: new Map(), asks: new Map() };
     pending = [];
     failed = false;
+    sawSnapshot = false;
     channelById.clear();
   }
   function checksumInput(book) {
@@ -189,6 +193,41 @@ export function createBitfinexAdapter({
       if (!Number.isInteger(currentSeq)) return false;
       const previousSeq = Number.isInteger(previous?.meta?.venue_seq) ? previous.meta.venue_seq : null;
       return previousSeq === null || currentSeq === previousSeq + 1;
+    },
+    /**
+     * Set 7b: classify one received frame as a raw record (or an array, for a snapshot's second
+     * write), or null. The payload is the running v1 store's, measured 2026-10-10 (`bitfinex_spot`):
+     * `{event_time_source:'local', type, bids, asks, ts, seq:null}` - the venue gives no exchange book
+     * time and no sequence, so the time is local and `seq` is null. A board frame whose body is a
+     * nested array is the whole book (`type:'snapshot'`); a single `[price, count, amount]` is a
+     * diff, and v1 called the first diff before any snapshot a snapshot too. Trades are not part of
+     * this adapter (v2 does not subscribe to Bitfinex trades; that is Set 8's catalog item).
+     */
+    rawEventFor(frame) {
+      const data = jsonOf(frame?.raw);
+      if (!Array.isArray(data) || !Number.isInteger(data[0]) || !channelById.has(data[0])) return null;
+      const parsed = protocolFrame(data);
+      if (!parsed || parsed.kind !== 'data') return null;
+      const book = changesOfData(data);
+      if (!book) return null;
+      const bids = [];
+      const asks = [];
+      for (const level of book.levels) {
+        const normalized = levelOf(level);
+        if (!normalized) continue;
+        const side = funding ? (normalized.amount < 0 ? 'bid' : 'ask') : (normalized.amount > 0 ? 'bid' : 'ask');
+        const qty = normalized.count === 0 ? '' : String(Math.abs(normalized.amount));
+        (side === 'bid' ? bids : asks).push([String(normalized.price), qty]);
+      }
+      const type = book.snapshot || !sawSnapshot ? 'snapshot' : 'update';
+      if (book.snapshot) sawSnapshot = true;
+      const atMs = Number.isFinite(frame?.atMs) && frame.atMs > 0 ? Math.floor(frame.atMs) : Date.now();
+      const payload = { event_time_source: 'local', type, bids, asks, ts: atMs, seq: null };
+      if (type === 'snapshot') {
+        const write = (stream) => rawBook({ market, stream, payload, event_ts_ms: atMs });
+        return [write('book_updates'), write('snapshots')];
+      }
+      return rawBook({ market, payload, event_ts_ms: atMs });
     },
     venueSeqOf(raw) { const data = jsonOf(raw); return sequenceOf(data); },
   };

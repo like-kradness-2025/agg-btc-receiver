@@ -1,5 +1,7 @@
 /** Binance Spot and USDⓈ-M Futures market adapters. */
 
+import { rawTrade, rawBook } from './raw-shape.mjs';
+
 const SPOT_SYMBOLS = new Set(['BTCUSDT', 'BTCUSDC', 'BTCFDUSD']);
 const DEFAULT_SPOT_WS = 'wss://stream.binance.com:9443/stream';
 const DEFAULT_SPOT_REST = 'https://api.binance.com/api/v3/depth';
@@ -189,7 +191,23 @@ function makeAdapter({ market, symbol, url, tradeUrl, restUrl, streams, depthStr
      */
     rawEventFor(frame) {
       const wrapper = parseWrapper(frame?.raw);
-      if (wrapper === null || wrapper.stream !== depthStream) return null;
+      if (wrapper === null) return null;
+      // Set 7b: a trade frame is a raw record too. v1 kept one `trades` row per emitted trade
+      // (`lib/base-connector.mjs:559`), keyed `{market, price, qty, side, ts, tradeId}` with the
+      // venue's fields: `p`/`q`, the maker flag `m` (true is the seller), the trade time `T` and the
+      // trade id `t` (spot `@trade` and the futures/perpetual trade stream both carry it; the
+      // aggregate stream names it `a`).
+      if (wrapper.stream === tradeStream) {
+        if (!tradeOf(wrapper.data)) return null;
+        const data = wrapper.data;
+        const ts = Number.isInteger(data.T) && data.T > 0 ? data.T : null;
+        if (ts === null) return null;
+        return rawTrade({
+          market, price: Number(data.p), qty: Number(data.q),
+          side: data.m ? 'sell' : 'buy', ts, tradeId: data.t ?? data.a,
+        });
+      }
+      if (wrapper.stream !== depthStream) return null;
       const event = depthOf(wrapper);
       if (!event) return null;
       const eventTs = Number.isInteger(event.E) && event.E > 0 ? event.E : Date.now();
@@ -209,13 +227,13 @@ function makeAdapter({ market, symbol, url, tradeUrl, restUrl, streams, depthStr
         book_apply: 'candidate',
       };
       if (bookPrevSeqFromVenue && Number.isInteger(event.pu)) payload.prev_seq = event.pu;
-      return {
-        stream: 'book_updates',
+      return rawBook({
+        market,
+        payload,
         event_ts_ms: eventTs,
         source_event_ts_ms: sourceKnown ? event.E : null,
         source_event_time_known: sourceKnown,
-        payload,
-      };
+      });
     },
     get needsResync() { return sync.needsResync; }, get lastUpdateId() { return sync.lastUpdateId; },
     get connectionId() { return sync.connectionId; }, async syncDepth() { return sync.sync([]); },

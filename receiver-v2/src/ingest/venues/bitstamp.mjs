@@ -33,6 +33,8 @@
  *    websocket-level pings, kept here as the adapter's no-activity form.
  */
 
+import { rawTrade, rawBook, collapse } from './raw-shape.mjs';
+
 const BITSTAMP_SYMBOLS = Object.freeze({
   bitstamp_spot: Object.freeze(['BTC/USD']),
 });
@@ -139,7 +141,7 @@ function snapshotShape(payload) {
  * discarded, and an equal stamp is not stale at all. A new connection resets everything; a sync
  * that gives up leaves the stream unsynchronized rather than half-synchronized.
  */
-export function createBitstampSynchronizer({ fetchSnapshot, symbol = 'BTC/USD' } = {}) {
+export function createBitstampSynchronizer({ fetchSnapshot, symbol = 'BTC/USD', onSnapshot = null } = {}) {
   const pair = String(symbol).replace('/', '').toLowerCase();
   const diffOf = makeDiffOf(`diff_order_book_${pair}`);
 
@@ -167,6 +169,9 @@ export function createBitstampSynchronizer({ fetchSnapshot, symbol = 'BTC/USD' }
     snapshotChangesPending = true;
     synced = true;
     needsResync = false;
+    // Set 7b: the REST snapshot is not a socket frame, so the adapter hands it to whoever is
+    // recording the raw through this sink, at the exact point it is applied.
+    if (typeof onSnapshot === 'function') onSnapshot({ payload, boundary: boundaryUs });
     return { status: 'snapshot', boundary: boundaryUs };
   }
 
@@ -299,8 +304,39 @@ function makeBitstampAdapter({ market = 'bitstamp_spot', symbol = 'BTC/USD', url
     JSON.stringify({ event: 'bts:subscribe', data: { channel: diffChannel } }),
   ];
 
+  // Set 7b: the raw sink for the REST snapshot. Null until the ingest process installs one; a
+  // snapshot applied with no sink set is simply not recorded, never a crash.
+  let rawSnapshotSink = null;
   const sync = createBitstampSynchronizer({
     symbol,
+    onSnapshot: (snap) => {
+      if (typeof rawSnapshotSink !== 'function') return;
+      // v1's REST-sync snapshot (`lib/bitstamp-connector.mjs:380-386`): the snapshot's own source
+      // microstamp is the event time (source time known), and the origin fields say the boundary came
+      // from the REST reconciliation. The levels keep the REST payload's own strings.
+      const pairs = (levels) => (Array.isArray(levels)
+        ? levels
+          .filter((entry) => Array.isArray(entry) && finiteNumber(entry[0]) !== null && finiteNumber(entry[1]) !== null && Number(entry[1]) > 0)
+          .map((entry) => [String(entry[0]), String(entry[1])])
+        : []);
+      const boundary = Math.floor(snap.boundary / 1000);
+      rawSnapshotSink({
+        event_ts_ms: boundary,
+        source_event_ts_ms: boundary,
+        source_event_time_known: true,
+        payload: {
+          market,
+          snapshot_origin: 'rest_sync',
+          snapshot_asof_ts_ms: boundary,
+          event_time_source: 'rest_snapshot_source',
+          type: 'snapshot',
+          bids: pairs(snap.payload?.bids),
+          asks: pairs(snap.payload?.asks),
+          ts: boundary,
+          seq: null,
+        },
+      });
+    },
     fetchSnapshot: async () => {
       if (typeof fetchImpl !== 'function') throw new TypeError('the Bitstamp depth sync needs fetch');
       const signal =
@@ -464,6 +500,51 @@ function makeBitstampAdapter({ market = 'bitstamp_spot', symbol = 'BTC/USD', url
       if (diffOf(raw) === null) return true;
       const result = sync.accept(raw);
       return result.status !== 'resync' && result.status !== 'malformed';
+    },
+
+    /** Set 7b: install the raw sink for REST snapshots applied by the depth synchronizer. */
+    setRawSnapshotSink(fn) {
+      rawSnapshotSink = typeof fn === 'function' ? fn : null;
+    },
+
+    /**
+     * Set 7b: classify one received frame as a raw record, an array of records, or null. The payloads
+     * are the running v1 store's, measured 2026-10-10 (`bitstamp_spot`): a diff frame is
+     * `{type:'update', bids, asks, ts, seq:null}` with the venue's own level strings and a millisecond
+     * `ts` (the microsecond matching-engine clock), a trade is v1's
+     * `{market, price, qty, side, ts, tradeId}` (`type` 0 = buy, 1 = sell), and the REST snapshot is
+     * delivered through `setRawSnapshotSink`, not here.
+     */
+    rawEventFor(frame) {
+      const data = asObject(frame?.raw);
+      if (data === null) return null;
+      if (data.event === 'data' && data.channel === diffChannel) {
+        const payload = data.data;
+        if (payload === null || typeof payload !== 'object') return null;
+        const us = usOf(payload.microtimestamp);
+        if (us === null) return null;
+        const pairs = (levels) => (Array.isArray(levels)
+          ? levels.filter((entry) => Array.isArray(entry) && finiteNumber(entry[0]) !== null && finiteNumber(entry[1]) !== null).map((entry) => [String(entry[0]), String(entry[1])])
+          : []);
+        const ts = Math.floor(us / 1000);
+        return rawBook({
+          market, payload: { type: 'update', bids: pairs(payload.bids), asks: pairs(payload.asks), ts, seq: null },
+          event_ts_ms: ts, source_event_ts_ms: ts, source_event_time_known: true,
+        });
+      }
+      if (data.event === 'trade' && data.channel === tradeChannel) {
+        const payload = data.data;
+        if (!isTradeFrame(payload)) return null;
+        const us = usOf(payload.microtimestamp);
+        if (us === null) return null;
+        const ts = Math.floor(us / 1000);
+        return rawTrade({
+          market, price: Number(payload.price), qty: Number(payload.amount),
+          side: Number(payload.type) === 0 ? 'buy' : 'sell', ts,
+          tradeId: payload.id ?? payload.trade_id ?? payload.microtimestamp,
+        });
+      }
+      return null;
     },
 
     /** The diff's microsecond stamp, for the envelope's `meta.venue_seq`. Only diff frames have one. */
