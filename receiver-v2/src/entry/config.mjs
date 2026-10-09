@@ -188,6 +188,17 @@ export function loadConfig(configPath) {
     }
     rawDir = raw.rawDir;
   }
+  // Set 8: the auxiliary open-interest REST poll interval. Optional - absent means the poller is off
+  // (the pre-Set-8 behaviour); a positive integer starts the 30 s-style poll. A present value must be
+  // a positive integer so a half-written key fails loudly rather than silently disabling the poll.
+  let oiPollIntervalMs;
+  if (Object.prototype.hasOwnProperty.call(raw, 'oiPollIntervalMs')) {
+    const value = raw.oiPollIntervalMs;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw new TypeError('the config\'s "oiPollIntervalMs" must be a positive integer when present');
+    }
+    oiPollIntervalMs = value;
+  }
   return Object.freeze({
     venue: raw.venue,
     market: raw.market,
@@ -199,6 +210,7 @@ export function loadConfig(configPath) {
     ...(startupDeadlineMs === undefined ? {} : { startupDeadlineMs }),
     ...(routerPath === undefined ? {} : { routerPath }),
     ...(rawDir === undefined ? {} : { rawDir }),
+    ...(oiPollIntervalMs === undefined ? {} : { oiPollIntervalMs }),
     // The venue-specific extras, only when the file carries them. Kraken needs a symbol; Bitfinex
     // defaults to tBTCUSD. A url is optional and defaults inside the adapter.
     symbol: typeof raw.symbol === 'string' && raw.symbol.length > 0 ? raw.symbol : undefined,

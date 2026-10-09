@@ -53,6 +53,7 @@ export function toChildSpec(
       storePath: options.ingestStorePath,
       spoolDir: options.spoolDir,
       rawDir: options.rawDir,
+      ...(Number.isFinite(options.oiPollIntervalMs) && options.oiPollIntervalMs > 0 ? { oiPollIntervalMs: options.oiPollIntervalMs } : {}),
       websocketModule,
       adapterModule,
       adapterSpec,

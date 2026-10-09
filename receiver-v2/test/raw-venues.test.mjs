@@ -56,11 +56,11 @@ test('binance_spot: a @trade frame is a v1 trades record', () => {
   });
 });
 
-test('binance_perp: an @aggTrade frame is a v1 trades record', () => {
+test('binance_perp: a @trade frame is a v1 trades record', () => {
   const adapter = createBinanceFuturesAdapter({ market: 'binance_perp' });
   const record = adapter.rawEventFor(frame({
-    stream: 'btcusdt@aggTrade',
-    data: { e: 'aggTrade', s: 'BTCUSDT', a: 7, p: '101', q: '3', T: 1_792_000_000_500, m: false },
+    stream: 'btcusdt@trade',
+    data: { e: 'trade', s: 'BTCUSDT', t: 7, p: '101', q: '3', T: 1_792_000_000_500, m: false },
   }));
   assert.equal(record.stream, 'trades');
   assert.deepEqual(keysOf(record.payload), TRADE_KEYS);
@@ -392,11 +392,11 @@ for (const [market, symbol, lower, upper] of [['binance_spot_usdc', 'BTCUSDC', '
   });
 }
 
-test('binance_perp_btcusdc: an aggTrade frame is a v1 trades record', () => {
+test('binance_perp_btcusdc: a @trade frame is a v1 trades record', () => {
   const adapter = createBinanceFuturesAdapter({ market: 'binance_perp_btcusdc', symbol: 'BTCUSDC' });
   const record = adapter.rawEventFor(frame({
-    stream: 'btcusdc@aggTrade',
-    data: { e: 'aggTrade', s: 'BTCUSDC', a: 11, p: '82296.9', q: '0.003', T: 1_792_000_000_700, m: false },
+    stream: 'btcusdc@trade',
+    data: { e: 'trade', s: 'BTCUSDC', t: 11, p: '82296.9', q: '0.003', T: 1_792_000_000_700, m: false },
   }));
   assert.deepEqual(keysOf(record.payload), TRADE_KEYS);
   assert.deepEqual(record.payload, {

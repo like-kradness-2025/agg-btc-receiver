@@ -15,7 +15,7 @@ const parse = (payload) => adapter.parse(JSON.stringify(payload));
 const changesOf = (payload) => adapter.changesFor({ raw: Buffer.from(JSON.stringify(payload)) });
 
 test('the subscribe payloads carry the documented fields', () => {
-  const [conf, book] = adapter.subscribeMessages().map((message) => JSON.parse(message));
+  const [conf, book, trades] = adapter.subscribeMessages().map((message) => JSON.parse(message));
   assert.deepEqual(conf, { event: 'conf', flags: 196608 });
   assert.deepEqual(book, {
     event: 'subscribe',
@@ -25,8 +25,9 @@ test('the subscribe payloads carry the documented fields', () => {
     freq: 'F0',
     len: '25',
   });
+  assert.deepEqual(trades, { event: 'subscribe', channel: 'trades', symbol: 'tBTCUSD' });
   assert.equal(adapter.stream, 'book');
-  assert.deepEqual(adapter.expectedSubscriptions(), ['book:tBTCUSD']);
+  assert.deepEqual(adapter.expectedSubscriptions(), ['book:tBTCUSD', 'trades:tBTCUSD']);
   assert.deepEqual(JSON.parse(adapter.heartbeatMessage()), { event: 'ping' });
   assert.equal(adapter.url, 'wss://api-pub.bitfinex.com/ws/2');
 });
@@ -77,7 +78,8 @@ test('the connection admits Bitfinex after synchronous preparation', async () =>
       send(message) {
         const payload = JSON.parse(message);
         if (payload.event === 'subscribe') {
-          queueMicrotask(() => socket.onmessage?.({ data: JSON.stringify({ event: 'subscribed', channel: 'book', symbol: 'tBTCUSD', chanId: 42 }) }));
+          const chanId = payload.channel === 'trades' ? 43 : 42;
+          queueMicrotask(() => socket.onmessage?.({ data: JSON.stringify({ event: 'subscribed', channel: payload.channel, symbol: 'tBTCUSD', chanId }) }));
         }
       },
       close() {},
@@ -281,4 +283,35 @@ test('a checksum mismatch releases nothing and requests resynchronization', () =
   const snapshot = [42, [[50000, 2, 1.5]], 30];
   assert.deepEqual(adapter.acceptDepthEvent(JSON.stringify(snapshot)), { status: 'pending' });
   assert.equal(adapter.acceptDepthEvent(JSON.stringify([42, 'cs', 123, 31])).status, 'resync');
+});
+
+// Bitfinex numbers every message on a connection with one sequence, across channels. A trade frame
+// (including the `te` and trade heartbeats that produce no record) must advance the same counter a
+// book frame does, or the next book frame reads as a gap and the adapter resyncs on healthy traffic.
+test('a trade frame advances the connection sequence so the next book frame is not a gap', () => {
+  const subject = createBitfinexAdapter({ market: 'bitfinex_spot', symbol: 'tBTCUSD' });
+  subject.parse(JSON.stringify({ event: 'subscribed', channel: 'book', symbol: 'tBTCUSD', chanId: 42 }));
+  subject.parse(JSON.stringify({ event: 'subscribed', channel: 'trades', symbol: 'tBTCUSD', chanId: 7 }));
+  assert.equal(subject.acceptDepthEvent(JSON.stringify([42, [[50000, 1, 1]], 1])).status, 'pending');
+  // Sequence 2 rides a trade frame with no book meaning: it still has to be counted.
+  subject.acceptAuxFrame(JSON.stringify([7, 'tu', [1234, 1792000000000, 0.25, 50000], 2]));
+  const next = subject.acceptDepthEvent(JSON.stringify([42, [[50001, 1, 1]], 3]));
+  assert.notEqual(next.status, 'resync', 'sequence 3 follows 2, so there is no gap');
+  // A `te` (immediate, revisable) trade produces no record, but it is still a sequenced message.
+  // Sequence 4: a `te` (immediate, revisable) trade produces no record, but it is still a sequenced
+  // message on the connection.
+  const teFrame = [7, 'te', [1235, 1792000001000, 0.5, 50001], 4];
+  assert.equal(subject.parse(JSON.stringify(teFrame))?.kind, 'data', 'a `te` frame is classified as data so its sequence is counted');
+  assert.equal(subject.rawEventFor({ raw: JSON.stringify(teFrame), atMs: 1792000001000 }), null, 'a `te` frame produces no raw record');
+  subject.acceptAuxFrame(JSON.stringify(teFrame));
+  const afterTe = subject.acceptDepthEvent(JSON.stringify([42, [[50002, 1, 1]], 5]));
+  assert.notEqual(afterTe.status, 'resync', 'sequence 5 follows 4: a dropped `te` still counted');
+  // Sequence 6: a heartbeat on the trade channel carries the same shared sequence and must be counted
+  // the same way the book channel's heartbeat is.
+  const tradeHeartbeat = subject.parse(JSON.stringify([7, 'hb', 6]));
+  assert.equal(tradeHeartbeat?.kind, 'heartbeat', 'a trade-channel heartbeat is still a heartbeat');
+  assert.equal(tradeHeartbeat?.seq, 6);
+  subject.acceptAuxFrame(JSON.stringify([7, 'hb', 6]));
+  const afterHb = subject.acceptDepthEvent(JSON.stringify([42, [[50003, 1, 1]], 7]));
+  assert.notEqual(afterHb.status, 'resync', 'sequence 7 follows the trade heartbeat at 6');
 });

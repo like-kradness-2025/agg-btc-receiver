@@ -1,6 +1,6 @@
 /** Bitfinex public aggregated book adapter (SEQ_ALL + OB_CHECKSUM). */
 
-import { rawBook } from './raw-shape.mjs';
+import { rawBook, rawTrade, collapse } from './raw-shape.mjs';
 
 const INFO_RECONNECT = 20051;
 const INFO_MAINTENANCE_START = 20060;
@@ -34,7 +34,8 @@ export function createBitfinexAdapter({
   const funding = symbol.startsWith('f');
   if (!/^[tf][A-Z0-9]+$/.test(symbol)) throw new TypeError(`unsupported Bitfinex book symbol: ${symbol}`);
   const channelById = new Map();
-  const expectedKey = `book:${symbol}`;
+  const expectedKeys = [`book:${symbol}`, `trades:${symbol}`];
+  let tradeChanId = null;
   let lastSeq = null;
   let mirror = { bids: new Map(), asks: new Map() };
   let pending = [];
@@ -48,6 +49,7 @@ export function createBitfinexAdapter({
     failed = false;
     sawSnapshot = false;
     channelById.clear();
+    tradeChanId = null;
   }
   function checksumInput(book) {
     const bids = [...book.bids.values()].sort((a, b) => b.price - a.price).slice(0, 25);
@@ -122,11 +124,14 @@ export function createBitfinexAdapter({
 
   return {
     market, url, stream, boundary: 'sequence', ackMode: 'explicit',
-    expectedSubscriptions: () => [expectedKey],
+    expectedSubscriptions: () => [...expectedKeys],
     onConnectionOpen() { resetState(); },
     subscribeMessages: () => [
       JSON.stringify({ event: 'conf', flags: SEQ_ALL + OB_CHECKSUM }),
       JSON.stringify({ event: 'subscribe', channel: 'book', symbol, prec: bookPrecision, freq: bookFrequency, len: bookLength }),
+      // Set 8: v1 subscribed Bitfinex `trades` too (`lib/bitfinex-connector.mjs:67-72`) and this
+      // receiver now records them; the trade frames are raw-only (the board is book-only).
+      JSON.stringify({ event: 'subscribe', channel: 'trades', symbol }),
     ],
     heartbeatMessage: () => JSON.stringify({ event: 'ping' }),
     parse(raw) {
@@ -134,10 +139,16 @@ export function createBitfinexAdapter({
       if (!Array.isArray(data)) {
         if (!data || typeof data !== 'object') return null;
         if (data.event === 'subscribed') {
-          if (data.channel !== 'book' || !Number.isInteger(data.chanId) || (data.symbol ?? symbol) !== symbol) return { kind: 'protocol-error', reason: 'invalid Bitfinex book subscription acknowledgement' };
-          const key = `${data.channel}:${data.symbol ?? symbol}`;
-          channelById.set(data.chanId, key);
-          return { kind: 'subscription', key, ok: true };
+          if (!Number.isInteger(data.chanId) || (data.symbol ?? symbol) !== symbol) return { kind: 'protocol-error', reason: 'invalid Bitfinex subscription acknowledgement' };
+          if (data.channel === 'book') {
+            channelById.set(data.chanId, `book:${symbol}`);
+            return { kind: 'subscription', key: `book:${symbol}`, ok: true };
+          }
+          if (data.channel === 'trades') {
+            tradeChanId = data.chanId;
+            return { kind: 'subscription', key: `trades:${symbol}`, ok: true };
+          }
+          return { kind: 'protocol-error', reason: 'invalid Bitfinex subscription acknowledgement' };
         }
         if (data.event === 'unsubscribed') return { kind: 'subscription', key: `${data.chanId}`, ok: false, detail: 'unsubscribed' };
         if (data.event === 'error') {
@@ -152,6 +163,20 @@ export function createBitfinexAdapter({
           return { kind: 'heartbeat', answered: false };
         }
         if (data.event === 'pong') return { kind: 'heartbeat', answered: true };
+        return null;
+      }
+      // Set 8: a trade-channel frame. Only `tu` (the confirmed, final trade) becomes a record; `te`
+      // (immediate, revisable) is dropped exactly as v1 dropped it (`lib/bitfinex-connector.mjs:112-116`),
+      // so a trade is never counted twice. A trade snapshot (`[chanId, [[...], ...]]`) is the
+      // subscription's own history of the same trades. Every one of them is still a connection
+      // message carrying the shared sequence, so all of them have to be classified as data - what
+      // becomes a record is decided by `rawEventFor`, not here.
+      if (tradeChanId !== null && data[0] === tradeChanId) {
+        const body = data[1];
+        // A channel heartbeat is a heartbeat whichever channel it rides: it carries the shared
+        // sequence too, and the connection hands a sequenced heartbeat to `acceptDepthEvent`.
+        if (body === 'hb') return protocolFrame(data);
+        if (body === 'tu' || body === 'te' || Array.isArray(body)) return { kind: 'data', trade: true };
         return null;
       }
       return protocolFrame(data);
@@ -205,6 +230,22 @@ export function createBitfinexAdapter({
      */
     rawEventFor(frame) {
       const data = jsonOf(frame?.raw);
+      if (Array.isArray(data) && tradeChanId !== null && data[0] === tradeChanId) {
+        const rows = data[1] === 'tu' ? [data[2]] : Array.isArray(data[1]) ? data[1] : [];
+        const out = [];
+        for (const trade of rows) {
+          if (!Array.isArray(trade) || trade.length < 4) continue;
+          const price = Number(trade[3]);
+          const amount = Number(trade[2]);
+          const ts = Number(trade[1]);
+          if (!(price > 0) || !Number.isFinite(amount) || !Number.isInteger(ts) || ts <= 0) continue;
+          out.push(rawTrade({
+            market, price, qty: Math.abs(amount), side: amount < 0 ? 'sell' : 'buy',
+            ts, tradeId: String(trade[0]),
+          }));
+        }
+        return collapse(out);
+      }
       if (!Array.isArray(data) || !Number.isInteger(data[0]) || !channelById.has(data[0])) return null;
       const parsed = protocolFrame(data);
       if (!parsed || parsed.kind !== 'data') return null;
@@ -230,5 +271,26 @@ export function createBitfinexAdapter({
       return rawBook({ market, payload, event_ts_ms: atMs });
     },
     venueSeqOf(raw) { const data = jsonOf(raw); return sequenceOf(data); },
+    /**
+     * Set 8: Bitfinex numbers every message on a connection with one sequence, across channels. A
+     * trade frame - including the `te` and trade heartbeats that produce no record - therefore has to
+     * advance the same counter a book frame does. Without this the next book frame reads as a gap
+     * (`expected: 2, actual: 3` after book(1), trade(2), book(3)) and the adapter resyncs on healthy
+     * traffic forever.
+     */
+    acceptAuxFrame(raw) {
+      const data = jsonOf(raw);
+      if (!Array.isArray(data) || !Number.isInteger(data[0]) || data[0] !== tradeChanId) return null;
+      if (failed) return { status: 'resync', reason: 'Bitfinex stream is failed closed' };
+      const seq = sequenceOf(data) ?? (Number.isInteger(data[2]) ? data[2] : null);
+      if (!Number.isInteger(seq)) return null;
+      if (lastSeq !== null && seq !== lastSeq + 1) {
+        failed = true;
+        pending = [];
+        return { status: 'resync', reason: 'Bitfinex sequence gap, duplicate, or reversal', expected: lastSeq + 1, actual: seq };
+      }
+      lastSeq = seq;
+      return { status: 'accepted' };
+    },
   };
 }

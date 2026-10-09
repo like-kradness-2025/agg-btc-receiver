@@ -37,6 +37,7 @@
  */
 
 import { rawTrade, rawBook, rawLiquidation, collapse } from './raw-shape.mjs';
+import { openInterestRecord } from '../oi.mjs';
 
 const OKX_INSTRUMENTS = Object.freeze({
   okx_perp: Object.freeze(['BTC-USDT-SWAP']),
@@ -79,7 +80,7 @@ function validLevel(level) {
   return price !== null && price > 0 && size !== null && size >= 0;
 }
 
-function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, restUrl = null, bookDepth = 400, contractValue = 1 } = {}) {
+function makeOkxAdapter({ market, symbol, instType, liquidation, openInterest = false, url = null, restUrl = null, bookDepth = 400, contractValue = 1 } = {}) {
   const known = OKX_INSTRUMENTS[market];
   if (!Array.isArray(known) || !known.includes(symbol)) {
     throw new TypeError(`unsupported OKX instrument for ${market}: ${symbol}`);
@@ -87,10 +88,18 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
 
   // One request per topic, each under its own alphanumeric id. The ack names its topic through
   // `arg`; the id is what a refusal echoes, so it is the bridge back to the expected key.
+  // Set 8: the perp adds OKX's own `open-interest` (OI), `funding-rate` and `mark-price` channels -
+  // v1 polled the same three values over REST (`lib/derivatives-helper.mjs:303-353`); the WS channels
+  // are the venue's push form of the same data.
   const subscriptions = [
     { id: 'ob1', key: `books:${symbol}`, arg: { channel: 'books', instId: symbol } },
     { id: 'tr1', key: `trades:${symbol}`, arg: { channel: 'trades', instId: symbol } },
     ...(liquidation ? [{ id: 'lq1', key: `liquidation-orders:${instType}`, arg: { channel: 'liquidation-orders', instType } }] : []),
+    ...(openInterest ? [
+      { id: 'oi1', key: `open-interest:${symbol}`, arg: { channel: 'open-interest', instId: symbol } },
+      { id: 'fr1', key: `funding-rate:${symbol}`, arg: { channel: 'funding-rate', instId: symbol } },
+      { id: 'mp1', key: `mark-price:${symbol}`, arg: { channel: 'mark-price', instId: symbol } },
+    ] : []),
   ];
   const keyById = new Map(subscriptions.map((entry) => [entry.id, entry.key]));
 
@@ -99,11 +108,20 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
   let lastAcceptedSeq = null;
   let lastProvenSeq = null;
   let failed = false;
+  // Set 8: the OI/funding/mark channels arrive separately, so the mark and funding a row is built
+  // with are the latest seen - the open-interest frame itself carries only OI. v1 published one row
+  // per poll with all three coalesced; this keeps that row whole.
+  let mergedMarkPrice = null;
+  let mergedFundingRate = null;
+  let mergedNextFundingTime = null;
 
   function resetState() {
     lastAcceptedSeq = null;
     lastProvenSeq = null;
     failed = false;
+    mergedMarkPrice = null;
+    mergedFundingRate = null;
+    mergedNextFundingTime = null;
   }
 
   /** A well-formed book frame for our instrument, or null: one row with an integer seqId/prevSeqId and valid levels. */
@@ -255,6 +273,12 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
         // is not ours to carry. It is dropped here rather than stamped under our market.
         return ours.length > 0 ? { kind: 'data', liquidation: true } : null;
       }
+      if (openInterest && (channel === 'open-interest' || channel === 'funding-rate' || channel === 'mark-price')) {
+        if (data.arg?.instId !== symbol) {
+          throw new TypeError(`unrecognised OKX ${channel} frame for ${JSON.stringify(data.arg?.instId)}`);
+        }
+        return { kind: 'data', auxiliary: true };
+      }
       throw new TypeError(`unrecognised OKX frame (channel ${JSON.stringify(channel ?? null)})`);
     },
 
@@ -402,6 +426,43 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
         }
         return collapse(out);
       }
+      if (openInterest && channel === 'open-interest') {
+        const row = Array.isArray(data.data) && data.data.length === 1 ? data.data[0] : null;
+        if (row === null || typeof row !== 'object' || row.instId !== symbol) return null;
+        const sourceTs = Number(row.ts);
+        if (!Number.isInteger(sourceTs) || sourceTs <= 0) return null;
+        const ts = Number.isFinite(frame?.atMs) && frame.atMs > 0 ? Math.floor(frame.atMs) : Date.now();
+        return openInterestRecord({
+          market,
+          sample: {
+            open_interest: Number(row.oi),
+            oiCcy: finiteNumber(row.oiCcy),
+            oiUsd: finiteNumber(row.oiUsd),
+            mark_price: mergedMarkPrice,
+            funding_rate: mergedFundingRate,
+            next_funding_time: mergedNextFundingTime,
+            source_ts: sourceTs,
+            ts: sourceTs,
+          },
+          ts,
+          nowMs: ts,
+        });
+      }
+      if (openInterest && channel === 'funding-rate') {
+        const row = Array.isArray(data.data) ? data.data[0] : null;
+        if (row !== null && typeof row === 'object' && row.instId === symbol) {
+          mergedFundingRate = finiteNumber(row.fundingRate);
+          mergedNextFundingTime = finiteNumber(row.fundingTime);
+        }
+        return null;
+      }
+      if (openInterest && channel === 'mark-price') {
+        const row = Array.isArray(data.data) ? data.data[0] : null;
+        if (row !== null && typeof row === 'object' && row.instId === symbol) {
+          mergedMarkPrice = finiteNumber(row.markPx);
+        }
+        return null;
+      }
       if (channel === 'books') {
         const book = bookFrameOf(data);
         if (book === null) return null;
@@ -432,7 +493,7 @@ function makeOkxAdapter({ market, symbol, instType, liquidation, url = null, res
 export function createOkxPerpAdapter({ market = 'okx_perp', symbol = 'BTC-USDT-SWAP', bookDepth = 400, url = null, restUrl = null } = {}) {
   // v1 measured the swap contract as 0.01 BTC (`lib/okx-connector.mjs:17`); a trade or liquidation
   // size is contracts, so the raw qty is `sz * ctVal` exactly as v1 emitted it.
-  return makeOkxAdapter({ market, symbol, instType: 'SWAP', liquidation: true, bookDepth, url, restUrl, contractValue: 0.01 });
+  return makeOkxAdapter({ market, symbol, instType: 'SWAP', liquidation: true, openInterest: true, bookDepth, url, restUrl, contractValue: 0.01 });
 }
 
 /** The Spot market (BTC-USDT): books at 400 levels and trades. */

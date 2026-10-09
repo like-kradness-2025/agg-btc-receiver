@@ -14,7 +14,7 @@ const spotDepth = (symbol = 'BTCUSDC', stream = `${symbol.toLowerCase()}@depth@1
   data: { e: 'depthUpdate', E: 1, s: symbol, U: 11, u: 11, b: level, a: [], ...extra },
 });
 const futuresDepth = (extra = {}) => ({
-  stream: 'btcusdt@depth',
+  stream: 'btcusdt@depth@100ms',
   data: { e: 'depthUpdate', E: 1, T: 1, s: 'BTCUSDT', U: 11, u: 11, pu: 10, b: level, a: [], ...extra },
 });
 
@@ -37,12 +37,12 @@ test('spot adapters fail closed for unknown symbols and streams', () => {
   assert.equal(adapter.parse(JSON.stringify({ stream: 'btcusdc@unknown', data: spotDepth('BTCUSDC').data })), null);
 });
 
-test('futures adapter uses USD-M public endpoint, aggTrade and pu continuity', () => {
+test('futures adapter uses USD-M public endpoint, @trade and pu continuity', () => {
   const adapter = createBinanceFuturesAdapter({ market: 'binance_perp', symbol: 'BTCUSDT' });
-  assert.equal(adapter.url, 'wss://fstream.binance.com/public/stream?streams=btcusdt@depth');
-  assert.equal(adapter.tradeUrl, 'wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade');
+  assert.equal(adapter.url, 'wss://fstream.binance.com/public/stream?streams=btcusdt@depth@100ms/btcusdt@forceOrder');
+  assert.equal(adapter.tradeUrl, 'wss://fstream.binance.com/market/stream?streams=btcusdt@trade');
   assert.equal(adapter.restUrl, 'https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000');
-  assert.deepEqual(adapter.parse(JSON.stringify({ stream: 'btcusdt@aggTrade', data: { e: 'aggTrade', s: 'BTCUSDT', a: 1, p: '1', q: '1', T: 1, m: true } })), { kind: 'data', trade: true });
+  assert.deepEqual(adapter.parse(JSON.stringify({ stream: 'btcusdt@trade', data: { e: 'trade', s: 'BTCUSDT', t: 1, p: '1', q: '1', T: 1, m: true } })), { kind: 'data', trade: true });
   assert.deepEqual(adapter.parse(JSON.stringify(futuresDepth())), { kind: 'data', depth: true });
   adapter.syncSnapshot({ lastUpdateId: 10, bids: [], asks: [] });
   assert.equal(adapter.acceptDepthEvent(futuresDepth({ U: 9, u: 11 }).data).status, 'applied');
@@ -61,10 +61,10 @@ test('futures rejects spot-style depth and unknown stream fail-closed', () => {
 test('USD-M BTCUSDC is isolated from BTCUSDT by symbol, streams and REST endpoint', () => {
   const adapter = createBinanceFuturesAdapter({ market: 'binance_perp_btcusdc', symbol: 'BTCUSDC' });
   assert.equal(adapter.symbol, 'BTCUSDC');
-  assert.equal(adapter.url, 'wss://fstream.binance.com/public/stream?streams=btcusdc@depth');
-  assert.equal(adapter.tradeUrl, 'wss://fstream.binance.com/market/stream?streams=btcusdc@aggTrade');
+  assert.equal(adapter.url, 'wss://fstream.binance.com/public/stream?streams=btcusdc@depth@100ms/btcusdc@forceOrder');
+  assert.equal(adapter.tradeUrl, 'wss://fstream.binance.com/market/stream?streams=btcusdc@trade');
   assert.equal(adapter.restUrl, 'https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDC&limit=1000');
-  assert.deepEqual(adapter.parse(JSON.stringify({ stream: 'btcusdc@aggTrade', data: { e: 'aggTrade', s: 'BTCUSDC', a: 1, p: '1', q: '2', T: 1 } })), { kind: 'data', trade: true });
+  assert.deepEqual(adapter.parse(JSON.stringify({ stream: 'btcusdc@trade', data: { e: 'trade', s: 'BTCUSDC', t: 1, p: '1', q: '2', T: 1 } })), { kind: 'data', trade: true });
   assert.equal(adapter.parse(JSON.stringify({ stream: 'btcusdt@aggTrade', data: { e: 'aggTrade', s: 'BTCUSDT', a: 1, p: '1', q: '2', T: 1 } })), null);
 });
 

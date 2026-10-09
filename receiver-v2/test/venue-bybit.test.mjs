@@ -36,6 +36,7 @@ const PERP_BOOK = 'orderbook.1000.BTCUSDT';
 const SPOT_BOOK = 'orderbook.200.BTCUSDT';
 const PERP_TRADE = 'publicTrade.BTCUSDT';
 const PERP_LIQ = 'allLiquidation.BTCUSDT';
+const PERP_TICKER = 'tickers.BTCUSDT';
 
 const perpSnapshot = (u, b = [['83769.90', '3.380'], ['83769.80', '1.114']], a = [['83770.00', '19.788'], ['83770.10', '0.002']]) => ({
   topic: PERP_BOOK,
@@ -164,12 +165,13 @@ test('the perpetual adapter names the linear endpoint, its topics and their own 
   assert.equal(adapter.url, 'wss://stream.bybit.com/v5/public/linear');
   assert.equal(adapter.restUrl, 'https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=1000');
   assert.equal(adapter.ackMode, 'explicit');
-  assert.deepEqual(adapter.expectedSubscriptions(), [PERP_TRADE, PERP_BOOK, PERP_LIQ]);
+  assert.deepEqual(adapter.expectedSubscriptions(), [PERP_TRADE, PERP_BOOK, PERP_LIQ, PERP_TICKER]);
   const messages = adapter.subscribeMessages().map((message) => JSON.parse(message));
   assert.deepEqual(messages, [
     { op: 'subscribe', req_id: PERP_TRADE, args: [PERP_TRADE] },
     { op: 'subscribe', req_id: PERP_BOOK, args: [PERP_BOOK] },
     { op: 'subscribe', req_id: PERP_LIQ, args: [PERP_LIQ] },
+    { op: 'subscribe', req_id: PERP_TICKER, args: [PERP_TICKER] },
   ]);
 });
 
@@ -551,10 +553,10 @@ test('the connection admits bybit when every topic is acknowledged, and the live
   sockets.sockets[0].onopen();
   assert.deepEqual(
     sockets.sockets[0].sent.map((message) => JSON.parse(message).req_id),
-    [PERP_TRADE, PERP_BOOK, PERP_LIQ],
+    [PERP_TRADE, PERP_BOOK, PERP_LIQ, PERP_TICKER],
     'each topic was asked for under its own req_id',
   );
-  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ]) {
+  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ, PERP_TICKER]) {
     sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
   }
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
@@ -595,7 +597,7 @@ test('a duplicate update replaces the connection fail-closed instead of reaching
   const connection = openConnection({ adapter, sockets, envelopes, diagnostics });
   connection.start();
   sockets.sockets[0].onopen();
-  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ]) sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
+  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ, PERP_TICKER]) sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
   sockets.sockets[0].deliver(JSON.stringify(perpSnapshot(100)));
   sockets.sockets[0].deliver(JSON.stringify(perpDelta(101)));
@@ -615,7 +617,7 @@ test('a malformed book frame replaces the connection fail-closed', async () => {
   const connection = openConnection({ adapter, sockets, envelopes });
   connection.start();
   sockets.sockets[0].onopen();
-  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ]) sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
+  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ, PERP_TICKER]) sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
 
   sockets.sockets[0].deliver(JSON.stringify({ ...perpSnapshot(100), data: { s: 'BTCUSDT', b: [], a: [], seq: 1 } }));
@@ -632,7 +634,7 @@ test('an unclassifiable frame is counted, not silently dropped', async () => {
   const connection = openConnection({ adapter, sockets, diagnostics, envelopes });
   connection.start();
   sockets.sockets[0].onopen();
-  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ]) sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
+  for (const topic of [PERP_TRADE, PERP_BOOK, PERP_LIQ, PERP_TICKER]) sockets.sockets[0].deliver(JSON.stringify(linearAck(topic)));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
 
   sockets.sockets[0].deliver('this is not json');

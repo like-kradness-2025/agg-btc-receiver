@@ -1,6 +1,6 @@
 /** Binance Spot and USDⓈ-M Futures market adapters. */
 
-import { rawTrade, rawBook } from './raw-shape.mjs';
+import { rawTrade, rawBook, rawLiquidation } from './raw-shape.mjs';
 
 const SPOT_SYMBOLS = new Set(['BTCUSDT', 'BTCUSDC', 'BTCFDUSD']);
 const DEFAULT_SPOT_WS = 'wss://stream.binance.com:9443/stream';
@@ -207,6 +207,27 @@ function makeAdapter({ market, symbol, url, tradeUrl, restUrl, streams, depthStr
           side: data.m ? 'sell' : 'buy', ts, tradeId: data.t ?? data.a,
         });
       }
+      // Set 8: the USDⓈ-M `@forceOrder` frame is a liquidation. v1's `_handleForceOrder`
+      // (`lib/binance-connector.mjs:471-492`) emitted `{exchange:'binance', symbol:o.s,
+      // side:o.S==='SELL'?'sell':'buy', price:o.p, qty:o.z??o.q, notional, raw_type:'forceOrder',
+      // trade_id:null, source_ts:o.T??event.E}` - this is that shape. v1's own store holds ZERO
+      // binance liquidation rows because that emit was gated by `o.f==='LIQUIDATION'||'ROE_LIQUIDATION'`
+      // while the live payloads carry a time-in-force (GTC/IOC/FOK) there, so the gate never matched
+      // (research §4). There is therefore no measured binance liquidation to copy; the official
+      // forceOrder fields are written straight through instead, and the field set is v1's emit call.
+      if (forceOrderStream !== null && wrapper.stream === forceOrderStream) {
+        if (!forceOrderOf?.(wrapper.data)) return null;
+        const o = wrapper.data.o;
+        const price = Number(o.p);
+        const qty = Number(o.z ?? o.q);
+        if (!(price > 0) || !(qty > 0)) return null;
+        const sourceTs = Number.isInteger(o.T) ? o.T : Number.isInteger(wrapper.data.E) ? wrapper.data.E : null;
+        return rawLiquidation({
+          market, exchange: 'binance', symbol: o.s, side: o.S === 'SELL' ? 'sell' : 'buy',
+          price, qty, notional: price * qty, raw_type: 'forceOrder', trade_id: null,
+          source_ts: sourceTs, ts: frame.atMs,
+        });
+      }
       if (wrapper.stream !== depthStream) return null;
       const event = depthOf(wrapper);
       if (!event) return null;
@@ -255,7 +276,7 @@ function makeAdapter({ market, symbol, url, tradeUrl, restUrl, streams, depthStr
       const wrapper = parseWrapper(raw);
       if (wrapper === null || !streams.has(wrapper.stream)) return null;
       if (wrapper.stream === tradeStream && tradeOf(wrapper.data)) return { kind: 'data', trade: true };
-      if (forceOrderStream !== null && wrapper.stream === forceOrderStream && forceOrderOf?.(wrapper.data)) return { kind: 'data', liquidation: true };
+      if (forceOrderStream !== null && wrapper.stream === forceOrderStream && forceOrderOf?.(wrapper.data)) return { kind: 'data', auxiliary: true, liquidation: true };
       if (wrapper.stream === depthStream && depthOf(wrapper)) return { kind: 'data', depth: true };
       return null;
     },
@@ -295,7 +316,8 @@ function futuresDepthFactory(symbol, depthStream) {
     return data;
   };
 }
-function futuresTradeFactory(symbol) { return (data) => data && data.e === 'aggTrade' && data.s === symbol && finiteNumber(data.p) !== null && Number(data.p) > 0 && finiteNumber(data.q) !== null && Number(data.q) > 0 && Number.isInteger(data.a) && data.a >= 0 && Number.isInteger(data.T) && data.T >= 0; }
+function futuresTradeFactory(symbol) { return (data) => data && (data.e === 'trade' || data.e === 'aggTrade') && data.s === symbol && finiteNumber(data.p) !== null && Number(data.p) > 0 && finiteNumber(data.q) !== null && Number(data.q) > 0 && (Number.isInteger(data.t) || Number.isInteger(data.a)) && Number.isInteger(data.T) && data.T >= 0; }
+function futuresForceOrderFactory(symbol) { return (data) => data && data.e === 'forceOrder' && data.o && data.o.s === symbol; }
 
 export function createBinanceDepthSynchronizer({ fetchSnapshot } = {}) {
   const symbol = 'BTCUSDT';
@@ -329,10 +351,16 @@ export function createBinanceSpotAdapter({ market = 'binance_spot', symbol = 'BT
 export function createBinanceFuturesAdapter({ market = 'binance_perp', symbol = 'BTCUSDT', url, restUrl, fetchImpl = globalThis.fetch } = {}) {
   const normalized = String(symbol).toUpperCase();
   if (!new Set(['BTCUSDT', 'BTCUSDC']).has(normalized)) throw new TypeError(`unsupported Binance USDⓈ-M Futures symbol: ${symbol}`);
-  const lower = normalized.toLowerCase(); const depthStream = `${lower}@depth`; const tradeStream = `${lower}@aggTrade`;
-  const defaults = makeUrls(DEFAULT_FUTURES_PUBLIC_WS, [depthStream], DEFAULT_FUTURES_REST, normalized, 1000);
+  const lower = normalized.toLowerCase();
+  // Set 8: v1 (the running production store) subscribes `btcusdt@trade` (not `@aggTrade`),
+  // `btcusdt@depth@100ms` (not the 250 ms default) and `btcusdt@forceOrder`
+  // (`lib/binance-connector.mjs:340`). The receiver matches that subscription exactly.
+  const depthStream = `${lower}@depth@100ms`;
+  const tradeStream = `${lower}@trade`;
+  const forceOrderStream = `${lower}@forceOrder`;
+  const defaults = makeUrls(DEFAULT_FUTURES_PUBLIC_WS, [depthStream, forceOrderStream], DEFAULT_FUTURES_REST, normalized, 1000);
   const depthOf = futuresDepthFactory(normalized, depthStream);
-  return makeAdapter({ market, symbol: normalized, url: url ?? defaults.url, tradeUrl: `${DEFAULT_FUTURES_MARKET_WS}?streams=${tradeStream}`, restUrl: restUrl ?? defaults.restUrl, streams: new Set([tradeStream, depthStream]), depthStream, tradeStream, depthOf, tradeOf: futuresTradeFactory(normalized), fetchImpl, waitForBufferMs: 5000, bookPrevSeqFromVenue: true, continuity: (event, state) => {
+  return makeAdapter({ market, symbol: normalized, url: url ?? defaults.url, tradeUrl: `${DEFAULT_FUTURES_MARKET_WS}?streams=${tradeStream}`, restUrl: restUrl ?? defaults.restUrl, streams: new Set([tradeStream, depthStream, forceOrderStream]), depthStream, tradeStream, forceOrderStream, forceOrderOf: futuresForceOrderFactory(normalized), depthOf, tradeOf: futuresTradeFactory(normalized), fetchImpl, waitForBufferMs: 5000, bookPrevSeqFromVenue: true, continuity: (event, state) => {
     if (event.u < state.lastUpdateId) return { status: 'discarded', reason: 'depth update is before snapshot boundary' };
     if (state.previousEventId === null) {
       return event.U <= state.lastUpdateId && state.lastUpdateId <= event.u ? { status: 'applied' } : { status: 'resync', reason: 'futures first depth update does not bridge snapshot', first: event.U, final: event.u };

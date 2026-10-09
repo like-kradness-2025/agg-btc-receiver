@@ -36,6 +36,7 @@
  */
 
 import { rawTrade, rawBook, collapse } from './raw-shape.mjs';
+import { openInterestRecord } from '../oi.mjs';
 
 const HYPERLIQUID_COINS = Object.freeze({
   hyperliquid_perp: Object.freeze(['BTC']),
@@ -88,6 +89,11 @@ function makeHyperliquidAdapter({ market = 'hyperliquid_perp', symbol = 'BTC', u
   const subscriptions = [
     { key: `l2Book:${symbol}`, frame: { method: 'subscribe', subscription: { type: 'l2Book', coin: symbol } } },
     { key: `trades:${symbol}`, frame: { method: 'subscribe', subscription: { type: 'trades', coin: symbol } } },
+    // Set 8: `activeAssetCtx` carries the funding rate, open interest and mark price in one frame -
+    // v1 read the same three from `metaAndAssetCtxs` over REST (`lib/derivatives-helper.mjs:359-399`).
+    // The frame is recorded as one `open_interest` row. (The optional `bbo` channel is not subscribed:
+    // it is a best-bid-offer mirror with no v1 counterpart to record.)
+    { key: `activeAssetCtx:${symbol}`, frame: { method: 'subscribe', subscription: { type: 'activeAssetCtx', coin: symbol } } },
   ];
 
   let lastAcceptedMs = null;
@@ -169,6 +175,16 @@ function makeHyperliquidAdapter({ market = 'hyperliquid_perp', symbol = 'BTC', u
     }
     if (total === 0) return null;
     return { ms, bids: sides[0], asks: sides[1] };
+  }
+
+  /** The activeAssetCtx frame's OI/funding/mark, in the documented `ctx` object. */
+  function activeAssetCtxOf(data) {
+    const body = data.data;
+    if (body === null || typeof body !== 'object' || body.coin !== symbol) return null;
+    const ctx = body.ctx;
+    if (ctx === null || typeof ctx !== 'object') return null;
+    if (finiteNumber(ctx.openInterest) === null || finiteNumber(ctx.markPx) === null) return null;
+    return ctx;
   }
 
   /** Whether every trade row in a trades frame is a well-formed trade of our coin. */
@@ -260,6 +276,14 @@ function makeHyperliquidAdapter({ market = 'hyperliquid_perp', symbol = 'BTC', u
         }
         if (!isTradeFrame(data)) throw new TypeError('malformed Hyperliquid trade frame');
         return { kind: 'data', trade: true };
+      }
+
+      if (data.channel === 'activeAssetCtx') {
+        if (data.data?.coin !== undefined && data.data.coin !== symbol) {
+          throw new TypeError('unrecognised Hyperliquid activeAssetCtx frame for another coin');
+        }
+        if (activeAssetCtxOf(data) === null) throw new TypeError('malformed Hyperliquid activeAssetCtx frame');
+        return { kind: 'data', auxiliary: true };
       }
 
       if (data.channel === 'pong') {
@@ -367,6 +391,24 @@ function makeHyperliquidAdapter({ market = 'hyperliquid_perp', symbol = 'BTC', u
           out.push(rawTrade({ market, price: Number(trade.px), qty: Number(trade.sz), side: trade.side === 'B' ? 'buy' : 'sell', ts, tradeId: trade.tid }));
         }
         return collapse(out);
+      }
+      if (data.channel === 'activeAssetCtx') {
+        const ctx = activeAssetCtxOf(data);
+        if (ctx === null) return null;
+        const ts = Number.isFinite(frame?.atMs) && frame.atMs > 0 ? Math.floor(frame.atMs) : Date.now();
+        return openInterestRecord({
+          market,
+          sample: {
+            open_interest: Number(ctx.openInterest),
+            mark_price: Number(ctx.markPx),
+            funding_rate: finiteNumber(ctx.funding),
+            next_funding_time: null,
+            source_ts: ts,
+            ts,
+          },
+          ts,
+          nowMs: ts,
+        });
       }
       if (data.channel !== 'l2Book') return null;
       if (bookFrameOf(data) === null) return null;

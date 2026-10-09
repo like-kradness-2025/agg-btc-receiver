@@ -35,6 +35,7 @@ import {
   DEFAULT_RAW_BATCH_WINDOW_MS,
   DEFAULT_RAW_BATCH_MAX_ROWS,
 } from '../raw.mjs';
+import { createAuxCollector, hasRestOiSource } from './aux.mjs';
 import { IPC_VERSION, makeMessage } from '../ipc-message.mjs';
 import { attachChanges, deriveChanges } from '../changes.mjs';
 import { connect } from '../ipc.mjs';
@@ -74,6 +75,14 @@ export function createIngestProcess({
   rawDir = null,
   rawBatchWindowMs = DEFAULT_RAW_BATCH_WINDOW_MS,
   rawBatchMaxRows = DEFAULT_RAW_BATCH_MAX_ROWS,
+  // Set 8: the auxiliary open-interest REST poller. Disabled (0) by default, so every pre-Set-8
+  // configuration is unchanged; a positive value starts the v1-style 30 s poll for this market's
+  // REST OI source (see `src/ingest/aux.mjs`). The fetch and the interval timer are injectable so a
+  // test can drive them; production gets the real ones.
+  oiPollIntervalMs = 0,
+  auxFetchImpl = globalThis.fetch,
+  auxSetTimer = setInterval,
+  auxClearTimer = clearInterval,
   // The restart identity of this child process. It is deliberately separate from the receive run and
   // from the connection generation (ruling ⑧): a book or organize restart is a fact about that child,
   // and it must not move the receive generation. Overridden by the caller so two lives of one run get
@@ -170,6 +179,9 @@ export function createIngestProcess({
   let tailWriteFailure = null;
   let receptionCloseFailure = null;
   let rawFlushFailure = null;
+  // Set 8: whether the auxiliary poller's current failure episode has already been reported. The
+  // episode ends when a sample is written again (see `writeAuxRecord`).
+  let auxFailureReported = false;
   let unretainedFrameFailure = false;
   // The generations reception is waiting for an acceptance on, keyed by generation. Only these may be
   // settled by an `accepted`; anything else is a stale instance's answer (C2).
@@ -314,6 +326,39 @@ export function createIngestProcess({
   // has no such hook and this is a no-op.
   adapter?.setRawSnapshotSink?.((snapshot) => writeRawSnapshot(snapshot));
 
+  // Set 8: the open-interest poller, when the deployment asked for one and this market has a REST
+  // source. It writes to the same raw writer as the received frames (one owner per market), so the
+  // `open_interest` rows land in the market's database beside them. Started in `start()`, stopped
+  // by `stop()`/`close()`.
+  const aux =
+    raw !== null && Number.isFinite(oiPollIntervalMs) && oiPollIntervalMs > 0 && hasRestOiSource(market)
+      ? createAuxCollector({
+          market,
+          fetchImpl: auxFetchImpl,
+          intervalMs: oiPollIntervalMs,
+          setTimer: auxSetTimer,
+          clearTimer: auxClearTimer,
+          append: (record) => writeAuxRecord(record),
+          onError: (error) => {
+            // A sample that could not be fetched is not a reception failure. v1 polled this on a 30 s
+            // clock and wrote a `status:'error'` placeholder row when the fetch failed (with
+            // `event_ts_ms: 0`, which the downstream drops the moment it sees it), and the
+            // open-interest stream is not consumed by the live stages at all. Stopping reception over
+            // a REST hiccup would trade a hole in an auxiliary stream for the market's whole
+            // reception going dark. The failure is reported once per episode instead - the same
+            // "one episode, one report" rule the capacity and acknowledgement stalls follow - and
+            // reception carries on.
+            if (auxFailureReported) return;
+            auxFailureReported = true;
+            try {
+              onDiagnostic({ market, reason: `the open-interest poller failed: ${error.message}` });
+            } catch {
+              // a diagnostic is best-effort by contract
+            }
+          },
+        })
+      : null;
+
   /**
    * Set 7a: write one received frame to the canonical raw, from the connection's `onRawFrame` hook -
    * that is, for every parsed data frame and before anything judges it. The adapter decides whether
@@ -359,6 +404,43 @@ export function createIngestProcess({
         // a diagnostic must not replace the loud stop
       }
       stopReception('the canonical raw could not be written');
+      throw error;
+    }
+  }
+
+  /**
+   * Set 8: write one open-interest row (from the REST poller) to the canonical raw. The record is the
+   * adapter-shaped one `openInterestRecord` produced; the arrival stamps are this process's clock,
+   * because a REST sample has no socket frame behind it. A write that fails is loud, exactly like a
+   * received frame's: reported, reception stopped, and the error rethrown.
+   */
+  function writeAuxRecord(record) {
+    if (raw === null || !record) return;
+    try {
+      raw.append({
+        market,
+        stream: record.stream,
+        event_ts_ms: record.event_ts_ms,
+        recv_ts_ms: Date.now(),
+        recv_mono_ns: Number(process.hrtime.bigint()),
+        connection_id: connection.connectionId,
+        sequence_order: null,
+        receive_seq: null,
+        source_event_ts_ms: record.source_event_ts_ms ?? null,
+        source_event_time_known: record.source_event_time_known === true,
+        source_id: record.source_id ?? null,
+        payload: record.payload,
+      });
+      // A row written and not an error placeholder means the source answered: the failure episode is
+      // over, and the next failure is a new one that must be reported in its own right.
+      if (record.payload?.status !== 'error') auxFailureReported = false;
+    } catch (error) {
+      try {
+        onDiagnostic({ market, reason: `the open-interest row could not be written: ${error.message}` });
+      } catch {
+        // a diagnostic must not replace the loud stop
+      }
+      stopReception('the open-interest row could not be written');
       throw error;
     }
   }
@@ -603,6 +685,8 @@ export function createIngestProcess({
   }
 
   async function quiesce() {
+    // Set 8: quiescence fences new raw records, so the auxiliary poller stops with it.
+    aux?.stop();
     fenceReception();
     return { quiesced: true };
   }
@@ -614,6 +698,9 @@ export function createIngestProcess({
    */
   function stopReception(reason) {
     if (stopped || closed) return;
+    // Set 8: the auxiliary poller writes into the same raw, so it stops with the reception - no row
+    // may land after the last flush.
+    aux?.stop();
     fenceReception();
     onStop({ market, reason });
   }
@@ -1406,6 +1493,9 @@ export function createIngestProcess({
       if (closed) return { started: false, reason: 'this ingest process is closed' };
       if (quiescing || stopped) return { started: false, reason: 'this ingest process has stopped' };
       connection.start();
+      // Set 8: the auxiliary poller starts with reception. Its timer is unref'd, so a run that has
+      // nothing else to do can still let the loop go.
+      aux?.start();
       return { started: true };
     },
 
@@ -1436,6 +1526,8 @@ export function createIngestProcess({
         if (rawFlushFailure === null) rawFlushFailure = error;
       }
       spool?.close();
+      // Set 8: stop the auxiliary poller - no row may be produced after the process is closing.
+      aux?.close();
       const failure = receptionCloseFailure ?? rawFlushFailure ?? tailWriteFailure ?? spool?.failed;
       const abnormal = failure != null || unretainedFrameFailure;
       return {
@@ -1465,6 +1557,8 @@ export function createIngestProcess({
         // the latch is the fact
       }
       spool?.close();
+      // Set 8: closing stops the auxiliary poller too.
+      aux?.close();
       // Set 7a: closing the raw flushes the last window and closes the databases. A failure here means
       // the last rows did not land, and a run that ends without recording what it heard must not be
       // reported as a clean shutdown: the failure is reported and rethrown (after the stores are

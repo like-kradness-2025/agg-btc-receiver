@@ -348,10 +348,11 @@ test('the Binance depth adapter classifies a depth frame and lets a snapshot thr
   assert.deepEqual(record.payload.bids, [['100', '1']]);
 
   // The futures product writes v1's futures shape, which *does* carry the venue's `pu` (measured in
-  // the running v1 store), unlike spot. Its depth stream is `@depth` (250 ms), not `@depth@100ms`.
+  // the running v1 store), unlike spot. Its depth stream is `@depth@100ms` (v1's subscription), which
+  // Set 8 aligned the futures adapter to.
   const futures = createBinanceFuturesAdapter({ market: 'binance_perp' });
   const futuresFrame = {
-    stream: 'btcusdt@depth',
+    stream: 'btcusdt@depth@100ms',
     data: { e: 'depthUpdate', s: 'BTCUSDT', U: 157, u: 160, pu: 156, b: [['100', '1']], a: [['101', '2']], E: 1_792_000_000_123 },
   };
   const futuresRecord = futures.rawEventFor({ raw: JSON.stringify(futuresFrame) });

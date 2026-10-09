@@ -142,6 +142,7 @@ async function buildRole(spec, send) {
       ingestStorePath: spec.storePath,
       spoolDir: spec.spoolDir,
       rawDir: spec.rawDir,
+      ...(Number.isFinite(spec.oiPollIntervalMs) && spec.oiPollIntervalMs > 0 ? { oiPollIntervalMs: spec.oiPollIntervalMs } : {}),
       channelOptions,
       readinessIntervalMs: spec.readinessIntervalMs ?? 0,
       onDiagnostic,

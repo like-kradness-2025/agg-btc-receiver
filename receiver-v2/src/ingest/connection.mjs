@@ -474,7 +474,20 @@ export function createReceiveConnection({
       subscriptionState = ACKNOWLEDGED;
       publishSubscriptionState('the first data frame established the stream');
     }
-    if (parsed.kind === 'data' && parsed.trade === true) return;
+    if (parsed.kind === 'data' && parsed.trade === true) {
+      // Set 8: a venue whose sequence spans channels (Bitfinex) counts this frame even though it has
+      // no book meaning, or the next book frame reads as a gap.
+      if (typeof adapter.acceptAuxFrame === 'function') adapter.acceptAuxFrame(raw);
+      return;
+    }
+    // Set 8: an auxiliary frame (open interest / mark / funding / a liquidation that this adapter
+    // does not feed to a depth verifier) is stream data with no book meaning. It was recorded at
+    // arrival by `onRawFrame`; it is not stamped onward and it never reaches the depth verifier, for
+    // the same reason a trade is not: an unrelated frame would read as a false sequence failure.
+    if (parsed.kind === 'data' && parsed.auxiliary === true) {
+      if (typeof adapter.acceptAuxFrame === 'function') adapter.acceptAuxFrame(raw);
+      return;
+    }
     if (parsed.kind === 'data' || parsed.kind === 'checksum') {
       if (typeof adapter.acceptDepthEvent === 'function') {
         const accepted = adapter.acceptDepthEvent(raw);

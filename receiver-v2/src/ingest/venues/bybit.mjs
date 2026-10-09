@@ -36,6 +36,7 @@
  */
 
 import { rawTrade, rawBook, rawLiquidation, collapse } from './raw-shape.mjs';
+import { openInterestRecord } from '../oi.mjs';
 
 const BYBIT_SYMBOLS = new Set(['BTCUSDT']);
 
@@ -83,7 +84,17 @@ function makeBybitAdapter({ market, category, symbol = 'BTCUSDT', bookDepth, url
   const tradeTopic = `publicTrade.${symbol}`;
   const bookTopic = `orderbook.${bookDepth}.${symbol}`;
   const liquidationTopic = category === 'linear' ? `allLiquidation.${symbol}` : null;
-  const topics = liquidationTopic === null ? [tradeTopic, bookTopic] : [tradeTopic, bookTopic, liquidationTopic];
+  // Set 8: Bybit has no standalone OI/funding/mark channel - `tickers` carries all three in one frame
+  // (`lib/derivatives-helper.mjs:278`: v1 read markPrice/fundingRate/openInterest/nextFundingTime from
+  // this same topic over REST). The linear category is therefore subscribed to it, and the frame is
+  // recorded as one `open_interest` row. Spot has no OI/funding to collect.
+  const tickerTopic = category === 'linear' ? `tickers.${symbol}` : null;
+  const topics = [
+    tradeTopic,
+    bookTopic,
+    ...(liquidationTopic === null ? [] : [liquidationTopic]),
+    ...(tickerTopic === null ? [] : [tickerTopic]),
+  ];
 
   // Reception-side continuity (`acceptDepthEvent`) and book-side continuity (`connects`) are kept
   // apart on purpose: in the single-process structure both run over the same frames, and one shared
@@ -153,6 +164,33 @@ function makeBybitAdapter({ market, category, symbol = 'BTCUSDT', bookDepth, url
         Number.isInteger(row.T) &&
         row.T >= 0,
     );
+  }
+
+  // Set 8: the tickers topic pushes a snapshot and then partial deltas, and a delta carries only the
+  // values that changed. Reading only a snapshot dropped every update after the first; reading a
+  // delta without merging dropped the fields it did not resend. The last values seen are kept and
+  // every frame's fields are merged over them.
+  let tickerState = null;
+
+  /** The documented tickers frame's OI/funding/mark fields (linear only), snapshot or delta. */
+  function isTickerFrame(data) {
+    if (data.type !== 'snapshot' && data.type !== 'delta') return false;
+    const t = data.data;
+    if (t === null || typeof t !== 'object' || Array.isArray(t)) return false;
+    if (t.symbol !== symbol) return false;
+    return finiteNumber(t.openInterest) !== null || finiteNumber(t.markPrice) !== null || finiteNumber(t.fundingRate) !== null;
+  }
+
+  /** Merge a tickers frame over the last values seen and return the resulting sample. */
+  function mergeTickerFrame(t) {
+    const previous = tickerState;
+    tickerState = {
+      open_interest: finiteNumber(t.openInterest) ?? previous?.open_interest ?? null,
+      mark_price: finiteNumber(t.markPrice) ?? previous?.mark_price ?? null,
+      funding_rate: finiteNumber(t.fundingRate) ?? previous?.funding_rate ?? null,
+      next_funding_time: finiteNumber(t.nextFundingTime) ?? previous?.next_funding_time ?? null,
+    };
+    return tickerState;
   }
 
   /** The level changes a book frame carries, in the v1 contract's shape. */
@@ -228,6 +266,10 @@ function makeBybitAdapter({ market, category, symbol = 'BTCUSDT', bookDepth, url
       if (liquidationTopic !== null && data.topic === liquidationTopic) {
         if (!isLiquidationFrame(data)) throw new TypeError('malformed Bybit liquidation frame');
         return { kind: 'data', liquidation: true };
+      }
+      if (tickerTopic !== null && data.topic === tickerTopic) {
+        if (!isTickerFrame(data)) throw new TypeError('malformed Bybit tickers frame');
+        return { kind: 'data', auxiliary: true };
       }
       if (data.topic === bookTopic) {
         // A frame on our own book topic that does not match the contract is not "some other
@@ -375,6 +417,26 @@ function makeBybitAdapter({ market, category, symbol = 'BTCUSDT', bookDepth, url
           }));
         }
         return collapse(out);
+      }
+      if (tickerTopic !== null && data.topic === tickerTopic) {
+        if (!isTickerFrame(data)) return null;
+        const merged = mergeTickerFrame(data.data);
+        if (merged.open_interest === null || merged.mark_price === null) return null;
+        const sourceTs = Number.isInteger(data.ts) && data.ts > 0 ? data.ts : null;
+        const ts = Number.isFinite(frame?.atMs) && frame.atMs > 0 ? Math.floor(frame.atMs) : Date.now();
+        return openInterestRecord({
+          market,
+          sample: {
+            open_interest: merged.open_interest,
+            mark_price: merged.mark_price,
+            funding_rate: merged.funding_rate,
+            next_funding_time: merged.next_funding_time,
+            source_ts: sourceTs,
+            ts: sourceTs ?? ts,
+          },
+          ts,
+          nowMs: ts,
+        });
       }
       if (data.topic === bookTopic) {
         const book = bookFrameOf(data);

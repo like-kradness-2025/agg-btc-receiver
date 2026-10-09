@@ -299,6 +299,9 @@ export function createRunSupervisor(options = {}) {
     spoolDir = null,
     // Set 7a: where the canonical raw lives, handed to the ingest child. Absent means no raw writer.
     rawDir = null,
+    // Set 8: the auxiliary open-interest REST poll interval, handed to the ingest child. Absent/0
+    // means no poller.
+    oiPollIntervalMs = 0,
     routerListenPath,
     webSocketImpl,
     rawWriter = null,
@@ -524,6 +527,7 @@ export function createRunSupervisor(options = {}) {
           ingestStorePath,
           spoolDir,
           ...(rawDir === null ? {} : { rawDir }),
+          ...(Number.isFinite(oiPollIntervalMs) && oiPollIntervalMs > 0 ? { oiPollIntervalMs } : {}),
           channelOptions: ROUTE_OPTIONS,
           readinessIntervalMs,
           onStop: (info) => diagnostic(`reception stopped: ${info?.reason ?? 'unknown'}`, { kind: 'stop' }),

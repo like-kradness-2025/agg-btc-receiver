@@ -61,6 +61,10 @@ const ackTrades = {
   channel: 'subscriptionResponse',
   data: { method: 'subscribe', subscription: { type: 'trades', coin: COIN } },
 };
+const ackActiveAssetCtx = {
+  channel: 'subscriptionResponse',
+  data: { method: 'subscribe', subscription: { type: 'activeAssetCtx', coin: COIN } },
+};
 
 const row = (px, sz, n = 1) => ({ px, sz, n });
 const book = (time, bids = [row('83457.0', '1.54301', 4), row('83456.0', '0.01793')], asks = [
@@ -102,11 +106,12 @@ test('the adapter names the Hyperliquid endpoint, its channels and their ack key
   assert.equal(adapter.restUrl, 'https://api.hyperliquid.xyz/info');
   assert.equal(adapter.ackMode, 'explicit');
   assert.equal(adapter.boundary, 'sequence', 'the frame time is the ordering this stream carries');
-  assert.deepEqual(adapter.expectedSubscriptions(), [`l2Book:${COIN}`, `trades:${COIN}`]);
+  assert.deepEqual(adapter.expectedSubscriptions(), [`l2Book:${COIN}`, `trades:${COIN}`, `activeAssetCtx:${COIN}`]);
   const messages = adapter.subscribeMessages().map((message) => JSON.parse(message));
   assert.deepEqual(messages, [
     { method: 'subscribe', subscription: { type: 'l2Book', coin: COIN } },
     { method: 'subscribe', subscription: { type: 'trades', coin: COIN } },
+    { method: 'subscribe', subscription: { type: 'activeAssetCtx', coin: COIN } },
   ]);
 });
 
@@ -428,11 +433,13 @@ test('the two acks establish the link, and the live frames flow', async () => {
     'the book is asked for first',
   );
   assert.deepEqual(JSON.parse(sockets.sockets[0].sent[1]), { method: 'subscribe', subscription: { type: 'trades', coin: COIN } });
-  assert.equal(sockets.sockets[0].sent.length, 2, 'nothing else is sent on open: the ping waits for the silence it answers');
+  assert.deepEqual(JSON.parse(sockets.sockets[0].sent[2]), { method: 'subscribe', subscription: { type: 'activeAssetCtx', coin: COIN } });
+  assert.equal(sockets.sockets[0].sent.length, 3, 'nothing else is sent on open: the ping waits for the silence it answers');
 
   sockets.sockets[0].deliver(JSON.stringify(ackL2Book));
   assert.equal(connection.subscriptionState, 'pending', 'one ack is not the whole set');
   sockets.sockets[0].deliver(JSON.stringify(ackTrades));
+  sockets.sockets[0].deliver(JSON.stringify(ackActiveAssetCtx));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
 
   sockets.sockets[0].deliver(JSON.stringify(book(1_700_000_000_000)));
@@ -471,6 +478,7 @@ test('a backwards book frame replaces the connection fail-closed instead of reac
   sockets.sockets[0].onopen();
   sockets.sockets[0].deliver(JSON.stringify(ackL2Book));
   sockets.sockets[0].deliver(JSON.stringify(ackTrades));
+  sockets.sockets[0].deliver(JSON.stringify(ackActiveAssetCtx));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
   sockets.sockets[0].deliver(JSON.stringify(book(5000)));
   await until(() => envelopes.length === 1, { label: 'the first frame' });
@@ -491,6 +499,7 @@ test('an error frame replaces the connection, and an unclassifiable frame is cou
   sockets.sockets[0].onopen();
   sockets.sockets[0].deliver(JSON.stringify(ackL2Book));
   sockets.sockets[0].deliver(JSON.stringify(ackTrades));
+  sockets.sockets[0].deliver(JSON.stringify(ackActiveAssetCtx));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
 
   sockets.sockets[0].deliver('this is not json');

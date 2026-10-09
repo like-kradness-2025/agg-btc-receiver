@@ -103,12 +103,15 @@ test('the perpetual adapter names the post-8443 endpoint, its topics and their o
   assert.equal(adapter.url, 'wss://ws.okx.com/ws/v5/public');
   assert.equal(adapter.restUrl, `https://openapi.okx.com/api/v5/market/books?instId=${PERP}&sz=400`);
   assert.equal(adapter.ackMode, 'explicit');
-  assert.deepEqual(adapter.expectedSubscriptions(), [bookTopic(PERP), tradeTopic(PERP), 'liquidation-orders:SWAP']);
+  assert.deepEqual(adapter.expectedSubscriptions(), [bookTopic(PERP), tradeTopic(PERP), 'liquidation-orders:SWAP', `open-interest:${PERP}`, `funding-rate:${PERP}`, `mark-price:${PERP}`]);
   const messages = adapter.subscribeMessages().map((message) => JSON.parse(message));
   assert.deepEqual(messages, [
     { id: 'ob1', op: 'subscribe', args: [{ channel: 'books', instId: PERP }] },
     { id: 'tr1', op: 'subscribe', args: [{ channel: 'trades', instId: PERP }] },
     { id: 'lq1', op: 'subscribe', args: [{ channel: 'liquidation-orders', instType: 'SWAP' }] },
+    { id: 'oi1', op: 'subscribe', args: [{ channel: 'open-interest', instId: PERP }] },
+    { id: 'fr1', op: 'subscribe', args: [{ channel: 'funding-rate', instId: PERP }] },
+    { id: 'mp1', op: 'subscribe', args: [{ channel: 'mark-price', instId: PERP }] },
   ]);
 });
 
@@ -465,12 +468,15 @@ test('the connection admits okx when every topic is acknowledged, and the live f
   sockets.sockets[0].onopen();
   assert.deepEqual(
     sockets.sockets[0].sent.map((message) => JSON.parse(message).id),
-    ['ob1', 'tr1', 'lq1'],
+    ['ob1', 'tr1', 'lq1', 'oi1', 'fr1', 'mp1'],
     'each topic was asked for under its own id',
   );
   sockets.sockets[0].deliver(JSON.stringify(ack('books', { instId: PERP })));
   sockets.sockets[0].deliver(JSON.stringify(ack('trades', { instId: PERP })));
   sockets.sockets[0].deliver(JSON.stringify(ack('liquidation-orders', { instType: 'SWAP' })));
+  sockets.sockets[0].deliver(JSON.stringify(ack('open-interest', { instId: PERP })));
+  sockets.sockets[0].deliver(JSON.stringify(ack('funding-rate', { instId: PERP })));
+  sockets.sockets[0].deliver(JSON.stringify(ack('mark-price', { instId: PERP })));
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
 
   sockets.sockets[0].deliver(JSON.stringify(snapshot(PERP, 100)));
@@ -508,7 +514,7 @@ test('a sequence gap replaces the connection fail-closed instead of reaching the
   const connection = openConnection({ adapter, sockets, envelopes, diagnostics });
   connection.start();
   sockets.sockets[0].onopen();
-  for (const [channel, extra] of [['books', { instId: PERP }], ['trades', { instId: PERP }], ['liquidation-orders', { instType: 'SWAP' }]]) {
+  for (const [channel, extra] of [['books', { instId: PERP }], ['trades', { instId: PERP }], ['liquidation-orders', { instType: 'SWAP' }], ['open-interest', { instId: PERP }], ['funding-rate', { instId: PERP }], ['mark-price', { instId: PERP }]]) {
     sockets.sockets[0].deliver(JSON.stringify(ack(channel, extra)));
   }
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });
@@ -531,7 +537,7 @@ test('an unclassifiable frame is counted, not silently dropped', async () => {
   const connection = openConnection({ adapter, sockets, diagnostics, envelopes });
   connection.start();
   sockets.sockets[0].onopen();
-  for (const [channel, extra] of [['books', { instId: PERP }], ['trades', { instId: PERP }], ['liquidation-orders', { instType: 'SWAP' }]]) {
+  for (const [channel, extra] of [['books', { instId: PERP }], ['trades', { instId: PERP }], ['liquidation-orders', { instType: 'SWAP' }], ['open-interest', { instId: PERP }], ['funding-rate', { instId: PERP }], ['mark-price', { instId: PERP }]]) {
     sockets.sockets[0].deliver(JSON.stringify(ack(channel, extra)));
   }
   await until(() => connection.subscriptionState === 'acknowledged', { label: 'establishment' });

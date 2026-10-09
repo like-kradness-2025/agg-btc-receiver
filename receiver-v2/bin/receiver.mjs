@@ -183,6 +183,7 @@ async function main(argv) {
       bookStorePath: config.stores.book,
       spoolDir: config.spoolDir,
       ...(config.rawDir === undefined ? {} : { rawDir: config.rawDir }),
+      ...(config.oiPollIntervalMs === undefined ? {} : { oiPollIntervalMs: config.oiPollIntervalMs }),
       routerListenPath: routerPath,
       // The startup deadline is carried only when the config named one: absent means the supervisor's own
       // default applies, so the entrance does not pass a value the deployment never chose.
