@@ -233,7 +233,24 @@ export function createStructure({
   const bookInternal = internalsOf(book);
   const ledgerInternal = internalsOf(ledger);
   const organizerInternal = internalsOf(organizer);
-  const spool = spoolDir ? constructing(() => createSpool({ dir: spoolDir })) : null;
+  const spool = spoolDir
+    ? constructing(() => {
+        const opened = createSpool({ dir: spoolDir });
+        // Set 8c: this side may be the first to open the spool, so the cut a reopen had to make is
+        // reported here as well as in the ingest - whichever process opens it first sees it.
+        if (opened.lastRepair) {
+          try {
+            onDiagnostic({
+              market,
+              reason: `the spool tail was cut: ${opened.lastRepair.removed} byte(s) after offset ${opened.lastRepair.from} in segment ${opened.lastRepair.segment} were unreadable`,
+            });
+          } catch {
+            // a diagnostic is best-effort by contract
+          }
+        }
+        return opened;
+      })
+    : null;
 
   // The run this structure has already admitted for this board. A takeover is issued once per run: the
   // second connection of the same run is a change of connection, not a new claim on the board, and the

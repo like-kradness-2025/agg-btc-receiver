@@ -130,6 +130,48 @@ export function createSpool(options = {}) {
   let unreadable = null;
   let bytes = segments.reduce((sum, segment) => sum + segment.bytes, 0);
   let fsyncTimer = null;
+  // Set 8c: a process killed mid-write leaves an incomplete record at the tail of the segment it was
+  // writing. Its bytes are not a record, so nothing after them can ever be read, and appending past
+  // them would bury every later record behind unreadable bytes - a spool that can never drain again.
+  // The bytes after the last complete record were never durable either: a record is confirmable only
+  // once it is whole, and the cursor can only sit past a complete one, so cutting them cannot take
+  // anything a consumer was told it had. The cut is reported rather than silent.
+  let repairedTail = null;
+  if (current && current.bytes > 0) {
+    const tailFile = path.join(dir, current.name);
+    let tailBytes = null;
+    try {
+      const fd = fsModule.openSync(tailFile, 'r');
+      try {
+        tailBytes = fsModule.readFileSync(fd);
+      } finally {
+        fsModule.closeSync(fd);
+      }
+    } catch {
+      tailBytes = null;
+    }
+    if (tailBytes !== null) {
+      const decoder = createFrameDecoder({ maxBytes: FRAME_MAX_BYTES + 1 });
+      let end = 0;
+      let torn = false;
+      try {
+        for (const record of decoder.push(tailBytes)) end += RECORD_OVERHEAD + record.length;
+        // A prefix of a valid record shorter than the record itself: the process died mid-write.
+        torn = decoder.bufferedBytes > 0 || end < tailBytes.length;
+      } catch {
+        // A length the format cannot have written is corruption, not a torn write. It is left exactly
+        // where it is: the walk's own verdict ends the run loudly, and a reopen that quietly cut
+        // bytes it cannot account for would turn a stopped run into a silent one.
+        torn = false;
+      }
+      if (torn && end < current.bytes) {
+        fsModule.truncateSync(tailFile, end);
+        repairedTail = { segment: current.index, from: end, removed: current.bytes - end };
+        bytes -= current.bytes - end;
+        current.bytes = end;
+      }
+    }
+  }
 
   function openCurrent() {
     if (handle) return handle;
@@ -544,6 +586,10 @@ export function createSpool(options = {}) {
      */
     get unreadable() {
       return unreadable;
+    },
+    /** Set 8c: what the reopen cut from the last segment, or null when there was nothing to cut. */
+    get lastRepair() {
+      return repairedTail;
     },
   };
 }

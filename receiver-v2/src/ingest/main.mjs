@@ -125,6 +125,19 @@ export function createIngestProcess({
   if (store === null) throw new TypeError('the ingest process needs an ingest store (a path or an open store)');
 
   const spool = spoolDir ? createSpool({ dir: spoolDir, ...spoolOptions }) : null;
+  // Set 8c: a reopen that had to cut an incomplete tail (a process killed mid-write) is a fact about
+  // what the spool held and is reported rather than passed over in silence - the cut bytes were never
+  // confirmable, so nothing a consumer was told it had is lost, but the tear itself is worth seeing.
+  if (spool !== null && spool.lastRepair !== null && spool.lastRepair !== undefined) {
+    try {
+      onDiagnostic({
+        market,
+        reason: `the spool tail was cut: ${spool.lastRepair.removed} byte(s) after offset ${spool.lastRepair.from} in segment ${spool.lastRepair.segment} were unreadable`,
+      });
+    } catch {
+      // a diagnostic is best-effort by contract
+    }
+  }
   // Set 7a: the canonical raw writer. It owns one database per market under `rawDir`, and it is the
   // single writer of those files (the same discipline as the store above). Opened here, synchronously,
   // so a directory that cannot be created fails construction rather than the first frame.

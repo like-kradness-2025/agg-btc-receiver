@@ -147,11 +147,12 @@ test('a torn tail is reported, not parsed as a record', async () => {
     for (let i = 1; i <= 3; i += 1) spool.append(envelope(i));
     spool.sync();
     spool.close();
-    // Simulate a process that died mid-write: half a record appended after the last complete one.
+    // Set 8c cuts a tear it finds at reopen, so the tear has to appear *during* the run to exercise
+    // the walk's own verdict: this is a read-time tear, not a crash.
     const segment = join(dir, 'segment-0000000001.spool');
-    fs.appendFileSync(segment, Buffer.from([0x00, 0x00, 0x01, 0x00, 0x7b]));
 
     const reopened = createSpool({ dir });
+    fs.appendFileSync(segment, Buffer.from([0x00, 0x00, 0x01, 0x00, 0x7b]));
     const seen = [];
     let torn = null;
     const iterator = reopened.drain();
@@ -556,5 +557,61 @@ test('Set 6b: a save that fails on the clock is retried instead of taking the pr
       'and no further retry is armed',
     );
     spool.close();
+  });
+});
+
+test('Set 8c: a torn tail is cut at reopen, so a restart can append and drain again', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir });
+    for (let i = 1; i <= 3; i += 1) spool.append(envelope(i));
+    spool.sync();
+    spool.close();
+    // A process that died mid-write: half a record appended after the last complete one.
+    const segment = join(dir, 'segment-0000000001.spool');
+    fs.appendFileSync(segment, Buffer.from([0x00, 0x00, 0x01, 0x00, 0x7b]));
+    const sizeBefore = fs.statSync(segment).size;
+
+    const reopened = createSpool({ dir });
+    assert.ok(reopened.lastRepair, 'the cut is reported');
+    assert.ok(reopened.lastRepair.from > 0, 'a real prefix of complete records was kept');
+    assert.ok(fs.statSync(segment).size < sizeBefore, 'the unreadable tail is gone');
+    // The restart appends and drains. Without the cut the new record would sit behind unreadable
+    // bytes and nothing after it could ever be read - the spool would never drain again.
+    reopened.append(envelope(4));
+    reopened.sync();
+    const seen = [];
+    const iterator = reopened.drain();
+    for (;;) {
+      const step = iterator.next();
+      if (step.done) break;
+      seen.push(step.value.receive_seq);
+    }
+    assert.deepEqual(seen, [1, 2, 3, 4], 'the records before the tear and the new one all read');
+    reopened.close();
+  });
+});
+
+test('Set 8c: a three-byte remnant (less than a length prefix) is cut too', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir });
+    spool.append(envelope(1));
+    spool.sync();
+    spool.close();
+    const segment = join(dir, 'segment-0000000001.spool');
+    fs.appendFileSync(segment, Buffer.from([0x01, 0x02, 0x03]));
+    const reopened = createSpool({ dir });
+    assert.ok(reopened.lastRepair, 'a fragment shorter than a length prefix is a torn write');
+    assert.equal(reopened.lastRepair.removed, 3);
+    reopened.append(envelope(2));
+    reopened.sync();
+    const seen = [];
+    const iterator = reopened.drain();
+    for (;;) {
+      const step = iterator.next();
+      if (step.done) break;
+      seen.push(step.value.receive_seq);
+    }
+    assert.deepEqual(seen, [1, 2], 'the fragment did not bury the record written after it');
+    reopened.close();
   });
 });
