@@ -26,6 +26,7 @@ import { FRAME_MAX_BYTES, createFrameDecoder, decodeEnvelope, encodeEnvelope, fr
 
 export const DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_FSYNC_MS = 1000;
+const DEFAULT_CURSOR_SAVE_MS = 100;
 export const DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 /**
  * The second half of the bound: the spec says the spool may hold the earlier of 5% of the
@@ -67,6 +68,12 @@ export function createSpool(options = {}) {
     dir,
     segmentBytes = DEFAULT_SEGMENT_BYTES,
     fsyncMs = DEFAULT_FSYNC_MS,
+    // Set 6b: how long a confirmed position may wait before it is written to the cursor file. The
+    // position itself moves in memory at the moment of the advance; what waits is the file write,
+    // the fsync and the segment deletion behind it - one fsync per save instead of one per release.
+    // Zero is the synchronous mode: every advance saves at once (tests pin it, and a caller that
+    // wants the old frame-by-frame order can ask for it).
+    cursorSaveMs = DEFAULT_CURSOR_SAVE_MS,
     maxBytes = DEFAULT_MAX_BYTES,
     fsModule = fs,
     setTimer = setTimeout,
@@ -109,6 +116,13 @@ export function createSpool(options = {}) {
   let handle = null;
   let current = segments.length > 0 ? segments[segments.length - 1] : null;
   let dirty = false;
+  // Set 6b: the cursor file lags the in-memory cursor by at most one save. The deletion of released
+  // segments happens at the save, right after the file is written, so the file never falls behind
+  // what has been deleted - a restart reads a position at or before the oldest surviving segment,
+  // and everything it can still see is walked and offered again (the duplicate is answered from the
+  // record, so the resend costs a round trip and nothing else).
+  let cursorTimer = null;
+  let cursorDirty = false;
   let failed = null;
   // Set by the latest drainRecords walk when a segment's bytes did not describe a length the format can
   // have written: the walk cannot continue, and a consumer has to be able to tell that "it ended" from
@@ -136,7 +150,16 @@ export function createSpool(options = {}) {
     if (fsyncTimer !== null) return;
     fsyncTimer = setTimer(() => {
       fsyncTimer = null;
-      flush();
+      try {
+        flush();
+      } catch {
+        // A scheduled fsync that fails is retried on the next clock rather than crashing the
+        // process: the bytes are still in the page cache and the next flush covers them, while a
+        // process that died here would be a run stopped over a transient write error (the run
+        // supervisor does not restart an ingest that exited). The explicit callers - `sync()`,
+        // `close()` - still see the failure themselves.
+        scheduleFsync();
+      }
     }, fsyncMs);
     if (typeof fsyncTimer.unref === 'function') fsyncTimer.unref();
   }
@@ -357,14 +380,20 @@ export function createSpool(options = {}) {
   /**
    * Confirm everything up to this position as consumed and durable elsewhere.
    *
-   * The caller may only pass a contiguous position; segments entirely behind it are deleted, which
-   * is what keeps the spool bounded. Deleting more than the caller confirmed would be data loss.
+   * The caller may only pass a contiguous position; segments entirely behind it are released, which
+   * is what keeps the spool bounded. Releasing more than the caller confirmed would be data loss.
    *
    * This is also where a position at a segment's end becomes the start of the next one: an end is
    * only a release when it is the end *now*. A position read earlier is compared against the
    * segment as it is at this moment, so a segment that has grown since keeps the cursor inside
    * itself and the bytes written after the confirmed record stay readable; only a position that is
    * still the whole segment's end releases it.
+   *
+   * Set 6b: the advance moves the position in memory, and the file and the deletion follow on the
+   * save clock (`cursorSaveMs`) rather than at the release. A release can arrive per acknowledged
+   * frame, and one fsync for each of those is a cost the disk answers for the whole pipeline; the
+   * save writes the latest position once, and the ordering (file first, deletion after) is what
+   * keeps a restart from reading a position ahead of the segments it can still see.
    */
   function advance(position) {
     if (!position || position.segment === null || position.segment === undefined) return;
@@ -374,17 +403,77 @@ export function createSpool(options = {}) {
       entry !== undefined && Number.isInteger(offset) && offset === entry.bytes
         ? { segment: segment + 1, offset: 0 }
         : { segment, offset };
+    if (cursorAt.segment === cursor.segment && cursorAt.offset === cursor.offset) return;
     cursor = cursorAt;
-    const fd = fsModule.openSync(cursorPath, 'w');
+    cursorDirty = true;
+    if (cursorSaveMs > 0) scheduleCursorSave();
+    else saveCursor();
+  }
+
+  function scheduleCursorSave() {
+    if (cursorTimer !== null || !cursorDirty) return;
+    cursorTimer = setTimer(() => {
+      cursorTimer = null;
+      try {
+        saveCursor();
+      } catch {
+        // Same rule as the segment fsync, and the same reason: the position stays dirty and the
+        // next clock retries it. Nothing is lost by waiting - the segments are still there - and
+        // the paths where the position must be on disk before anything else happens (the
+        // acceptance gate, the seal, the drain) save loudly and withhold what depends on them.
+        scheduleCursorSave();
+      }
+    }, cursorSaveMs);
+    if (typeof cursorTimer.unref === 'function') cursorTimer.unref();
+  }
+
+  /**
+   * Write the confirmed position down, then release the segments entirely behind it.
+   *
+   * The order is the point: the file names where a restart resumes, so a segment may only be
+   * deleted once the file says the consumer is past it. A write that fails leaves both the file
+   * and the segments as they were - the position stays unsaved, the data stays readable, and the
+   * caller sees the failure rather than a spool that looks further along than it is.
+   */
+  function saveCursor() {
+    if (cursorTimer !== null) {
+      clearTimer(cursorTimer);
+      cursorTimer = null;
+    }
+    if (!cursorDirty) return;
+    // The write goes to a temporary file and is renamed over the real one: the cursor file a
+    // restart reads is always either the position it had or the new one, never a half-written
+    // one. A write that fails part-way, or a short write, leaves the old file in place and the
+    // segments untouched - the failure is reported to the caller, and the position stays unsaved
+    // rather than becoming a file that reads as a different position than it is.
+    const serialized = JSON.stringify(cursor);
+    const tempPath = `${cursorPath}.tmp`;
+    const fd = fsModule.openSync(tempPath, 'w');
     try {
-      fsModule.writeSync(fd, JSON.stringify(cursor));
+      const written = fsModule.writeSync(fd, serialized);
+      if (written !== Buffer.byteLength(serialized)) {
+        throw new Error('the cursor was only partly written');
+      }
       fsModule.fsyncSync(fd);
     } finally {
       fsModule.closeSync(fd);
     }
+    fsModule.renameSync(tempPath, cursorPath);
+    // The rename has to be durable before anything is allowed to follow it. Without the directory
+    // fsync a power loss can leave the old cursor file behind while the segments it released are
+    // still present - and a restart that walks them after the generation has switched would offer
+    // records the new connection refuses, stopping the release order for good. The directory fsync
+    // is what makes "saved" mean the file a restart will read; only then are segments deleted.
+    const dirFd = fsModule.openSync(dir, 'r');
+    try {
+      fsModule.fsyncSync(dirFd);
+    } finally {
+      fsModule.closeSync(dirFd);
+    }
+    cursorDirty = false;
     const kept = [];
     for (const segmentEntry of segments) {
-      if (segmentEntry.index < cursorAt.segment) {
+      if (segmentEntry.index < cursor.segment) {
         bytes -= segmentEntry.bytes;
         try {
           fsModule.unlinkSync(path.join(dir, segmentEntry.name));
@@ -403,7 +492,21 @@ export function createSpool(options = {}) {
       clearTimer(fsyncTimer);
       fsyncTimer = null;
     }
+    if (cursorTimer !== null) {
+      clearTimer(cursorTimer);
+      cursorTimer = null;
+    }
     flush();
+    try {
+      // Best effort: a position that cannot be written down at closing is a position the next life
+      // walks again (the segments are still there - nothing was deleted past it), which costs a
+      // resend and nothing else. Closing must not be turned into a failure by a save the caller
+      // cannot act on any more; the paths where the position matters - the drain, the seal, the
+      // acceptance gate - save loudly.
+      saveCursor();
+    } catch {
+      /* the position stays unwritten; the data stays readable */
+    }
     if (handle) {
       fsModule.closeSync(handle);
       handle = null;
@@ -415,6 +518,7 @@ export function createSpool(options = {}) {
     drain,
     drainRecords,
     advance,
+    saveCursor,
     close,
     sync: flush,
     get bytes() {

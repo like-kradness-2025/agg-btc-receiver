@@ -498,7 +498,14 @@ export function createStructure({
         walkingSpool = false;
         drainingSpool = false;
       }
-      if (lastConsumed !== null) spool.advance(lastConsumed);
+      if (lastConsumed !== null) {
+        spool.advance(lastConsumed);
+        // Set 6b: the drain is also where the cursor is forced onto disk. The walk's own emptiness
+        // check reads `bytes`, which the save settles, and a drain whose save fails is a drain that
+        // did not finish - the failure travels to the caller instead of a spool that looks empty
+        // while its position was never written down.
+        spool.saveCursor();
+      }
       // A walk that consumed some records can still have ended at a desynchronised one: the spool's own
       // verdict says the bytes stopped describing records, which is a corrupt spool and not a finished
       // drain. It is reported as the same stop a record the walk could not hand back produces, so the

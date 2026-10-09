@@ -167,6 +167,24 @@ export function createIngestProcess({
   // link opens (or the next attempt can try), not never.
   let recoveryWanted = false;
   let deferredAdmission = null;
+  // Set 6b: a generation that waits on a cursor save it could not write must not wait for a trigger
+  // that will never come. The last acknowledgement emptied the FIFO (so the stall clock is off) and
+  // the failed save cleared the save clock itself; the retry below is what keeps the gate live. The
+  // failure is reported once per episode, the retry runs until the save succeeds, and the venue
+  // link's own reconnection model - wait, keep asking, report once - is the one it follows.
+  let admissionRetryTimer = null;
+  let admissionSaveFailureReported = false;
+  const ADMISSION_RETRY_MS = 200;
+
+  /** The clock that keeps a deferred acceptance live when the save or the send could not go through. */
+  function armAdmissionRetry() {
+    if (admissionRetryTimer !== null) return;
+    admissionRetryTimer = setTimer(() => {
+      admissionRetryTimer = null;
+      tryDeferredAdmission();
+    }, ADMISSION_RETRY_MS);
+    if (typeof admissionRetryTimer?.unref === 'function') admissionRetryTimer.unref();
+  }
 
   const connection = createReceiveConnection({
     ...receiveOptions,
@@ -441,9 +459,36 @@ export function createIngestProcess({
   function tryDeferredAdmission() {
     if (deferredAdmission === null) return false;
     if (fifo !== null && fifo.size > 0) return false;
+    // Set 6b: the cursor file must name the current confirmed position before a new generation is
+    // announced. The save clock may still be holding it back, and a crash with a lagging file would
+    // rebuild the release order from a position the old generation has already moved past - its
+    // records, once the new connection is accepted, would be refused for ever, and the release
+    // order would stop at a record nobody can acknowledge. The save is what makes the gate's
+    // emptiness true of the file as well as of the FIFO; a save that fails withholds the
+    // acceptance, and the deadline that follows is the honest report of it.
+    if (spool !== null) {
+      try {
+        spool.saveCursor();
+        admissionSaveFailureReported = false;
+      } catch (error) {
+        if (!admissionSaveFailureReported) {
+          admissionSaveFailureReported = true;
+          onDiagnostic({ market, reason: `the cursor could not be saved before the acceptance: ${error.message}` });
+        }
+        armAdmissionRetry();
+        return false;
+      }
+    }
     const sent = announceAccept(deferredAdmission.message);
-    if (sent === true) deferredAdmission = null;
-    return sent === true;
+    if (sent === true) {
+      deferredAdmission = null;
+      return true;
+    }
+    // The send itself was refused - the link is full, or the channel is momentarily gone. The same
+    // clock covers it: the FIFO is empty, so no acknowledgement is coming to ask again, and the
+    // gate would wait for a trigger that does not exist.
+    armAdmissionRetry();
+    return false;
   }
 
   function announceAccept(message) {
@@ -969,6 +1014,18 @@ export function createIngestProcess({
    */
   async function sealTails() {
     await quiesce();
+    // Set 6b: the released-but-unsaved position holds `bytes` above zero until the save runs, and
+    // `finalTailCandidate` reads exactly that to decide the spool is empty. The save is what turns
+    // "every acknowledgement arrived" into "the spool says so"; without it the seal would wait for
+    // a clock that has nothing left to wait for, and the run could never be reported complete.
+    if (spool !== null) {
+      try {
+        spool.saveCursor();
+      } catch (error) {
+        onDiagnostic({ market, reason: `the cursor could not be saved before sealing: ${error.message}` });
+        return null;
+      }
+    }
     const candidate = finalTailCandidate();
     if (candidate === null) return null;
     sendControlBestEffort(
@@ -1121,6 +1178,10 @@ export function createIngestProcess({
     close() {
       if (closed) return;
       fenceReception();
+      if (admissionRetryTimer !== null) {
+        clearTimer(admissionRetryTimer);
+        admissionRetryTimer = null;
+      }
       spool?.close();
       if (openedStoreHere) {
         store.close();

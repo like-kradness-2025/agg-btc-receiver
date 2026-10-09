@@ -899,10 +899,14 @@ test('a throwing channel diagnostic still spools the frame and permits a candida
       generation: 1,
       payload: { up_to_seq: 1 },
     });
-    assert.equal(h.process.spool.bytes, 0);
+    // Set 6b: the acknowledgement moved the release order in memory, but the save clock still holds
+    // the position back - and the seal is where it is forced, which is what lets the candidate be
+    // produced at all.
+    assert.ok(h.process.spool.bytes > 0, 'the release is not on disk yet');
     const afterAck = await h.process.sealTails();
     assert.equal(afterAck?.spoolEmpty, true, 'successful fallback was not marked as lost');
     assert.equal(afterAck?.tails[0]?.lastReceivedSeq, 1);
+    assert.equal(h.process.spool.bytes, 0, 'and the seal forced the save that settles the spool');
   } finally {
     h.close();
   }
@@ -1274,6 +1278,122 @@ test('⑥ a peer restart changes neither the receive generation nor the run', as
     assert.equal(h.process.runId, 'run-1', 'nor the receive run');
     assert.equal(h.process.roleInstance, 'ingest-a', 'nor the ingest instance id');
     assert.equal(h.process.peerInstances.get('book'), 'book-3', 'only the peer instance changed');
+  } finally {
+    await h.teardown();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Set 6b: the cursor save is deferred, and the generation gate is where it is forced
+// ---------------------------------------------------------------------------------------------------
+
+test('Set 6b: the cursor is on disk before a deferred generation is announced', async () => {
+  // The save clock is an hour away: the only thing that can put the position on disk is the gate
+  // itself, so this is what proves the gate forces it.
+  const h = await setup({ label: 'gate', spoolOptions: { cursorSaveMs: 3_600_000 } });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    const oldConnectionId = h.process.connectionId;
+    assert.ok(h.process.spool.bytes > 0, 'the frame is retained');
+    assert.equal(fs.existsSync(join(h.dir, 'spool-gate', 'cursor')), false, 'nothing is saved yet');
+
+    // The venue connection dies: the next generation waits for the old retention, and the moment
+    // the acknowledgement releases it the acceptance goes out - with the position on disk.
+    h.sockets[0].onclose();
+    await until(() => h.process.generation === 2);
+    h.organize.sendDurableAck({ connectionId: oldConnectionId, generation: 1, upToSeq: 1 });
+    await until(() => h.organize.state.accepts.some((message) => message.generation === 2), { timeoutMs: 2000 });
+
+    const onDisk = JSON.parse(fs.readFileSync(join(h.dir, 'spool-gate', 'cursor'), 'utf8'));
+    assert.deepEqual(
+      onDisk,
+      h.process.spool.cursor,
+      'the file names the confirmed position the acceptance was gated on',
+    );
+    assert.deepEqual(h.process.spool.segments, [], 'and the released segment is gone with it');
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('Set 6b: a gate save that fails is retried until the cursor can be written', async () => {
+  const h = await setup({ label: 'gate-retry', spoolOptions: { cursorSaveMs: 3_600_000 } });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    const oldConnectionId = h.process.connectionId;
+
+    // The cursor cannot be written: a directory where the file belongs makes the real save fail
+    // with EISDIR. The generation must not be announced over a position that is not on disk.
+    const cursorPath = join(h.dir, 'spool-gate-retry', 'cursor');
+    fs.mkdirSync(cursorPath);
+    h.sockets[0].onclose();
+    await until(() => h.process.generation === 2);
+    h.organize.sendDurableAck({ connectionId: oldConnectionId, generation: 1, upToSeq: 1 });
+    await until(() =>
+      h.diagnostics.some((d) => /cursor could not be saved before the acceptance/.test(String(d.reason))),
+    );
+    assert.equal(
+      h.organize.state.accepts.filter((message) => message.generation === 2).length,
+      0,
+      'the acceptance waits for a position that is really on disk',
+    );
+    const reported = h.diagnostics.filter((d) =>
+      /cursor could not be saved before the acceptance/.test(String(d.reason)),
+    ).length;
+
+    // The failure clears: the retry clock is what keeps the gate live, and the acceptance follows.
+    fs.rmdirSync(cursorPath);
+    h.fireByDelay(200);
+    await until(() => h.organize.state.accepts.some((message) => message.generation === 2), { timeoutMs: 2000 });
+    const onDisk = JSON.parse(fs.readFileSync(cursorPath, 'utf8'));
+    assert.deepEqual(onDisk, h.process.spool.cursor, 'the retried save wrote the confirmed position');
+    assert.equal(
+      h.diagnostics.filter((d) => /cursor could not be saved before the acceptance/.test(String(d.reason))).length,
+      reported,
+      'the failure was reported once per episode, not once per retry',
+    );
+  } finally {
+    await h.teardown();
+  }
+});
+
+test('Set 6b: a retry whose acceptance cannot be sent keeps its clock armed', async () => {
+  const h = await setup({ label: 'gate-send', spoolOptions: { cursorSaveMs: 3_600_000 } });
+  try {
+    h.process.start();
+    await until(() => h.sockets.length === 1);
+    h.sockets[0].onopen();
+    h.sockets[0].deliver('{"seq":1}');
+    await until(() => h.organize.state.envelopes.length === 1);
+    const oldConnectionId = h.process.connectionId;
+
+    // The gate save fails first (a directory where the cursor file belongs).
+    const cursorPath = join(h.dir, 'spool-gate-send', 'cursor');
+    fs.mkdirSync(cursorPath);
+    h.sockets[0].onclose();
+    await until(() => h.process.generation === 2);
+    h.organize.sendDurableAck({ connectionId: oldConnectionId, generation: 1, upToSeq: 1 });
+    await until(() =>
+      h.diagnostics.some((d) => /cursor could not be saved before the acceptance/.test(String(d.reason))),
+    );
+
+    // The save recovers, but the link is gone by the time the retry runs: the acceptance cannot be
+    // sent, and the clock must cover that too - nothing else will ask again (the FIFO is empty).
+    fs.rmdirSync(cursorPath);
+    await h.organize.close();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    h.fireByDelay(200);
+    const rearmed = h.timers.filter((timer) => timer.ms === 200 && !timer.cleared);
+    assert.equal(rearmed.length, 1, 'the refused send re-armed the retry clock');
+    assert.equal(h.organize.state.accepts.filter((message) => message.generation === 2).length, 0, 'nothing was announced over a dead link');
   } finally {
     await h.teardown();
   }

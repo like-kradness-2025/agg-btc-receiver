@@ -75,7 +75,9 @@ test('a record over the bound is refused, not written and not dropped', async ()
 
 test('a consumer that confirmed a position does not get that data again', async () => {
   await withSpool(async (dir) => {
-    const spool = createSpool({ dir });
+    // The synchronous mode: every advance saves at once, which is the frame-by-frame contract this
+    // test pins. The deferred mode (the default) is exercised by its own tests below.
+    const spool = createSpool({ dir, cursorSaveMs: 0 });
     for (let i = 1; i <= 4; i += 1) spool.append(envelope(i));
     spool.sync();
     const first = [...spool.drain()].filter((v) => v && typeof v === 'object');
@@ -288,7 +290,7 @@ test('a position that was an end when it was read is not an end once the segment
 
 test('a fully consumed segment is released, and a record after the drain starts ahead of the cursor', async () => {
   await withSpool(async (dir) => {
-    const spool = createSpool({ dir });
+    const spool = createSpool({ dir, cursorSaveMs: 0 });
     for (const seq of [1, 2, 3]) spool.append(envelope(seq));
     spool.sync();
     const records = [...spool.drainRecords()];
@@ -339,6 +341,219 @@ test('the free-space half of the bound refuses a record and deletes nothing', as
       [...spool.drainRecords()].map((record) => record.envelope.receive_seq),
       Array.from({ length: accepted }, (_, i) => i + 1),
       'a refusal never discards what is already spooled',
+    );
+    spool.close();
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Set 6b: the cursor save is deferred. The position moves in memory at the advance; the file write,
+// its fsync and the segment deletion behind it happen on the save clock - or at an explicit save.
+// ------------------------------------------------------------------------------------------------
+function fakeClocks() {
+  const timers = [];
+  return {
+    timers,
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      timer.cleared = true;
+    },
+    fire: (ms) => {
+      const timer = timers.find((entry) => entry.ms === ms && !entry.cleared);
+      assert.ok(timer, `a timer of ${ms} ms was armed`);
+      timer.cleared = true;
+      timer.fn();
+    },
+  };
+}
+
+test('Set 6b: an advance moves the position in memory and leaves the file and the segments to the clock', async () => {
+  await withSpool(async (dir) => {
+    const clocks = fakeClocks();
+    const spool = createSpool({ dir, cursorSaveMs: 100, setTimer: clocks.setTimer, clearTimer: clocks.clearTimer });
+    for (let i = 1; i <= 4; i += 1) spool.append(envelope(i));
+    spool.sync();
+    spool.advance({ segment: 2, offset: 0 });
+    assert.deepEqual(spool.cursor, { segment: 2, offset: 0 }, 'the position moved in memory at once');
+    assert.equal(fs.existsSync(join(dir, 'cursor')), false, 'the file has not been written yet');
+    assert.equal(spool.segments.length, 1, 'and nothing was deleted yet');
+    assert.ok(spool.bytes > 0, 'the spool still counts what it holds');
+
+    clocks.fire(100);
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(join(dir, 'cursor'), 'utf8')),
+      { segment: 2, offset: 0 },
+      'the clock wrote the position down',
+    );
+    assert.deepEqual(spool.segments, [], 'and only then released the segment behind it');
+    assert.equal(spool.bytes, 0, 'and nothing is counted as held');
+    spool.close();
+  });
+});
+
+test('Set 6b: the save writes the file before it deletes anything, and a failed write deletes nothing', async () => {
+  await withSpool(async (dir) => {
+    // The ordering is observed where it matters: at the moment of the first unlink, the file must
+    // already name the position the deletion is justified by.
+    const observations = [];
+    const events = [];
+    let failCursorWrite = false;
+    let shortWrite = false;
+    const fsModule = {
+      ...fs,
+      unlinkSync: (file) => {
+        observations.push(fs.readFileSync(join(dir, 'cursor'), 'utf8'));
+        events.push('unlink');
+        return fs.unlinkSync(file);
+      },
+      renameSync: (from, to) => {
+        events.push('rename');
+        return fs.renameSync(from, to);
+      },
+      openSync: (file, flags) => {
+        if (failCursorWrite && file.includes('cursor')) throw new Error('EIO: the cursor file will not open');
+        if (file === dir) events.push('dir-fsync-open');
+        return fs.openSync(file, flags);
+      },
+      writeSync: (fd, buf, ...rest) => {
+        if (shortWrite) return 4; // a write that stops part-way
+        return fs.writeSync(fd, buf, ...rest);
+      },
+    };
+    const spool = createSpool({ dir, cursorSaveMs: 0, fsModule });
+    for (let i = 1; i <= 4; i += 1) spool.append(envelope(i));
+    spool.sync();
+    // A first save puts a position on disk, so the failure below has an old file to protect.
+    spool.advance({ segment: 1, offset: 0 });
+
+    failCursorWrite = true;
+    assert.throws(() => spool.advance({ segment: 2, offset: 0 }), /EIO/);
+    assert.equal(fs.readFileSync(join(dir, 'cursor'), 'utf8'), '{"segment":1,"offset":0}', 'the old file is intact');
+    assert.equal(spool.segments.length, 1, 'a save that failed deleted nothing');
+    assert.ok(spool.bytes > 0, 'and the spool still holds what it held');
+
+    failCursorWrite = false;
+    shortWrite = true;
+    assert.throws(() => spool.saveCursor(), /partly written/);
+    assert.equal(fs.readFileSync(join(dir, 'cursor'), 'utf8'), '{"segment":1,"offset":0}', 'a short write leaves the old file too');
+    assert.equal(spool.segments.length, 1, 'and deletes nothing either');
+
+    shortWrite = false;
+    spool.saveCursor();
+    assert.deepEqual(JSON.parse(fs.readFileSync(join(dir, 'cursor'), 'utf8')), { segment: 2, offset: 0 });
+    assert.deepEqual(spool.segments, [], 'the retry released the segment');
+    assert.deepEqual(observations, ['{"segment":2,"offset":0}'], 'at the deletion, the file already named the position');
+    // The durability order: the rename is made durable by the directory fsync before any deletion
+    // runs - without it a power loss could leave the old cursor with the segments it released.
+    const renameAt = events.indexOf('rename');
+    const dirFsyncAt = events.indexOf('dir-fsync-open');
+    const unlinkAt = events.indexOf('unlink');
+    assert.ok(renameAt !== -1 && dirFsyncAt !== -1 && unlinkAt !== -1, 'the save renamed, fsynced the directory and deleted');
+    assert.ok(renameAt < dirFsyncAt && dirFsyncAt < unlinkAt, 'rename, then the directory fsync, then the deletion');
+    spool.close();
+  });
+});
+
+test('Set 6b: an advance to the position already confirmed saves nothing', async () => {
+  await withSpool(async (dir) => {
+    const clocks = fakeClocks();
+    const spool = createSpool({ dir, cursorSaveMs: 100, setTimer: clocks.setTimer, clearTimer: clocks.clearTimer });
+    for (let i = 1; i <= 4; i += 1) spool.append(envelope(i));
+    spool.sync();
+    spool.advance({ segment: 2, offset: 0 });
+    spool.saveCursor();
+    clocks.timers.length = 0;
+    spool.advance({ segment: 2, offset: 0 });
+    assert.equal(clocks.timers.filter((timer) => !timer.cleared).length, 0, 'the same position arms no save');
+    spool.close();
+  });
+});
+
+test('Set 6b: a crash with an unsaved position re-walks the records instead of losing them', async () => {
+  await withSpool(async (dir) => {
+    const clocks = fakeClocks();
+    const first = createSpool({ dir, cursorSaveMs: 100, setTimer: clocks.setTimer, clearTimer: clocks.clearTimer });
+    for (let i = 1; i <= 4; i += 1) first.append(envelope(i));
+    first.sync();
+    // The advance moves the position in memory, and the clock that would have saved it never fires:
+    // this is the crash window, and the segments must still be there for the next life.
+    first.advance({ segment: 2, offset: 0 });
+    assert.equal(fs.existsSync(join(dir, 'cursor')), false, 'nothing was saved');
+
+    const second = createSpool({ dir, cursorSaveMs: 0 });
+    assert.deepEqual(second.cursor, { segment: null, offset: 0 }, 'the restart knows nothing was confirmed');
+    assert.deepEqual(
+      [...second.drainRecords()].map((record) => record.envelope.receive_seq),
+      [1, 2, 3, 4],
+      'everything still present is walked and offered again',
+    );
+
+    // With the position saved, the same crash resumes past it instead.
+    first.saveCursor();
+    const third = createSpool({ dir, cursorSaveMs: 0 });
+    assert.deepEqual(third.cursor, { segment: 2, offset: 0 }, 'the saved position is where the restart resumes');
+    assert.deepEqual(third.segments, [], 'and the released segment is gone');
+    assert.deepEqual([...third.drainRecords()], [], 'nothing is walked back out of it');
+    first.close();
+    second.close();
+    third.close();
+  });
+});
+
+test('Set 6b: a save that fails on the clock is retried instead of taking the process down', async () => {
+  await withSpool(async (dir) => {
+    const clocks = fakeClocks();
+    let dirFd = null;
+    let failDirFsync = false;
+    const fsModule = {
+      ...fs,
+      openSync: (file, flags) => {
+        const fd = fs.openSync(file, flags);
+        if (file === dir) dirFd = fd;
+        return fd;
+      },
+      fsyncSync: (fd) => {
+        if (failDirFsync && fd === dirFd) throw new Error('EIO: the directory fsync failed');
+        return fs.fsyncSync(fd);
+      },
+    };
+    const spool = createSpool({
+      dir,
+      cursorSaveMs: 100,
+      setTimer: clocks.setTimer,
+      clearTimer: clocks.clearTimer,
+      fsModule,
+    });
+    for (let i = 1; i <= 4; i += 1) spool.append(envelope(i));
+    spool.sync();
+    spool.advance({ segment: 2, offset: 0 });
+
+    // The clock fires into a failing directory fsync: the spool must not throw out of its own
+    // timer (an uncaught exception here is a process that exits, and nothing restarts it), and the
+    // position must stay unsaved with the segments untouched.
+    failDirFsync = true;
+    clocks.fire(100);
+    assert.equal(spool.segments.length, 1, 'a failed save deleted nothing');
+    assert.ok(spool.bytes > 0, 'and the spool still holds what it held');
+    assert.equal(
+      clocks.timers.filter((timer) => timer.ms === 100 && !timer.cleared).length,
+      1,
+      'the retry clock was re-armed',
+    );
+
+    // The failure clears: the retry finishes the save, deletion included.
+    failDirFsync = false;
+    clocks.fire(100);
+    assert.deepEqual(JSON.parse(fs.readFileSync(join(dir, 'cursor'), 'utf8')), { segment: 2, offset: 0 });
+    assert.deepEqual(spool.segments, [], 'the retried save released the segment');
+    assert.equal(
+      clocks.timers.filter((timer) => timer.ms === 100 && !timer.cleared).length,
+      0,
+      'and no further retry is armed',
     );
     spool.close();
   });

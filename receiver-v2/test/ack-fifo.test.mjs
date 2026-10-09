@@ -103,7 +103,7 @@ test('released entries do not accumulate without bound', () => {
 test('a rebuilt FIFO keeps the spool walk order and releases a hand-over correctly', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ack-fifo-'));
   try {
-    const spool = createSpool({ dir });
+    const spool = createSpool({ dir, cursorSaveMs: 0 });
     spool.append(envelope(1, 'conn-A'));
     spool.append(envelope(2, 'conn-A'));
     spool.append(envelope(1, 'conn-B'));
