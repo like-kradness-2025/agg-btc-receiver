@@ -39,8 +39,8 @@ test('spot adapters fail closed for unknown symbols and streams', () => {
 
 test('futures adapter uses USD-M public endpoint, @trade and pu continuity', () => {
   const adapter = createBinanceFuturesAdapter({ market: 'binance_perp', symbol: 'BTCUSDT' });
-  assert.equal(adapter.url, 'wss://fstream.binance.com/public/stream?streams=btcusdt@depth@100ms/btcusdt@forceOrder');
-  assert.equal(adapter.tradeUrl, 'wss://fstream.binance.com/market/stream?streams=btcusdt@trade');
+  assert.equal(adapter.url, 'wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@depth@100ms/btcusdt@forceOrder', 'one socket carries every stream, as v1 does');
+  assert.equal(adapter.tradeUrl, undefined, 'no separate trade socket: the trade rides the one socket');
   assert.equal(adapter.restUrl, 'https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000');
   assert.deepEqual(adapter.parse(JSON.stringify({ stream: 'btcusdt@trade', data: { e: 'trade', s: 'BTCUSDT', t: 1, p: '1', q: '1', T: 1, m: true } })), { kind: 'data', trade: true });
   assert.deepEqual(adapter.parse(JSON.stringify(futuresDepth())), { kind: 'data', depth: true });
@@ -61,8 +61,8 @@ test('futures rejects spot-style depth and unknown stream fail-closed', () => {
 test('USD-M BTCUSDC is isolated from BTCUSDT by symbol, streams and REST endpoint', () => {
   const adapter = createBinanceFuturesAdapter({ market: 'binance_perp_btcusdc', symbol: 'BTCUSDC' });
   assert.equal(adapter.symbol, 'BTCUSDC');
-  assert.equal(adapter.url, 'wss://fstream.binance.com/public/stream?streams=btcusdc@depth@100ms/btcusdc@forceOrder');
-  assert.equal(adapter.tradeUrl, 'wss://fstream.binance.com/market/stream?streams=btcusdc@trade');
+  assert.equal(adapter.url, 'wss://fstream.binance.com/stream?streams=btcusdc@trade/btcusdc@depth@100ms/btcusdc@forceOrder');
+  assert.equal(adapter.tradeUrl, undefined);
   assert.equal(adapter.restUrl, 'https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDC&limit=1000');
   assert.deepEqual(adapter.parse(JSON.stringify({ stream: 'btcusdc@trade', data: { e: 'trade', s: 'BTCUSDC', t: 1, p: '1', q: '2', T: 1 } })), { kind: 'data', trade: true });
   assert.equal(adapter.parse(JSON.stringify({ stream: 'btcusdt@aggTrade', data: { e: 'aggTrade', s: 'BTCUSDT', a: 1, p: '1', q: '2', T: 1 } })), null);

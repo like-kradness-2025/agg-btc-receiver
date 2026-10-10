@@ -5,8 +5,14 @@ import { rawTrade, rawBook, rawLiquidation } from './raw-shape.mjs';
 const SPOT_SYMBOLS = new Set(['BTCUSDT', 'BTCUSDC', 'BTCFDUSD']);
 const DEFAULT_SPOT_WS = 'wss://stream.binance.com:9443/stream';
 const DEFAULT_SPOT_REST = 'https://api.binance.com/api/v3/depth';
-const DEFAULT_FUTURES_PUBLIC_WS = 'wss://fstream.binance.com/public/stream';
-const DEFAULT_FUTURES_MARKET_WS = 'wss://fstream.binance.com/market/stream';
+// The USDⓈ-M socket is the plain `/stream` the running v1 uses, carrying every stream in one
+// connection (`lib/binance-connector.mjs:340`:
+// `wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@depth@100ms/btcusdt@forceOrder`).
+// Measured live: `/market/stream` accepts a connection and then routes nothing at all (an 8 s probe
+// saw 0 frames), and the split arrangement - a depth socket plus a separate trade socket - was not
+// realised in the deployment either, so only the depth was ever opened and every futures trade was
+// missing from the raw. One socket, the v1's path.
+const DEFAULT_FUTURES_STREAM_WS = 'wss://fstream.binance.com/stream';
 const DEFAULT_FUTURES_REST = 'https://fapi.binance.com/fapi/v1/depth';
 
 function textOf(raw) { return typeof raw === 'string' ? raw : raw?.toString?.('utf8') ?? ''; }
@@ -358,9 +364,10 @@ export function createBinanceFuturesAdapter({ market = 'binance_perp', symbol = 
   const depthStream = `${lower}@depth@100ms`;
   const tradeStream = `${lower}@trade`;
   const forceOrderStream = `${lower}@forceOrder`;
-  const defaults = makeUrls(DEFAULT_FUTURES_PUBLIC_WS, [depthStream, forceOrderStream], DEFAULT_FUTURES_REST, normalized, 1000);
+  // One connection carries the trade, the depth and the forceOrder streams, as v1's does.
+  const defaults = makeUrls(DEFAULT_FUTURES_STREAM_WS, [tradeStream, depthStream, forceOrderStream], DEFAULT_FUTURES_REST, normalized, 1000);
   const depthOf = futuresDepthFactory(normalized, depthStream);
-  return makeAdapter({ market, symbol: normalized, url: url ?? defaults.url, tradeUrl: `${DEFAULT_FUTURES_MARKET_WS}?streams=${tradeStream}`, restUrl: restUrl ?? defaults.restUrl, streams: new Set([tradeStream, depthStream, forceOrderStream]), depthStream, tradeStream, forceOrderStream, forceOrderOf: futuresForceOrderFactory(normalized), depthOf, tradeOf: futuresTradeFactory(normalized), fetchImpl, waitForBufferMs: 5000, bookPrevSeqFromVenue: true, continuity: (event, state) => {
+  return makeAdapter({ market, symbol: normalized, url: url ?? defaults.url, restUrl: restUrl ?? defaults.restUrl, streams: new Set([tradeStream, depthStream, forceOrderStream]), depthStream, tradeStream, forceOrderStream, forceOrderOf: futuresForceOrderFactory(normalized), depthOf, tradeOf: futuresTradeFactory(normalized), fetchImpl, waitForBufferMs: 5000, bookPrevSeqFromVenue: true, continuity: (event, state) => {
     if (event.u < state.lastUpdateId) return { status: 'discarded', reason: 'depth update is before snapshot boundary' };
     if (state.previousEventId === null) {
       return event.U <= state.lastUpdateId && state.lastUpdateId <= event.u ? { status: 'applied' } : { status: 'resync', reason: 'futures first depth update does not bridge snapshot', first: event.U, final: event.u };
