@@ -238,6 +238,16 @@ export function createStructure({
         const opened = createSpool({ dir: spoolDir });
         // Set 8c: this side may be the first to open the spool, so the refusal is reported here as an
         // explanation of the stop, where the ingest reports it when it opens first.
+        if (opened.cursorClamped) {
+          try {
+            onDiagnostic({
+              market,
+              reason: `the spool cursor named offset ${opened.cursorClamped.offset} in segment ${opened.cursorClamped.segment} but the segment only holds ${opened.cursorClamped.clampedTo} readable byte(s); it was clamped so nothing is skipped`,
+            });
+          } catch {
+            // a diagnostic is best-effort by contract
+          }
+        }
         if (opened.unreadableTail) {
           try {
             onDiagnostic({

@@ -128,6 +128,16 @@ export function createIngestProcess({
   // Set 8c: an unreadable tail found at open (a process killed mid-write, or a corruption) means
   // appends are refused and the run will stop. It is reported here so the stop is explained rather
   // than mysterious.
+  if (spool !== null && spool.cursorClamped !== null && spool.cursorClamped !== undefined) {
+    try {
+      onDiagnostic({
+        market,
+        reason: `the spool cursor named offset ${spool.cursorClamped.offset} in segment ${spool.cursorClamped.segment} but the segment only holds ${spool.cursorClamped.clampedTo} readable byte(s); it was clamped so nothing is skipped`,
+      });
+    } catch {
+      // a diagnostic is best-effort by contract
+    }
+  }
   if (spool !== null && spool.unreadableTail !== null && spool.unreadableTail !== undefined) {
     try {
       onDiagnostic({

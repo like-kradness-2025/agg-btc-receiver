@@ -614,3 +614,31 @@ test('Set 8c: a three-byte remnant (less than a length prefix) is refused the sa
     reopened.close();
   });
 });
+
+test('Set 8c: a cursor past the readable end of its segment is clamped, not obeyed', async () => {
+  await withSpool(async (dir) => {
+    const spool = createSpool({ dir });
+    for (let i = 1; i <= 3; i += 1) spool.append(envelope(i));
+    spool.sync();
+    spool.close();
+    // The way a power loss can leave it: the cursor's save is durable, the segment's tail is not, so
+    // the position names bytes the segment no longer holds.
+    fs.writeFileSync(join(dir, 'cursor'), JSON.stringify({ segment: 1, offset: 99999 }));
+    const reopened = createSpool({ dir });
+    assert.ok(reopened.cursorClamped, 'the impossible position is reported');
+    assert.ok(reopened.cursorClamped.clampedTo < 99999);
+    reopened.append(envelope(4));
+    reopened.sync();
+    const seen = [];
+    const iterator = reopened.drain();
+    for (;;) {
+      const step = iterator.next();
+      if (step.done) break;
+      seen.push(step.value.receive_seq);
+    }
+    // The records before the cursor were consumed by definition; what the clamp protects is the
+    // record written after the reopen, which a position past the segment's end would skip entirely.
+    assert.deepEqual(seen, [4], 'the record written after the reopen is not skipped');
+    reopened.close();
+  });
+});

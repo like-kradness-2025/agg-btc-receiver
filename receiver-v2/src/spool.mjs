@@ -167,6 +167,27 @@ export function createSpool(options = {}) {
       }
     }
   }
+  // Set 8c: the cursor can name a position past what its segment actually holds. The cursor's save is
+  // fsynced while the segment's appends run on their own timer, so a power loss can leave the position
+  // durable and the bytes it names not. A position the segment cannot hold is not a position: it is
+  // clamped to the segment's readable end, which re-walks those records instead of skipping them. A
+  // duplicate is answered from the record, so the resend costs a round trip and nothing else - and
+  // nothing is lost in silence.
+  let cursorClamped = null;
+  if (Number.isInteger(cursor.segment) && Number.isInteger(cursor.offset) && cursor.offset > 0) {
+    const held = segments.find((segment) => segment.index === cursor.segment);
+    const readableEnd =
+      unreadableTail !== null && unreadableTail.segment === cursor.segment
+        ? unreadableTail.from
+        : held === undefined
+          ? null
+          : held.bytes;
+    if (readableEnd !== null && cursor.offset > readableEnd) {
+      cursorClamped = { segment: cursor.segment, offset: cursor.offset, clampedTo: readableEnd };
+      cursor = { segment: cursor.segment, offset: readableEnd };
+      cursorDirty = true;
+    }
+  }
 
   function openCurrent() {
     if (handle) return handle;
@@ -592,6 +613,10 @@ export function createSpool(options = {}) {
     /** Set 8c: the unreadable tail found at open, or null. While it is set, `append` refuses. */
     get unreadableTail() {
       return unreadableTail;
+    },
+    /** Set 8c: a cursor found past its segment's readable end, clamped at open. Null when it was sane. */
+    get cursorClamped() {
+      return cursorClamped;
     },
   };
 }
