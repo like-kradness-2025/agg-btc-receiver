@@ -125,14 +125,14 @@ export function createIngestProcess({
   if (store === null) throw new TypeError('the ingest process needs an ingest store (a path or an open store)');
 
   const spool = spoolDir ? createSpool({ dir: spoolDir, ...spoolOptions }) : null;
-  // Set 8c: a reopen that had to cut an incomplete tail (a process killed mid-write) is a fact about
-  // what the spool held and is reported rather than passed over in silence - the cut bytes were never
-  // confirmable, so nothing a consumer was told it had is lost, but the tear itself is worth seeing.
-  if (spool !== null && spool.lastRepair !== null && spool.lastRepair !== undefined) {
+  // Set 8c: an unreadable tail found at open (a process killed mid-write, or a corruption) means
+  // appends are refused and the run will stop. It is reported here so the stop is explained rather
+  // than mysterious.
+  if (spool !== null && spool.unreadableTail !== null && spool.unreadableTail !== undefined) {
     try {
       onDiagnostic({
         market,
-        reason: `the spool tail was cut: ${spool.lastRepair.removed} byte(s) after offset ${spool.lastRepair.from} in segment ${spool.lastRepair.segment} were unreadable`,
+        reason: `the spool's last segment (${spool.unreadableTail.segment}) ends in ${spool.unreadableTail.unreadable} byte(s) that are not a record; appends will be refused`,
       });
     } catch {
       // a diagnostic is best-effort by contract

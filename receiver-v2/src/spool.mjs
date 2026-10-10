@@ -130,13 +130,15 @@ export function createSpool(options = {}) {
   let unreadable = null;
   let bytes = segments.reduce((sum, segment) => sum + segment.bytes, 0);
   let fsyncTimer = null;
-  // Set 8c: a process killed mid-write leaves an incomplete record at the tail of the segment it was
-  // writing. Its bytes are not a record, so nothing after them can ever be read, and appending past
-  // them would bury every later record behind unreadable bytes - a spool that can never drain again.
-  // The bytes after the last complete record were never durable either: a record is confirmable only
-  // once it is whole, and the cursor can only sit past a complete one, so cutting them cannot take
-  // anything a consumer was told it had. The cut is reported rather than silent.
-  let repairedTail = null;
+  // Set 8c: a process killed mid-write can leave bytes at the tail of the last segment that are not a
+  // record - an incomplete one (a torn write), or a length the format cannot have written. Either way
+  // the bytes after the last complete record cannot be read, and appending past them would bury every
+  // later record behind unreadable bytes. `append` therefore refuses while this stands: the spool
+  // holds what it has and the run stops loudly, which is the same rule the in-process torn write
+  // follows. (The reopen does not cut them: a length-prefix format cannot tell a torn write from a
+  // corruption that happens to read as an in-range length, and cutting a corruption would throw away
+  // complete records the consumer was never told about.)
+  let unreadableTail = null;
   if (current && current.bytes > 0) {
     const tailFile = path.join(dir, current.name);
     let tailBytes = null;
@@ -153,22 +155,15 @@ export function createSpool(options = {}) {
     if (tailBytes !== null) {
       const decoder = createFrameDecoder({ maxBytes: FRAME_MAX_BYTES + 1 });
       let end = 0;
-      let torn = false;
+      let unreadable = false;
       try {
         for (const record of decoder.push(tailBytes)) end += RECORD_OVERHEAD + record.length;
-        // A prefix of a valid record shorter than the record itself: the process died mid-write.
-        torn = decoder.bufferedBytes > 0 || end < tailBytes.length;
+        unreadable = decoder.bufferedBytes > 0 || end < tailBytes.length;
       } catch {
-        // A length the format cannot have written is corruption, not a torn write. It is left exactly
-        // where it is: the walk's own verdict ends the run loudly, and a reopen that quietly cut
-        // bytes it cannot account for would turn a stopped run into a silent one.
-        torn = false;
+        unreadable = true;
       }
-      if (torn && end < current.bytes) {
-        fsModule.truncateSync(tailFile, end);
-        repairedTail = { segment: current.index, from: end, removed: current.bytes - end };
-        bytes -= current.bytes - end;
-        current.bytes = end;
+      if (unreadable) {
+        unreadableTail = { segment: current.index, from: end, unreadable: current.bytes - end };
       }
     }
   }
@@ -273,6 +268,13 @@ export function createSpool(options = {}) {
    * the moment of the advance, because the segment can still grow after this call.
    */
   function append(envelope) {
+    if (unreadableTail !== null) {
+      // Bytes at the end of the last segment are not a record. Appending past them would bury every
+      // later record behind unreadable bytes, so the spool holds what it has and the caller stops.
+      throw new Error(
+        `the spool's last segment (${unreadableTail.segment}) ends in ${unreadableTail.unreadable} byte(s) that are not a record; refusing to append past them`,
+      );
+    }
     if (failed) return false; // a torn record was written: appending after it would bury the tear
     const record = frame(encodeEnvelope(envelope));
     if (record.length > FRAME_MAX_BYTES) {
@@ -587,9 +589,9 @@ export function createSpool(options = {}) {
     get unreadable() {
       return unreadable;
     },
-    /** Set 8c: what the reopen cut from the last segment, or null when there was nothing to cut. */
-    get lastRepair() {
-      return repairedTail;
+    /** Set 8c: the unreadable tail found at open, or null. While it is set, `append` refuses. */
+    get unreadableTail() {
+      return unreadableTail;
     },
   };
 }

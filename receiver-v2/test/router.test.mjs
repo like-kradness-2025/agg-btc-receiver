@@ -15,7 +15,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -495,40 +495,4 @@ test('a throwing diagnostic cannot change a refusal', () => {
   }, 'a diagnostic failure does not escape the refusal');
   assert.equal(outcome.refused, true);
   assert.equal(router.stats.refusals, 1);
-});
-
-test('a stale router socket left by a hard stop does not stop the next start', async () => {
-  // A SIGKILL or a power loss leaves the socket file behind, and binding to an existing path fails
-  // with EADDRINUSE - which would make a restart impossible until a human removed the file.
-  const dir = mkdtempSync(join(tmpdir(), 'router-stale-'));
-  const listenPath = join(dir, 'router.sock');
-  writeFileSync(listenPath, '');
-  const router = await openRouter({ listenPath, channelOptions: { batchFrames: 1 } });
-  try {
-    assert.equal(router.path, listenPath, 'the stale socket was replaced and the router is listening');
-  } finally {
-    router.close();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('a live router socket is never removed by a second entrance', async () => {
-  // Removing a live entrance's socket would break that entrance to no purpose: a second start is a
-  // deployment mistake, and it is the bind that has to fail for it, not this cleanup.
-  const dir = mkdtempSync(join(tmpdir(), 'router-live-'));
-  const listenPath = join(dir, 'router.sock');
-  const first = await openRouter({ listenPath, channelOptions: { batchFrames: 1 } });
-  try {
-    await assert.rejects(() => openRouter({ listenPath, channelOptions: { batchFrames: 1 } }), /EADDRINUSE/);
-    // The first entrance is still reachable: its socket was left alone. The connect is bounded so a
-    // regression fails as a test failure instead of hanging the suite.
-    const channel = await Promise.race([
-      connect(listenPath, { batchFrames: 1 }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('the first entrance is unreachable')), 3000)),
-    ]);
-    channel.close();
-  } finally {
-    first.close();
-    rmSync(dir, { recursive: true, force: true });
-  }
 });

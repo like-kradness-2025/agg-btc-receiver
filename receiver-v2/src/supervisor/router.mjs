@@ -28,13 +28,10 @@
  */
 
 import net from 'node:net';
-import { existsSync, unlinkSync } from 'node:fs';
+import { unlinkSync } from 'node:fs';
 
 import { createChannel } from '../ipc.mjs';
 import { IPC_VERSION } from '../ipc-message.mjs';
-
-/** How long a probe waits for a live socket to answer before the path is called a stale leftover. */
-const SOCKET_PROBE_TIMEOUT_MS = 250;
 
 /** The roles that may announce themselves, and the frame route each one has. */
 export const ROLE_ROUTES = Object.freeze({
@@ -468,47 +465,8 @@ export function createRouter({ onDiagnostic = () => {}, onRefusal = () => {}, on
 }
 
 /** Open the supervisor's socket: the single rendezvous the three role processes connect to. */
-/**
- * Whether a socket path has nobody listening on it (a leftover from a hard stop) rather than a live
- * listener. Only two answers mean dead: the path is gone (`ENOENT`), or the connection was refused
- * (`ECONNREFUSED`) - the kernel saying no process holds it. Anything else (a permission problem, a
- * listener that accepts but does not answer, an error we do not recognise) is treated as alive, so
- * the cleanup can never remove a socket that might still be somebody's.
- */
-async function socketIsDead(path) {
-  try {
-    if (!existsSync(path)) return false;
-  } catch {
-    return false;
-  }
-  return await new Promise((resolve) => {
-    const socket = net.connect(path);
-    const settle = (dead) => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(dead);
-    };
-    socket.once('connect', () => settle(false));
-    socket.once('error', (error) => settle(error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED'));
-    socket.setTimeout(SOCKET_PROBE_TIMEOUT_MS, () => settle(false));
-  });
-}
-
 export async function openRouter({ listenPath, channelOptions = {}, ...hooks } = {}) {
   if (!listenPath) throw new TypeError('the supervisor router needs a socket path to listen on');
-  // A run that died without a graceful close (a SIGKILL, a power loss) leaves its socket file behind,
-  // and binding to an existing path fails with EADDRINUSE - which would make a restart impossible
-  // until a human removed the file. A stale socket is removed so a restart is possible; a socket
-  // somebody is still listening on is left alone, because removing a live entrance's socket would
-  // break that entrance to no purpose (a second start of the same entrance is a deployment mistake,
-  // and it is the bind below - not this cleanup - that has to fail for it).
-  if (await socketIsDead(listenPath)) {
-    try {
-      unlinkSync(listenPath);
-    } catch {
-      // Raced with something else removing it; the bind below is the authority either way.
-    }
-  }
   const router = createRouter(hooks);
   const server = net.createServer((socket) => {
     const channel = createChannel(socket, {

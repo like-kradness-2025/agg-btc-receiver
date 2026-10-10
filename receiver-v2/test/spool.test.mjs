@@ -560,7 +560,7 @@ test('Set 6b: a save that fails on the clock is retried instead of taking the pr
   });
 });
 
-test('Set 8c: a torn tail is cut at reopen, so a restart can append and drain again', async () => {
+test('Set 8c: a torn tail at reopen makes the spool refuse to append rather than bury it', async () => {
   await withSpool(async (dir) => {
     const spool = createSpool({ dir });
     for (let i = 1; i <= 3; i += 1) spool.append(envelope(i));
@@ -572,13 +572,13 @@ test('Set 8c: a torn tail is cut at reopen, so a restart can append and drain ag
     const sizeBefore = fs.statSync(segment).size;
 
     const reopened = createSpool({ dir });
-    assert.ok(reopened.lastRepair, 'the cut is reported');
-    assert.ok(reopened.lastRepair.from > 0, 'a real prefix of complete records was kept');
-    assert.ok(fs.statSync(segment).size < sizeBefore, 'the unreadable tail is gone');
-    // The restart appends and drains. Without the cut the new record would sit behind unreadable
-    // bytes and nothing after it could ever be read - the spool would never drain again.
-    reopened.append(envelope(4));
-    reopened.sync();
+    assert.ok(reopened.unreadableTail, 'the unreadable tail is reported');
+    assert.equal(reopened.unreadableTail.unreadable, 5);
+    assert.equal(fs.statSync(segment).size, sizeBefore, 'nothing is cut: the bytes are held');
+    // Appending past the tear would bury the new record behind unreadable bytes, so the spool refuses
+    // and the caller stops loudly (the same rule an in-process torn write follows). The complete
+    // records before the tear are still readable.
+    assert.throws(() => reopened.append(envelope(4)), /not a record/);
     const seen = [];
     const iterator = reopened.drain();
     for (;;) {
@@ -586,12 +586,12 @@ test('Set 8c: a torn tail is cut at reopen, so a restart can append and drain ag
       if (step.done) break;
       seen.push(step.value.receive_seq);
     }
-    assert.deepEqual(seen, [1, 2, 3, 4], 'the records before the tear and the new one all read');
+    assert.deepEqual(seen, [1, 2, 3], 'the complete records before the tear are still handed out');
     reopened.close();
   });
 });
 
-test('Set 8c: a three-byte remnant (less than a length prefix) is cut too', async () => {
+test('Set 8c: a three-byte remnant (less than a length prefix) is refused the same way', async () => {
   await withSpool(async (dir) => {
     const spool = createSpool({ dir });
     spool.append(envelope(1));
@@ -600,10 +600,9 @@ test('Set 8c: a three-byte remnant (less than a length prefix) is cut too', asyn
     const segment = join(dir, 'segment-0000000001.spool');
     fs.appendFileSync(segment, Buffer.from([0x01, 0x02, 0x03]));
     const reopened = createSpool({ dir });
-    assert.ok(reopened.lastRepair, 'a fragment shorter than a length prefix is a torn write');
-    assert.equal(reopened.lastRepair.removed, 3);
-    reopened.append(envelope(2));
-    reopened.sync();
+    assert.ok(reopened.unreadableTail, 'a fragment shorter than a length prefix is unreadable');
+    assert.equal(reopened.unreadableTail.unreadable, 3);
+    assert.throws(() => reopened.append(envelope(2)), /not a record/);
     const seen = [];
     const iterator = reopened.drain();
     for (;;) {
@@ -611,7 +610,7 @@ test('Set 8c: a three-byte remnant (less than a length prefix) is cut too', asyn
       if (step.done) break;
       seen.push(step.value.receive_seq);
     }
-    assert.deepEqual(seen, [1, 2], 'the fragment did not bury the record written after it');
+    assert.deepEqual(seen, [1], 'the record before the fragment is still handed out');
     reopened.close();
   });
 });

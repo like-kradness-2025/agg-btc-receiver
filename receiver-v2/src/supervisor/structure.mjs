@@ -236,13 +236,13 @@ export function createStructure({
   const spool = spoolDir
     ? constructing(() => {
         const opened = createSpool({ dir: spoolDir });
-        // Set 8c: this side may be the first to open the spool, so the cut a reopen had to make is
-        // reported here as well as in the ingest - whichever process opens it first sees it.
-        if (opened.lastRepair) {
+        // Set 8c: this side may be the first to open the spool, so the refusal is reported here as an
+        // explanation of the stop, where the ingest reports it when it opens first.
+        if (opened.unreadableTail) {
           try {
             onDiagnostic({
               market,
-              reason: `the spool tail was cut: ${opened.lastRepair.removed} byte(s) after offset ${opened.lastRepair.from} in segment ${opened.lastRepair.segment} were unreadable`,
+              reason: `the spool's last segment (${opened.unreadableTail.segment}) ends in ${opened.unreadableTail.unreadable} byte(s) that are not a record; appends will be refused`,
             });
           } catch {
             // a diagnostic is best-effort by contract
